@@ -14,6 +14,7 @@
 
 #include "msxtypes.h"
 #include "dispersion.h"
+#include "msxsegment_storage.h"
 #include "smatrix.h"
 
 #define ERRCODE(x) (errcode = ((errcode>100) ? (errcode) : (x)))
@@ -32,6 +33,11 @@ static double* gam;
 #ifdef USE_OPENMP
 #pragma omp threadprivate(al, bl, cl, rl, sol, gam)
 #endif
+
+static void setPipeRingAccessError(void)
+{
+	if (!MSX.ErrCode) MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+}
 
 int dispersion_open()
 {
@@ -101,12 +107,15 @@ void dispersion_pipe(int m, double tstep)
 	{
 	#ifdef USE_OPENMP
 	#pragma omp for private(seg, cons, vd, vu, vself, k, nseg, asquare, velocity, diam, area, flowrate, reynolds, dh, frictionfactor, shearvelocity, ldispersion, elpt)
-	#endif
+		#endif
 		for (k = 1; k <= MSX.Nobjects[LINK]; k++)
 		{
+			int usePipeRing = MSXsegStorage_isPipeRingLink(k);
+			int pipeCount = usePipeRing ? MSXsegStorage_pipeCount(k) : 0;
+			if (MSX.ErrCode) continue;
 			
 			velocity = 0;
-			if (MSX.FirstSeg[k] == NULL)
+			if ((!usePipeRing && MSX.FirstSeg[k] == NULL) || (usePipeRing && pipeCount == 0))
 				continue;
 			diam = MSX.Link[k].diam;
 			// Compute Reynolds No.
@@ -178,7 +187,6 @@ void dispersion_pipe(int m, double tstep)
 				continue;
 			}
 			asquare = area * area;
-			seg = MSX.FirstSeg[k];   //downstream
 			cons = 2.0 * ldispersion * asquare * tstep;
 			vd = 0.0;
 			bl[0] = 1.0;
@@ -186,22 +194,61 @@ void dispersion_pipe(int m, double tstep)
 			rl[0] = 0.0;
 			nseg = 0;
 
-			while (seg != NULL)
+			if (usePipeRing)
 			{
-				nseg++;
-				vself = seg->v;
-				rl[nseg] = seg->c[m];
-				seg = seg->prev;
-				if (seg)
-					vu = seg->v;
-				else
-					vu = 0.0;
-				al[nseg] = -cons / (vself * vself + vself * vd);
-				cl[nseg] = -cons / (vself * vself + vself * vu);
-				bl[nseg] = 1 - al[nseg] - cl[nseg];
+				for (int pos = 0; pos < pipeCount; pos++)
+				{
+					int slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+					double* c = MSXsegStorage_pipeC(k, slot);
+					double* v = MSXsegStorage_pipeVPtr(k, slot);
+					double* uv = NULL;
+					if (!c || !v)
+					{
+						setPipeRingAccessError();
+						break;
+					}
+					nseg++;
+					vself = *v;
+					rl[nseg] = c[m];
+					if (pos + 1 < pipeCount)
+					{
+						int uslot = MSXsegStorage_pipeSlotFromHead(k, pos + 1);
+						uv = MSXsegStorage_pipeVPtr(k, uslot);
+						if (!uv)
+						{
+							setPipeRingAccessError();
+							break;
+						}
+					}
+					vu = uv ? *uv : 0.0;
+					al[nseg] = -cons / (vself * vself + vself * vd);
+					cl[nseg] = -cons / (vself * vself + vself * vu);
+					bl[nseg] = 1 - al[nseg] - cl[nseg];
 
-				vd = vself;
+					vd = vself;
+				}
 			}
+			else
+			{
+				seg = MSX.FirstSeg[k];   //downstream
+				while (seg != NULL)
+				{
+					nseg++;
+					vself = seg->v;
+					rl[nseg] = seg->c[m];
+					seg = seg->prev;
+					if (seg)
+						vu = seg->v;
+					else
+						vu = 0.0;
+					al[nseg] = -cons / (vself * vself + vself * vd);
+					cl[nseg] = -cons / (vself * vself + vself * vu);
+					bl[nseg] = 1 - al[nseg] - cl[nseg];
+
+					vd = vself;
+				}
+			}
+			if (MSX.ErrCode) continue;
 			if (nseg == 0)
 				continue;
 		
@@ -218,13 +265,31 @@ void dispersion_pipe(int m, double tstep)
 					sol[p] = rl[p];
 			}
 
-			seg = MSX.FirstSeg[k];   //downstream segment
 			int segindex = 1;
-			while (seg != NULL)
+			if (usePipeRing)
 			{
-				seg->hresponse = sol[segindex];
-				seg = seg->prev;
-				segindex++;
+				for (int pos = 0; pos < pipeCount; pos++)
+				{
+					int slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+					double* h = MSXsegStorage_pipeHresponsePtr(k, slot);
+					if (!h)
+					{
+						setPipeRingAccessError();
+						break;
+					}
+					*h = sol[segindex];
+					segindex++;
+				}
+			}
+			else
+			{
+				seg = MSX.FirstSeg[k];   //downstream segment
+				while (seg != NULL)
+				{
+					seg->hresponse = sol[segindex];
+					seg = seg->prev;
+					segindex++;
+				}
 			}
 			/*clear initial condition*/
 			for (int p = 1; p < nseg + 1; p++)
@@ -240,13 +305,31 @@ void dispersion_pipe(int m, double tstep)
 					sol[p] = rl[p];
 			}
 
-			seg = MSX.FirstSeg[k];   //downstream
 			segindex = 1;
-			while (seg != NULL)
+			if (usePipeRing)
 			{
-				seg->dresponse = sol[segindex];
-				seg = seg->prev;
-				segindex++;
+				for (int pos = 0; pos < pipeCount; pos++)
+				{
+					int slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+					double* d = MSXsegStorage_pipeDresponsePtr(k, slot);
+					if (!d)
+					{
+						setPipeRingAccessError();
+						break;
+					}
+					*d = sol[segindex];
+					segindex++;
+				}
+			}
+			else
+			{
+				seg = MSX.FirstSeg[k];   //downstream
+				while (seg != NULL)
+				{
+					seg->dresponse = sol[segindex];
+					seg = seg->prev;
+					segindex++;
+				}
 			}
 
 			/*upstream unit boundary condition*/
@@ -260,13 +343,31 @@ void dispersion_pipe(int m, double tstep)
 					sol[p] = rl[p];
 			}
 
-			seg = MSX.FirstSeg[k];   //downstream
 			segindex = 1;
-			while (seg != NULL)
+			if (usePipeRing)
 			{
-				seg->uresponse = sol[segindex];
-				seg = seg->prev;
-				segindex++;
+				for (int pos = 0; pos < pipeCount; pos++)
+				{
+					int slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+					double* u = MSXsegStorage_pipeUresponsePtr(k, slot);
+					if (!u)
+					{
+						setPipeRingAccessError();
+						break;
+					}
+					*u = sol[segindex];
+					segindex++;
+				}
+			}
+			else
+			{
+				seg = MSX.FirstSeg[k];   //downstream
+				while (seg != NULL)
+				{
+					seg->uresponse = sol[segindex];
+					seg = seg->prev;
+					segindex++;
+				}
 			}
 		}
 	}
@@ -309,16 +410,45 @@ void solve_nodequal(int m, double tstep)
 		diam = MSX.Link[k].diam;
 		area = 0.25 * PI * diam * diam;
 		asquare = area * area;
-		firstseg = MSX.FirstSeg[k];   //downstream
-		lastseg =  MSX.LastSeg[k];		//upstream	
+		double firstV, lastV;
+		double firstH, firstD, firstU;
+		double lastH, lastD, lastU;
+		if (MSXsegStorage_isPipeRingLink(k))
+		{
+			int count = MSXsegStorage_pipeCount(k);
+			int firstSlot, lastSlot;
+			double *p;
+			if (count <= 0) continue;
+			firstSlot = MSXsegStorage_pipeSlotFromHead(k, 0);      // downstream
+			lastSlot = MSXsegStorage_pipeSlotFromTail(k, 0);       // upstream
+			p = MSXsegStorage_pipeVPtr(k, firstSlot); if (!p) { setPipeRingAccessError(); return; } firstV = *p;
+			p = MSXsegStorage_pipeVPtr(k, lastSlot);  if (!p) { setPipeRingAccessError(); return; } lastV = *p;
+			p = MSXsegStorage_pipeHresponsePtr(k, firstSlot); if (!p) { setPipeRingAccessError(); return; } firstH = *p;
+			p = MSXsegStorage_pipeDresponsePtr(k, firstSlot); if (!p) { setPipeRingAccessError(); return; } firstD = *p;
+			p = MSXsegStorage_pipeUresponsePtr(k, firstSlot); if (!p) { setPipeRingAccessError(); return; } firstU = *p;
+			p = MSXsegStorage_pipeHresponsePtr(k, lastSlot); if (!p) { setPipeRingAccessError(); return; } lastH = *p;
+			p = MSXsegStorage_pipeDresponsePtr(k, lastSlot); if (!p) { setPipeRingAccessError(); return; } lastD = *p;
+			p = MSXsegStorage_pipeUresponsePtr(k, lastSlot); if (!p) { setPipeRingAccessError(); return; } lastU = *p;
+		}
+		else
+		{
+			firstseg = MSX.FirstSeg[k];   //downstream
+			lastseg =  MSX.LastSeg[k];		//upstream	
+			if (firstseg == NULL)
+				continue;
+			firstV = firstseg->v;
+			lastV = lastseg->v;
+			firstH = firstseg->hresponse;
+			firstD = firstseg->dresponse;
+			firstU = firstseg->uresponse;
+			lastH = lastseg->hresponse;
+			lastD = lastseg->dresponse;
+			lastU = lastseg->uresponse;
+		}
 
-
-		if (firstseg == NULL)
-			continue;
-
-		coefirstseg = ldispersion * asquare / firstseg->v;   //dispersion should be pipe by pipe
-		coelastseg = ldispersion * asquare / lastseg->v;   //dispersion should be pipe by pipe
-		MSX.Dispersion.Aij[MSX.Dispersion.Ndx[k]] -= coefirstseg * firstseg->uresponse; //coefirstseg*firstseg->greenu = coelastseg*lastseg->greend 
+		coefirstseg = ldispersion * asquare / firstV;   //dispersion should be pipe by pipe
+		coelastseg = ldispersion * asquare / lastV;   //dispersion should be pipe by pipe
+		MSX.Dispersion.Aij[MSX.Dispersion.Ndx[k]] -= coefirstseg * firstU; //coefirstseg*firstseg->greenu = coelastseg*lastseg->greend 
 
 		found = 0;
 		source = MSX.Node[n2].sources;
@@ -337,19 +467,19 @@ void solve_nodequal(int m, double tstep)
 		{
 			if (source == NULL || source->c0 <= 0.0)
 			{
-				MSX.Dispersion.Aii[MSX.Dispersion.Row[n2]] += coefirstseg * (1.0 - firstseg->dresponse);
+				MSX.Dispersion.Aii[MSX.Dispersion.Row[n2]] += coefirstseg * (1.0 - firstD);
 
-				MSX.Dispersion.F[MSX.Dispersion.Row[n2]] += coefirstseg * firstseg->hresponse;
+				MSX.Dispersion.F[MSX.Dispersion.Row[n2]] += coefirstseg * firstH;
 			}
 			else
 			{
 				MSX.Dispersion.Aij[MSX.Dispersion.Ndx[k]] = 0;
-				MSX.Dispersion.F[MSX.Dispersion.Row[n1]] += coelastseg * MSX.LastSeg[k]->dresponse * MSX.Node[n2].c[m];
+				MSX.Dispersion.F[MSX.Dispersion.Row[n1]] += coelastseg * lastD * MSX.Node[n2].c[m];
 			}
 		}
 		else
 		{
-			MSX.Dispersion.F[MSX.Dispersion.Row[n1]] += coelastseg * MSX.LastSeg[k]->dresponse * MSX.Node[n2].c[m];
+			MSX.Dispersion.F[MSX.Dispersion.Row[n1]] += coelastseg * lastD * MSX.Node[n2].c[m];
 		}
 
 			
@@ -371,19 +501,19 @@ void solve_nodequal(int m, double tstep)
 			source = MSX.Node[n1].sources;
 			if (source == NULL || source->c0 <= 0.0)
 			{
-				MSX.Dispersion.Aii[MSX.Dispersion.Row[n1]] += coelastseg * (1.0 - lastseg->uresponse);
-				MSX.Dispersion.F[MSX.Dispersion.Row[n1]] += coelastseg * lastseg->hresponse;
+				MSX.Dispersion.Aii[MSX.Dispersion.Row[n1]] += coelastseg * (1.0 - lastU);
+				MSX.Dispersion.F[MSX.Dispersion.Row[n1]] += coelastseg * lastH;
 			}
 			else
 			{
 				MSX.Dispersion.Aij[MSX.Dispersion.Ndx[k]] = 0;   //sure
-				MSX.Dispersion.F[MSX.Dispersion.Row[n2]] += coefirstseg * firstseg->uresponse * MSX.Node[n1].c[m];
+				MSX.Dispersion.F[MSX.Dispersion.Row[n2]] += coefirstseg * firstU * MSX.Node[n1].c[m];
 			}
 
 		}
 		else
 		{
-			MSX.Dispersion.F[MSX.Dispersion.Row[n2]] += coefirstseg * firstseg->uresponse * MSX.Node[n1].c[m];
+			MSX.Dispersion.F[MSX.Dispersion.Row[n2]] += coefirstseg * firstU * MSX.Node[n1].c[m];
 		}
 	}
 	for (int i = 1; i <= njuncs; i++)
@@ -440,6 +570,101 @@ void   segqual_update(int m, double tstep)
 				n1 = MSX.Link[k].n2;
 				n2 = MSX.Link[k].n1;
 			}
+			if (MSXsegStorage_isPipeRingLink(k))
+			{
+				int count = MSXsegStorage_pipeCount(k);
+				int firstSlot, lastSlot;
+				double *firstC, *lastC, *firstV, *lastV;
+				if (MSX.ErrCode) continue;
+				if (count <= 0) continue;
+
+				for (int pos = 0; pos < count; pos++)
+				{
+					int slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+					double *c = MSXsegStorage_pipeC(k, slot);
+					double *v = MSXsegStorage_pipeVPtr(k, slot);
+					double *h = MSXsegStorage_pipeHresponsePtr(k, slot);
+					double *d = MSXsegStorage_pipeDresponsePtr(k, slot);
+					double *u = MSXsegStorage_pipeUresponsePtr(k, slot);
+					if (!c || !v || !h || !d || !u)
+					{
+						setPipeRingAccessError();
+						break;
+					}
+					mass1 += c[m] * (*v);
+					c[m] = *h + MSX.Node[n2].c[m] * (*d) + MSX.Node[n1].c[m] * (*u);
+					mass2 += c[m] * (*v);
+				}
+				if (MSX.ErrCode) continue;
+
+				firstSlot = MSXsegStorage_pipeSlotFromHead(k, 0);
+				lastSlot = MSXsegStorage_pipeSlotFromTail(k, 0);
+				firstC = MSXsegStorage_pipeC(k, firstSlot);
+				lastC = MSXsegStorage_pipeC(k, lastSlot);
+				firstV = MSXsegStorage_pipeVPtr(k, firstSlot);
+				lastV = MSXsegStorage_pipeVPtr(k, lastSlot);
+				if (!firstC || !lastC || !firstV || !lastV)
+				{
+					setPipeRingAccessError();
+					continue;
+				}
+
+				source = MSX.Node[n2].sources;
+				while (source != NULL)
+				{
+					if (source->species == m)
+						break;
+					source = source->next;
+				}
+				massin = 0;
+				if (source != NULL && source->c0 > 0)
+				{
+					massin = 2.0 * ldispersion * tstep * area * area * (MSX.Node[n2].c[m] - firstC[m]) * LperFT3 / (*firstV);
+				}
+				else if (n2 > njuncs && MSX.Tank[n2 - njuncs].a == 0)
+				{
+					massin = 2.0 * ldispersion * tstep * area * area * (MSX.Node[n2].c[m] - firstC[m]) * LperFT3 / (*firstV);
+				}
+				else if (n2 > njuncs && MSX.Tank[n2 - njuncs].a > 0.0)
+				{
+					massin = 2.0 * ldispersion * tstep * area * area * (MSX.Node[n2].c[m] - firstC[m]) * LperFT3 / (*firstV);
+				}
+				#ifdef USE_OPENMP
+				#pragma omp critical
+				#endif
+				{
+					dispersedin += massin;
+				}
+
+				source = MSX.Node[n1].sources;
+				while (source != NULL)
+				{
+					if (source->species == m)
+						break;
+					source = source->next;
+				}
+				massin = 0;
+				if (source != NULL && source->c0 > 0)
+				{
+					massin = 2.0 * ldispersion * tstep * area * area * (MSX.Node[n1].c[m] - lastC[m]) * LperFT3 / (*lastV);
+				}
+				else if (n1 > njuncs && MSX.Tank[n1 - njuncs].a == 0)
+				{
+					massin = 2.0 * ldispersion * tstep * area * area * (MSX.Node[n1].c[m] - lastC[m]) * LperFT3 / (*lastV);
+				}
+				else if (n1 > njuncs && MSX.Tank[n1 - njuncs].a > 0.0)
+				{
+					massin = 2.0 * ldispersion * tstep * area * area * (MSX.Node[n1].c[m] - lastC[m]) * LperFT3 / (*lastV);
+				}
+				#ifdef USE_OPENMP
+				#pragma omp critical
+				#endif
+				{
+					dispersedin += massin;
+				}
+				continue;
+			}
+
 			seg = MSX.FirstSeg[k];
 			while (seg != NULL)   //update segment concentration based on new up/down node quality
 			{

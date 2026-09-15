@@ -272,9 +272,7 @@ void  MSXtank_mix3(int i, double vin, double *massin, double vnet)
             if (seg->prev)
             {
                 MSX.FirstSeg[k] = seg->prev;
-             //   MSXqual_removeSeg(seg);
-                seg->prev = MSX.FreeSeg;
-                MSX.FreeSeg = seg;
+                MSXqual_removeSeg(seg);
 
             }
         }

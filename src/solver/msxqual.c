@@ -18,6 +18,8 @@
 //#include "mempool.h"
 #include "msxutils.h"
 #include "dispersion.h"
+#include "msxgpu.h"
+#include "msxsegment_storage.h"
 
 // Macros to identify upstream & downstream nodes of a link
 // under the current flow and to compute link volume
@@ -90,6 +92,8 @@ static int    flowdirchanged(void);
 static void   advectSegs(double dt);
 static void   getNewSegWallQual(int k, double dt, Pseg seg);
 static void   shiftSegWallQual(int k, double dt);
+static void   getNewSegWallQualRing(int k, double dt, Pseg seg);
+static void   shiftSegWallQualRing(int k, double dt);
 static void   sourceInput(int n, double vout, double dt);
 static void   addSource(int n, Psource source, double v, double dt);
 static double getSourceQual(Psource source);
@@ -198,6 +202,7 @@ int  MSXqual_open()
     CALL(errcode, MEMCHECK(MSX.MassBalance.reacted));
     CALL(errcode, MEMCHECK(MSX.MassBalance.final));
     CALL(errcode, MEMCHECK(MSX.MassBalance.ratio));
+    if (!errcode) CALL(errcode, MSXsegStorage_open());
 
 // --- check if wall species are present
 
@@ -227,6 +232,8 @@ int  MSXqual_init()
     int errcode = 0;
 
 // --- initialize node concentrations, tank volumes, & source mass flows
+
+    MSX.ErrCode = 0;
 
     for (i=1; i<=MSX.Nobjects[NODE]; i++)
     {
@@ -283,6 +290,7 @@ int  MSXqual_init()
     AllocSetPool(MSX.QualPool);
     MSX.FreeSeg = NULL;
     AllocReset();
+    MSXsegStorage_reset();
 
 // --- re-position hydraulics file
 
@@ -294,6 +302,20 @@ int  MSXqual_init()
     MSX.Qtime = 0;                         //Quality routing time
     MSX.Rtime = MSX.Rstart * 1000;         //Reporting time
     MSX.Nperiods = 0;                      //Number fo reporting periods
+
+    // --- validate strict GPU declarations and initialize timing output
+
+    errcode = MSXgpu_validateStrict();
+    if (errcode)
+    {
+        MSX.GpuError.code = errcode;
+        MSX.ErrCode = errcode;
+        return errcode;
+    }
+    errcode = MSXgpu_openTiming();
+    if (errcode) return errcode;
+    errcode = MSXcpu_openTiming();
+    if (errcode) return errcode;
 
     for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
     {
@@ -390,6 +412,7 @@ int MSXqual_step(double *t, double *tleft)
                     {
                         flowchanged = 1;
                         initSegs();
+                        if (MSX.ErrCode) return MSX.ErrCode;
                     }
                     else 
                         flowchanged = flowdirchanged();
@@ -404,6 +427,7 @@ int MSXqual_step(double *t, double *tleft)
         // --- report results if its time to do so
             if (MSX.Saveflag && MSX.Qtime == MSX.Rtime)
             {
+                MSXsegStorage_syncAllPsegMirrors();
                 CALL(errcode, MSXout_saveResults());
                 MSX.Rtime += MSX.Rstep * 1000;
                 MSX.Nperiods++;
@@ -421,6 +445,7 @@ int MSXqual_step(double *t, double *tleft)
     // --- reduce overall time step by the size of the current time step
 
         tstep -= dt;
+        if (MSX.ErrCode) errcode = MSX.ErrCode;
         if (MSX.OutOfMemory) errcode = ERR_MEMORY;
     } while (!errcode && tstep > 0);
 
@@ -433,6 +458,7 @@ int MSXqual_step(double *t, double *tleft)
 
     if ( *tleft <= 0 && MSX.Saveflag )
     {
+        MSXsegStorage_syncAllPsegMirrors();
         findstoredmass(MSX.MassBalance.final);
         for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
         {
@@ -512,7 +538,32 @@ double  MSXqual_getLinkQual(int k, int m)
 {
     double  vsum = 0.0,
             msum = 0.0;
+    double  *c,
+            *v;
     Pseg    seg;
+    int     pos,
+            n,
+            slot;
+
+    if (MSXsegStorage_isPipeRingLink(k))
+    {
+        n = MSXsegStorage_pipeCount(k);
+        for (pos = 0; pos < n; pos++)
+        {
+            slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+            c = MSXsegStorage_pipeC(k, slot);
+            v = MSXsegStorage_pipeVPtr(k, slot);
+            if (c == NULL || v == NULL) continue;
+            vsum += *v;
+            msum += c[m] * (*v);
+        }
+        if (vsum > 0.0) return(msum/vsum);
+        else
+        {
+            return (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
+                    MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
+        }
+    }
 
     seg = MSX.FirstSeg[k];
     while (seg != NULL)
@@ -546,6 +597,9 @@ int MSXqual_close()
     int errcode = 0;
     if (!MSX.ProjectOpened) return 0;
     MSXchem_close();
+    MSXcpu_closeTiming();
+    MSXgpu_closeTiming();
+    MSXsegStorage_close();
 
     FREE(MSX.C1);
     FREE(MSX.FirstSeg);
@@ -688,6 +742,7 @@ int  transport(int64_t tstep)
 {
     int64_t qtime, dt64;
     double dt;
+    double timer;
     int  errcode = 0;
 
 // --- repeat until time step is exhausted
@@ -701,18 +756,42 @@ int  transport(int64_t tstep)
         dt64 = MIN(MSX.Qstep, tstep-qtime); // get actual time step
         qtime += dt64;                      // update amount of input tstep taken
         dt = dt64 / 1000.;                  // time step as fractional seconds
-        
+
+        MSXgpu_beginStep((MSX.Qtime + qtime) / 1000.0);
+        MSXsegStorage_syncAllPsegMirrors();
+        timer = MSXgpu_wallTimeMs();
+        MSXgpu_reactBegin();
         errcode = MSXchem_react(dt);        // react species in each pipe & tank
-        if ( errcode ) return errcode;
+        MSXgpu_reactEnd();
+        MSX.GpuTimingRecord.react_ms += MSXgpu_wallTimeMs() - timer;
+        MSXsegStorage_syncAllScalarsFromPseg();
+        if ( errcode )
+        {
+            MSXgpu_endStep(errcode);
+            return errcode;
+        }
+        timer = MSXgpu_wallTimeMs();
         advectSegs(dt);                     // advect segments in each pipe
-        
+        MSX.GpuTimingRecord.advect_ms += MSXgpu_wallTimeMs() - timer;
+        if (MSX.ErrCode)
+        {
+            MSXgpu_endStep(MSX.ErrCode);
+            return MSX.ErrCode;
+        }
+
         topological_transport(dt);          //replace accumulate, updateNodes, sourceInput and release
+        MSXsegStorage_syncAllPsegMirrors();
+        if (MSX.ErrCode)
+        {
+            errcode = MSX.ErrCode;
+        }
 
 		if (MSXerr_mathError())             // check for any math error        
 		{
 			MSXerr_writeMathErrorMsg();
 			errcode = ERR_ILLEGAL_MATH;
 		}
+        MSXgpu_endStep(errcode);
    }
    return errcode;
 }
@@ -815,6 +894,7 @@ void  initSegs()
         }
     }
 
+    MSXsegStorage_syncAllPsegMirrors();
     findstoredmass(MSX.MassBalance.initial);    // initial mass
 }
 
@@ -897,8 +977,16 @@ void advectSegs(double dt)
 
         if ( MSX.HasWallSpecies )
         {
-            getNewSegWallQual(k, dt, MSX.NewSeg[k]);
-            shiftSegWallQual(k, dt);
+            if (MSXsegStorage_isPipeRingLink(k))
+            {
+                getNewSegWallQualRing(k, dt, MSX.NewSeg[k]);
+                shiftSegWallQualRing(k, dt);
+            }
+            else
+            {
+                getNewSegWallQual(k, dt, MSX.NewSeg[k]);
+                shiftSegWallQual(k, dt);
+            }
         }
     }
 }
@@ -992,9 +1080,11 @@ void shiftSegWallQual(int k, double dt)
 **    dt = current WQ time step (sec)
 */
 {
-    Pseg  seg1, seg2;
+    Pseg  seg1, seg2, scanSeg;
     int   m;
-    double v, vin, vstart, vend, vcur, vsum;
+    double v, vin, vstart, vend;
+    double scanStart, seg2Start, seg2End;
+    double overlapStart, overlapEnd, overlap;
 
 // --- find volume of water displaced in pipe
 
@@ -1005,6 +1095,8 @@ void shiftSegWallQual(int k, double dt)
 // --- set future start position (measured by pipe volume) of original last segment
 
     vstart = vin;
+    scanSeg = MSX.LastSeg[k];
+    scanStart = 0.0;
 
 // --- examine each segment, from upstream to downstream
 
@@ -1022,25 +1114,52 @@ void shiftSegWallQual(int k, double dt)
 
         vend = vstart + seg1->v;   //
         if (vend > v) vend = v;
-        vcur = vstart;
-        vsum = 0;
 
-    // --- find volume taken up by the segment after it moves down the pipe
+    // --- advance to the first old segment that can overlap this moved segment
 
-        for (seg2 = MSX.LastSeg[k]; seg2 != NULL; seg2 = seg2->next)
+        while (scanSeg != NULL)
         {
-            if ( seg2->v == 0.0 ) continue;
-            vsum += seg2->v;
-            if ( vsum >= vstart && vsum <= vend )  //DS end of seg2 is between vstart and vend 
+            if (scanSeg->v == 0.0)
+            {
+                scanSeg = scanSeg->next;
+                continue;
+            }
+            seg2End = scanStart + scanSeg->v;
+            if (seg2End >= vstart) break;
+            scanStart = seg2End;
+            scanSeg = scanSeg->next;
+        }
+
+    // --- accumulate wall species mass over old segments that overlap the
+    //     moved segment interval [vstart, vend]
+
+        seg2 = scanSeg;
+        seg2Start = scanStart;
+        while (seg2 != NULL && seg2Start < vend)
+        {
+            if (seg2->v == 0.0)
+            {
+                seg2 = seg2->next;
+                continue;
+            }
+
+            seg2End = seg2Start + seg2->v;
+            overlapStart = (vstart > seg2Start) ? vstart : seg2Start;
+            overlapEnd = (vend < seg2End) ? vend : seg2End;
+            overlap = overlapEnd - overlapStart;
+
+            if (overlap > 0.0)
             {
                 for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
                 {
                     if ( MSX.Species[m].type == WALL )
-                        MSX.C1[m] += (vsum - vcur) * seg2->c[m];
+                        MSX.C1[m] += overlap * seg2->c[m];
                 }
-                vcur = vsum;
             }
-            if ( vsum >= vend ) break;  //DS of seg2 is at DS of vend 
+
+            seg2Start = seg2End;
+            if (seg2End >= vend) break;
+            seg2 = seg2->next;
         }
 
     // --- update the wall species concentrations in the segment
@@ -1048,7 +1167,6 @@ void shiftSegWallQual(int k, double dt)
         for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
         {
             if ( MSX.Species[m].type != WALL ) continue;
-            if (seg2 != NULL) MSX.C1[m] += (vend - vcur) * seg2->c[m]; //only part of seg2
             seg1->c[m] = MSX.C1[m] / (vend - vstart);
             if ( seg1->c[m] < 0.0 ) seg1->c[m] = 0.0;
         }
@@ -1057,6 +1175,154 @@ void shiftSegWallQual(int k, double dt)
 
         vstart = vend;
     //    if ( vstart >= v ) break;   //2020 moved up
+    }
+}
+
+
+//=============================================================================
+
+void getNewSegWallQualRing(int k, double dt, Pseg newseg)
+/*
+**  PIPE_RING variant of getNewSegWallQual().  It reads existing pipe
+**  segments through the ring iterator instead of the Pseg mirror chain.
+*/
+{
+    Pseg  seg;
+    int   m, pos, count;
+    double v, vin, vsum, vadded, vleft;
+
+    if ( newseg == NULL ) return;
+    v = LINKVOL(k);
+    vin = ABS(MSX.Q[k])*dt;
+    if (vin > v) vin = v;
+
+    count = MSXsegStorage_pipeCount(k);
+    vsum = 0.0;
+    vleft = vin;
+    for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+    {
+        if ( MSX.Species[m].type == WALL ) newseg->c[m] = 0.0;
+    }
+
+    for (pos = 0; vleft > 0.0 && pos < count; pos++)
+    {
+        seg = MSXsegStorage_pipeSegFromTail(k, pos);
+        if (seg == NULL) break;
+
+        vadded = seg->v;
+        if ( vadded > vleft ) vadded = vleft;
+        vsum += vadded;
+        vleft -= vadded;
+
+        for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+        {
+            if ( MSX.Species[m].type == WALL ) newseg->c[m] += vadded*seg->c[m];
+        }
+    }
+
+    if ( vsum > 0.0 )
+    {
+        for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+        {
+            if ( MSX.Species[m].type == WALL ) newseg->c[m] /= vsum;
+        }
+    }
+}
+
+//=============================================================================
+
+void shiftSegWallQualRing(int k, double dt)
+/*
+**  PIPE_RING variant of shiftSegWallQual().  It preserves the same overlap
+**  math as the Pseg implementation while iterating old/new segments by ring
+**  tail-to-head order.
+*/
+{
+    Pseg  seg1, seg2, scanSeg;
+    int   m, count, pos1, scanPos, pos2;
+    double v, vin, vstart, vend;
+    double scanStart, seg2Start, seg2End;
+    double overlapStart, overlapEnd, overlap;
+
+    v = LINKVOL(k);
+    vin = ABS((double)MSX.Q[k])*dt;
+    if (vin > v) vin = v;
+
+    count = MSXsegStorage_pipeCount(k);
+    vstart = vin;
+    scanPos = 0;
+    scanSeg = MSXsegStorage_pipeSegFromTail(k, scanPos);
+    scanStart = 0.0;
+
+    for (pos1 = 0; pos1 < count; pos1++)
+    {
+        seg1 = MSXsegStorage_pipeSegFromTail(k, pos1);
+        if (seg1 == NULL) break;
+        if (vstart >= v) break;
+
+        for (m = 1; m <= MSX.Nobjects[SPECIES]; m++) MSX.C1[m] = 0.0;
+
+        vend = vstart + seg1->v;
+        if (vend > v) vend = v;
+
+        while (scanSeg != NULL)
+        {
+            if (scanSeg->v == 0.0)
+            {
+                scanPos++;
+                scanSeg = MSXsegStorage_pipeSegFromTail(k, scanPos);
+                continue;
+            }
+            seg2End = scanStart + scanSeg->v;
+            if (seg2End >= vstart) break;
+            scanStart = seg2End;
+            scanPos++;
+            scanSeg = MSXsegStorage_pipeSegFromTail(k, scanPos);
+        }
+
+        pos2 = scanPos;
+        seg2 = scanSeg;
+        seg2Start = scanStart;
+        while (seg2 != NULL && seg2Start < vend)
+        {
+            if (seg2->v == 0.0)
+            {
+                pos2++;
+                seg2 = MSXsegStorage_pipeSegFromTail(k, pos2);
+                continue;
+            }
+
+            seg2End = seg2Start + seg2->v;
+            overlapStart = (vstart > seg2Start) ? vstart : seg2Start;
+            overlapEnd = (vend < seg2End) ? vend : seg2End;
+            overlap = overlapEnd - overlapStart;
+
+            if (overlap > 0.0)
+            {
+                for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+                {
+                    if ( MSX.Species[m].type == WALL )
+                        MSX.C1[m] += overlap * seg2->c[m];
+                }
+            }
+
+            seg2Start = seg2End;
+            if (seg2End >= vend) break;
+            pos2++;
+            seg2 = MSXsegStorage_pipeSegFromTail(k, pos2);
+        }
+
+        if (vend > vstart)
+        {
+            for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+            {
+                if ( MSX.Species[m].type != WALL ) continue;
+                seg1->c[m] = MSX.C1[m] / (vend - vstart);
+                if ( seg1->c[m] < 0.0 ) seg1->c[m] = 0.0;
+            }
+        }
+
+        vstart = vend;
     }
 }
 
@@ -1239,6 +1505,11 @@ void  removeAllSegs(int k)
 */
 {
     Pseg seg;
+    if (MSXsegStorage_isPipeRingLink(k))
+    {
+        MSXsegStorage_pipeClear(k);
+        return;
+    }
     seg = MSX.FirstSeg[k];
     while (seg != NULL)
     {
@@ -1255,6 +1526,7 @@ void topological_transport(double dt)
 {
     int j, n, k, m;
     double volin, volout;
+    double timer;
     Padjlist  alink;
 
 
@@ -1282,7 +1554,9 @@ void topological_transport(double dt)
             if (MSX.FlowDir[k] < 0) m = MSX.Link[k].n1;
             if (m == n)
             {
+                timer = MSXgpu_wallTimeMs();
                 evalnodeinflow(k, dt, &volin, MSX.MassIn);
+                MSX.GpuTimingRecord.release_ms += MSXgpu_wallTimeMs() - timer;
             }
 
             // ... link has flow out of node - add it to node's outflow
@@ -1299,7 +1573,9 @@ void topological_transport(double dt)
         volout *= dt;
 
         // ... find the concentration of flow leaving the node
+        timer = MSXgpu_wallTimeMs();
         findnodequal(n, volin, MSX.MassIn, volout, dt);
+        MSX.GpuTimingRecord.mix_ms += MSXgpu_wallTimeMs() - timer;
 
         // ... examine each link with flow out of the node
         for (alink = MSX.Adjlist[n]; alink != NULL; alink = alink->next)
@@ -1311,7 +1587,9 @@ void topological_transport(double dt)
             if (m == n)
             {
                 // ... send flow at new node concen. into link
+                timer = MSXgpu_wallTimeMs();
                 evalnodeoutflow(k, MSX.Node[n].c, dt);
+                MSX.GpuTimingRecord.release_ms += MSXgpu_wallTimeMs() - timer;
             }
         }
 
@@ -1321,6 +1599,7 @@ void topological_transport(double dt)
     //2. Compose the nodal equations
     //3. Solve the matrix to update nodal concentration
     //4. Update segment concentration
+    timer = MSXgpu_wallTimeMs();
     for (int m = 1; m <= MSX.Nobjects[SPECIES]; m++)
     {
         if (MSX.Dispersion.md[m] > 0 || MSX.Dispersion.ld[m] > 0)
@@ -1330,6 +1609,7 @@ void topological_transport(double dt)
             segqual_update(m, dt);
         }
     }
+    MSX.GpuTimingRecord.disperse_ms += MSXgpu_wallTimeMs() - timer;
 }
 
 
@@ -1361,6 +1641,35 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
     {
         if (MSX.Species[m].type == BULK)
             MSX.NewSeg[k]->c[m] = upnodequal[m];
+    }
+
+    if (MSXsegStorage_isPipeRingLink(k))
+    {
+        seg = MSXsegStorage_pipePeekTail(k);
+        if (seg)
+        {
+            if (!MSXqual_isSame(seg->c, upnodequal) && MSX.Link[k].nsegs < MSX.MaxSegments)
+                useNewSeg = 1;
+            else
+                useNewSeg = 0;
+
+            if (useNewSeg == 0)
+            {
+                MSXsegStorage_pipeMergeTail(k, upnodequal, v);
+                MSXqual_removeSeg(MSX.NewSeg[k]);
+            }
+            else
+            {
+                MSX.NewSeg[k]->v = v;
+                MSX.ErrCode = MSXsegStorage_pipeAppendTail(k, MSX.NewSeg[k]);
+            }
+        }
+        else
+        {
+            MSX.NewSeg[k]->v = v;
+            MSX.ErrCode = MSXsegStorage_pipeAppendTail(k, MSX.NewSeg[k]);
+        }
+        return;
     }
 
     // ... case where link has a last (most upstream) segment
@@ -1430,6 +1739,34 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
     q = MSX.Q[k];
     v = fabs(q) * tstep;
 
+    if (MSXsegStorage_isPipeRingLink(k))
+    {
+        while (v > 0.0)
+        {
+            seg = MSXsegStorage_pipePeekHead(k);
+            if (!seg) break;
+
+            vseg = seg->v;
+            vseg = MIN(vseg, v);
+
+            *volin += vseg;
+            for (sindex = 1; sindex <= MSX.Nobjects[SPECIES]; sindex++)
+                massin[sindex] += vseg * seg->c[sindex] * LperFT3;
+
+            v -= vseg;
+
+            if (v >= 0.0 && vseg >= seg->v)
+            {
+                MSXsegStorage_pipePopHead(k);
+            }
+            else
+            {
+                MSXsegStorage_pipeConsumeHead(k, vseg);
+            }
+        }
+        return;
+    }
+
     // Transport flow volume v from link's leading segments into downstream
     // node, removing segments once their full volume is consumed
     while (v > 0.0)
@@ -1460,8 +1797,7 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
             else MSX.FirstSeg[k]->next = NULL; //03/19/2024 added to break the linked segments 
 		    
             // ... recycle the used up segment
-            seg->prev = MSX.FreeSeg;
-            MSX.FreeSeg = seg;
+            MSXqual_removeSeg(seg);
         }
 
         // ... otherwise just reduce this segment's volume
@@ -1744,19 +2080,27 @@ void  noflowqual(int n)
         if (MSX.Link[k].n2 == n && dir >= 0) inflow = TRUE;
         else if (MSX.Link[k].n1 == n && dir < 0)  inflow = TRUE;
         else inflow = FALSE;
-        if (inflow == TRUE && MSX.FirstSeg[k] != NULL)
+        if (inflow == TRUE &&
+            ((MSXsegStorage_isPipeRingLink(k) && MSXsegStorage_pipePeekHead(k) != NULL) ||
+             (!MSXsegStorage_isPipeRingLink(k) && MSX.FirstSeg[k] != NULL)))
         {
+            Pseg endseg = MSXsegStorage_isPipeRingLink(k) ?
+                          MSXsegStorage_pipePeekHead(k) : MSX.FirstSeg[k];
             for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
-                MSX.Node[n].c[m] += MSX.FirstSeg[k]->c[m];
+                MSX.Node[n].c[m] += endseg->c[m];
             kount++;
         }
 
         // Node n is link's upstream node - add quality
         // of link's last segment to average
-        else if (inflow == FALSE && MSX.LastSeg[k] != NULL)
+        else if (inflow == FALSE &&
+                 ((MSXsegStorage_isPipeRingLink(k) && MSXsegStorage_pipePeekTail(k) != NULL) ||
+                  (!MSXsegStorage_isPipeRingLink(k) && MSX.LastSeg[k] != NULL)))
         {
+            Pseg endseg = MSXsegStorage_isPipeRingLink(k) ?
+                          MSXsegStorage_pipePeekTail(k) : MSX.LastSeg[k];
             for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
-                MSX.Node[n].c[m] += MSX.LastSeg[k]->c[m];
+                MSX.Node[n].c[m] += endseg->c[m];
             kount++;
         }
     }
@@ -1777,7 +2121,10 @@ void findstoredmass(double * mass)
 {
 
     int    i, k, m;
+    int    pos, n, slot;
     Pseg   seg;
+    double *c;
+    double *v;
 
     for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
     {
@@ -1787,6 +2134,26 @@ void findstoredmass(double * mass)
     // Mass residing in each pipe
     for (k = 1; k <= MSX.Nobjects[LINK]; k++)
     {
+        if (MSXsegStorage_isPipeRingLink(k))
+        {
+            n = MSXsegStorage_pipeCount(k);
+            for (pos = 0; pos < n; pos++)
+            {
+                slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+                c = MSXsegStorage_pipeC(k, slot);
+                v = MSXsegStorage_pipeVPtr(k, slot);
+                if (c == NULL || v == NULL) continue;
+                for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+                {
+                    if (MSX.Species[m].type == BULK)
+                        mass[m] += c[m] * (*v) * LperFT3;  //M/L * ft3 * L/Ft3 = M
+                    else
+                        mass[m] += c[m] * (*v) * 4.0 / MSX.Link[k].diam * MSX.Ucf[AREA_UNITS]; //Mass per area unit * ft3 / ft * area unit per ft2;
+                }
+            }
+            continue;
+        }
+
         // Sum up the quality and volume in each segment of the link
         seg = MSX.FirstSeg[k];
         while (seg != NULL)
@@ -1837,6 +2204,12 @@ void MSXqual_reversesegs(int k)
 {
     Pseg  seg, cseg, pseg;
 
+    if (MSXsegStorage_isPipeRingLink(k))
+    {
+        MSXsegStorage_pipeReverse(k);
+        return;
+    }
+
     seg = MSX.FirstSeg[k];
     MSX.FirstSeg[k] = MSX.LastSeg[k];
     MSX.LastSeg[k] = seg;
@@ -1865,6 +2238,7 @@ void MSXqual_removeSeg(Pseg seg)
 */
 {
     if ( seg == NULL ) return;
+    MSXsegStorage_unbindSegment(seg);
     seg->prev = MSX.FreeSeg;
     seg->next = NULL;
     MSX.FreeSeg = seg;
@@ -1886,7 +2260,6 @@ Pseg MSXqual_getFreeSeg(double v, double c[])
 */
 {
     Pseg seg;
-    int  m;
 
 // --- try using the last discarded segment if one is available
 
@@ -1906,19 +2279,16 @@ Pseg MSXqual_getFreeSeg(double v, double c[])
             MSX.OutOfMemory = TRUE;
             return NULL;
         }
-        seg->c = (double *) Alloc((MSX.Nobjects[SPECIES]+1)*sizeof(double));
-        seg->lastc = (double *)Alloc((MSX.Nobjects[SPECIES] + 1) * sizeof(double));
-        if ( seg->c == NULL||seg->lastc == NULL)
-        {
-            MSX.OutOfMemory = TRUE;
-            return NULL;
-        }
+        memset(seg, 0, sizeof(struct Sseg));
     }
+
+    if (MSXsegStorage_preparePrivate(seg))
+        return NULL;
 
 // --- assign volume, WQ, & integration time step to the new segment
 
     seg->v = v;
-    for (m=1; m<=MSX.Nobjects[SPECIES]; m++) seg->c[m] = c[m];
+    MSXsegStorage_initPrivateValues(seg, c);
     seg->hstep = 0.0;
     return seg;
 }
@@ -1936,6 +2306,21 @@ void  MSXqual_addSeg(int k, Pseg seg)
 */
 
 {
+    int errcode;
+    if (seg == NULL) return;
+    if (MSX.ErrCode) return;
+    if (MSXsegStorage_isPipeRingLink(k))
+    {
+        errcode = MSXsegStorage_pipeAppendTail(k, seg);
+        if (errcode) MSX.ErrCode = errcode;
+        return;
+    }
+    errcode = MSXsegStorage_bindPipeSegment(k, seg);
+    if (errcode)
+    {
+        MSX.ErrCode = errcode;
+        return;
+    }
     seg->prev = NULL;
     seg->next = NULL;
     if (MSX.FirstSeg[k] == NULL) MSX.FirstSeg[k] = seg;

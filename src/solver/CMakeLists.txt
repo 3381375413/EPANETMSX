@@ -8,6 +8,12 @@
 #
 
 find_package(OpenMP)
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND AND CUDAToolkit_NVCC_EXECUTABLE)
+    set(EPANETMSX_REACT_TRANSFER_STATIC_CUDA ON)
+else()
+    set(EPANETMSX_REACT_TRANSFER_STATIC_CUDA OFF)
+endif()
 
 
 set(EPANETMSX_PUBLIC_HEADERS
@@ -18,6 +24,37 @@ file(GLOB
     EPANETMSX_SOURCES
     RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *.c *.h *.dat
 )
+
+if(EPANETMSX_REACT_TRANSFER_STATIC_CUDA)
+    set(REACT_TRANSFER_CUDA_OBJ ${CMAKE_CURRENT_BINARY_DIR}/msxreact_transfer_cuda.obj)
+    set(REACT_TRANSFER_CUDA_OPENMP_FLAG "")
+    if(OpenMP_C_FOUND AND MSVC)
+        set(REACT_TRANSFER_CUDA_OPENMP_FLAG "-Xcompiler=/openmp")
+    elseif(OpenMP_C_FOUND)
+        set(REACT_TRANSFER_CUDA_OPENMP_FLAG "-Xcompiler=-fopenmp")
+    endif()
+    add_custom_command(
+        OUTPUT ${REACT_TRANSFER_CUDA_OBJ}
+        COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
+            -c ${CMAKE_CURRENT_SOURCE_DIR}/msxreact_transfer_cuda.cu
+            -allow-unsupported-compiler
+            -o ${REACT_TRANSFER_CUDA_OBJ}
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -I${CMAKE_CURRENT_SOURCE_DIR}/..
+            -I${PROJECT_SOURCE_DIR}/EPANET2.2/SRC_engines/include
+            -I${CUDAToolkit_INCLUDE_DIRS}
+            -DEPANETMSX_CUDA_ENABLED
+            -D_CRT_SECURE_NO_WARNINGS
+            -Xcompiler=/MD
+            ${REACT_TRANSFER_CUDA_OPENMP_FLAG}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msxreact_transfer_cuda.cu
+                ${CMAKE_CURRENT_SOURCE_DIR}/msxreact_transfer_cuda.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/msxsegment_storage.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/msxtypes.h
+        VERBATIM
+    )
+    list(APPEND EPANETMSX_SOURCES ${REACT_TRANSFER_CUDA_OBJ})
+endif()
 
 if(BUILD_DEF)
     # Builds library with def file interface for backward compatibility
@@ -38,6 +75,12 @@ else()
 
 endif()
 
+if(MSVC)
+    set_property(TARGET epanetmsx PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+    )
+endif()
+
 target_link_libraries(epanetmsx
     PUBLIC
         epanet2
@@ -48,6 +91,24 @@ if(OpenMP_C_FOUND)
     target_compile_definitions(epanetmsx
         PUBLIC
             USE_OPENMP
+    )
+endif()
+
+if(CUDAToolkit_FOUND)
+    target_compile_definitions(epanetmsx
+        PRIVATE
+            EPANETMSX_CUDA_ENABLED
+    )
+    target_include_directories(epanetmsx
+        PRIVATE
+            ${CUDAToolkit_INCLUDE_DIRS}
+    )
+endif()
+
+if(EPANETMSX_REACT_TRANSFER_STATIC_CUDA)
+    target_compile_definitions(epanetmsx
+        PRIVATE
+            EPANETMSX_REACT_TRANSFER_STATIC_CUDA
     )
 endif()
 
@@ -68,6 +129,7 @@ target_link_options(epanetmsx
     PUBLIC
         "$<$<C_COMPILER_ID:MSVC>:"
             "$<$<CONFIG:Release>:/LTCG:incremental>"
+            "$<$<BOOL:${CUDAToolkit_FOUND}>:/NODEFAULTLIB:LIBCMT>"
         ">"
 )
 
@@ -90,7 +152,11 @@ target_link_libraries(epanetmsx
         $<$<NOT:$<BOOL:$<C_COMPILER_ID:MSVC>>>:m>
         $<$<BOOL:${OpenMP_C_FOUND}>:OpenMP::OpenMP_C>
         $<$<BOOL:${OpenMP_AVAILABLE}>:omp>
+        $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cuda_driver>
+        $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::nvrtc>
+        $<$<BOOL:${EPANETMSX_REACT_TRANSFER_STATIC_CUDA}>:CUDA::cudart>
 )
+
 
 
 target_include_directories(epanetmsx

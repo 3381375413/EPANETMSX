@@ -211,7 +211,40 @@ typedef  float REAL4;
                   ATOL_OPTION,
                   COMPILER_OPTION,
                   MAXSEGMENT_OPTION,
-                  PECLETNUMER_OPTION};                                            
+                  PECLETNUMER_OPTION,
+                  GPU_COMPILER_OPTION,
+                  GPU_STRICT_OPTION,
+                  GPU_REACT_SCOPE_OPTION,
+                  GPU_REACT_OPTION,
+                  GPU_ODE_OPTION,
+                  GPU_EQUIL_OPTION,
+                  GPU_FORMULA_OPTION,
+                  GPU_SOLVER_OPTION,
+                  GPU_RK5_MODE_OPTION,
+                  GPU_TIMING_DETAIL_OPTION,
+                  GPU_TIMING_OPTION,
+                  CPU_TIMING_OPTION,
+                  SEGMENT_STORAGE_OPTION,
+                  PIPE_RING_CAP_OPTION};
+
+ enum SegmentStorageType              // Pipe segment concentration storage
+                 {SEG_STORAGE_PSEG,
+                  SEG_STORAGE_PIPE_RING};
+
+ enum GpuReactScopeType                // Scope requested for GPU reactions
+                 {GPU_PIPE_SEGMENT,
+                  GPU_FULL_REACT};
+
+ enum GpuRk5ModeType                   // GPU RK5 execution mode
+                 {GPU_RK5_CPU_ALIGN,
+                  GPU_RK5_FAST_BUCKET};
+
+ enum GpuStageType                     // Stage stored in GPU error details
+                 {GPU_STAGE_NONE,
+                  GPU_STAGE_ODE,
+                  GPU_STAGE_EQUIL,
+                  GPU_STAGE_FORMULA,
+                  GPU_STAGE_RATE};
 
  enum CompilerType                     // C compiler type                      
                  {NO_COMPILER,
@@ -264,8 +297,25 @@ typedef  float REAL4;
            ERR_OPEN_RPT_FILE,          // 521                                             
            ERR_COMPILE_FAILED,         // 522                                  
            ERR_COMPILED_LOAD,          // 523                                  
-           ERR_ILLEGAL_MATH,           // 524                                        
+           ERR_ILLEGAL_MATH,           // 524
+           ERR_PIPE_RING_CAPACITY,     // 525
            ERR_MAX};
+
+ enum GpuErrorCodeType                 // GPU strict-mode errors (9000-9013)
+          {ERR_GPU_NOT_ENABLED = 9000,
+           ERR_GPU_UNSUPPORTED_FEATURE,
+           ERR_GPU_SOLVER_UNSUPPORTED,
+           ERR_GPU_EQUIL_UNSUPPORTED,
+           ERR_GPU_FULL_COUPLING_UNSUPPORTED,
+           ERR_GPU_NVRTC_COMPILE_FAILED,
+           ERR_GPU_MEMORY_ALLOCATION_FAILED,
+           ERR_GPU_KERNEL_LAUNCH_FAILED,
+           ERR_GPU_KERNEL_RUNTIME_ERROR,
+           ERR_GPU_ODE_INTEGRATION_FAILED,
+           ERR_GPU_EQUIL_NOT_CONVERGED,
+           ERR_GPU_FORMULA_INVALID,
+           ERR_GPU_NUMERIC_INVALID,
+           ERR_GPU_SEGMENT_PACK_FAILED};
 
 
 //-----------------------------------------------------------------------------
@@ -353,7 +403,13 @@ struct Sseg                            // PIPE SEGMENT OBJECT
     struct    Sseg *next;              // ptr. to next segment
     double    hresponse,               // for dispersion response of initial,
               uresponse,               // upstream and downstream condition 
-              dresponse;    
+              dresponse;
+    int       ownerLink;               // owning link/tank index
+    int       ringSlot;                // pipe-local ring slot index
+    int       ringIndex;               // flat ring row index
+    char      inPipeRing;              // TRUE if c/lastc point to pipe ring row
+    double    *privateC;               // private segment concentration storage
+    double    *privateLastC;           // private previous-step concentration storage
 };
 typedef struct Sseg *Pseg;
 
@@ -403,6 +459,71 @@ typedef struct                         // FILE OBJECT
    char          mode;                 // see FileModeType enumeration below
    FILE*         file;                 // FILE structure pointer
 }  TFile;
+
+typedef struct                         // First detailed GPU error
+{
+    int code;
+    int stage;
+    int sid;
+    int pipe;
+    int species;
+    int expr;
+    int iter;
+    double value;
+} GpuErrorInfo;
+
+typedef struct                         // Per-quality-substep timing record
+{
+    long long step_index;
+    double sim_time_sec;
+    int gpu_enabled;
+    int gpu_strict;
+    int react_gpu;
+    int advect_gpu;
+    int mix_gpu;
+    int release_gpu;
+    int disperse_gpu;
+    int ode_gpu;
+    int equil_gpu;
+    int formula_gpu;
+    int full_coupling;
+    int equil_time_embedded;
+    double total_ms;
+    double react_ms;
+    double advect_ms;
+    double mix_ms;
+    double release_ms;
+    double disperse_ms;
+    double react_pack_ms;
+    double h2d_ms;
+    double react_ode_ms;
+    double react_equil_ms;
+    double react_formula_ms;
+    double d2h_ms;
+    double react_unpack_ms;
+    double jit_ms;
+    double nvrtc_compile_ms;
+    double ptx_cache_read_ms;
+    double cu_module_load_ms;
+    double kernel_lookup_ms;
+    double rk5_nfcn;
+    double rk5_naccpt;
+    double rk5_nrejct;
+    double rk5_last_hstep;
+    double rk5_bucket_count;
+    double rk5_bucket_launches;
+    double rk5_bucket_max_size;
+    double rk5_bucket_reorder_ms;
+    double react_count_parallel_ms;
+    double react_count_prefix_ms;
+    double react_pack_segment_ms;
+    double react_host_alloc_ms;
+    double react_device_alloc_ms;
+    double react_scatter_ms;
+    int rk5_fast_mode;
+    int rk5_error_code;
+    int error_code;
+} MSXGpuTiming;
 
 
 
@@ -490,7 +611,21 @@ typedef struct                         // MSX PROJECT VARIABLES
           Nperiods,                    // Number of reporting periods
           ErrCode,                     // Error code
           ProjectOpened,               // Project opened flag
-          QualityOpened;               // Water quality system opened flag
+          QualityOpened,               // Water quality system opened flag
+          GpuCompiler,                 // NVRTC/CUDA compiler requested
+          GpuStrict,                   // prohibit fallback for GPU declarations
+          GpuReact,                    // GPU React requested
+          GpuReactScope,               // PIPE_SEGMENT or FULL_REACT
+          GpuOde,                      // GPU ODE requested
+          GpuEquil,                    // GPU EQUIL requested
+          GpuFormula,                  // GPU FORMULA requested
+          GpuSolver,                   // requested GPU ODE solver
+          GpuRk5Mode,                  // CPU_ALIGN or FAST_BUCKET for GPU RK5
+          GpuTiming,                   // timing CSV enabled
+          GpuTimingDetail,             // React detail timing enabled
+          CpuTiming,                   // CPU timing CSV enabled
+          SegmentStorage,              // SEGMENT_STORAGE option
+          PipeRingCap;                 // fixed slots per pipe for PIPE_RING
    int    MaxSegments;                 // Maximum number of segments in a link  
    long   HydOffset,                   // Hydraulics file byte offset
           Pstep,                       // Time pattern time step (sec)
@@ -536,6 +671,8 @@ typedef struct                         // MSX PROJECT VARIABLES
    Pseg  FreeSeg;                      // pointer to unused segment
    FlowDirection *FlowDir;             // flow direction for each pipe
    SmassBalance MassBalance;
+   MSXGpuTiming GpuTimingRecord;
+   GpuErrorInfo GpuError;
    alloc_handle_t* QualPool;           // memory pool
 
    int DispersionFlag;                 // 1 if dispersion modeling

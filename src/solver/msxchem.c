@@ -19,6 +19,8 @@
 #include "ros2.h"
 #include "newton.h"
 #include "msxfuncs.h"                                                          
+#include "msxgpu.h"
+#include "msxsegment_storage.h"
 
 //  External variables
 //--------------------
@@ -79,7 +81,9 @@ double MSXerr_validate(double x, int index, int element, int exprType);
 static void   setSpeciesChemistry(void);
 static void   setTankChemistry(void);
 //static void   evalHydVariables(int k);           
+static int    evalPipeSegmentReaction(int k, double dt, Pseg seg);
 static int    evalPipeReactions(int k, double dt);
+static int    evalPipeRingReactions(int k, double dt);
 static int    evalTankReactions(int k, double dt);
 static int    evalPipeEquil(double *c);
 static int    evalTankEquil(double *c);
@@ -279,26 +283,37 @@ int MSXchem_react(double dt)
     }
 
 // --- examine each link
+
+    if (MSX.GpuReact && MSX.GpuReactScope == GPU_PIPE_SEGMENT)
+    {
+        errcode = MSXgpu_reactPipeSegments(dt);
+    }
+    else
+    {
 #pragma omp parallel
 {
-    #pragma omp for private(k)
-    for (k = 1; k <= MSX.Nobjects[LINK]; k++)
-    {
-        // --- skip non-pipe links
+        #pragma omp for private(k)
+        for (k = 1; k <= MSX.Nobjects[LINK]; k++)
+        {
+            // --- skip non-pipe links
 
-        if (MSX.Link[k].len == 0.0) continue;
+            if (MSX.Link[k].len == 0.0) continue;
 
-        // --- evaluate hydraulic variables
+            // --- evaluate hydraulic variables
 
-        //evalHydVariables(k);
-        for (int hi = 1; hi < MAX_HYD_VARS; hi++)
-            HydVar[hi] = MSX.Link[k].HydVar[hi];
-         // --- compute pipe reactions
+            //evalHydVariables(k);
+            for (int hi = 1; hi < MAX_HYD_VARS; hi++)
+                HydVar[hi] = MSX.Link[k].HydVar[hi];
+             // --- compute pipe reactions
 
-         errcode = evalPipeReactions(k, dt);
-        //if (errcode) return errcode;
-    }
+             if (MSXsegStorage_isPipeRingLink(k))
+                 errcode = evalPipeRingReactions(k, dt);
+             else
+                 errcode = evalPipeReactions(k, dt);
+            //if (errcode) return errcode;
+        }
 }
+    }
     if (errcode) return errcode;
 
 // --- save tolerances of tank rate species
@@ -346,20 +361,35 @@ int MSXchem_equil(int zone, int k, double *c)
 */
 {
     int errcode = 0;
+    double timer;
     if ( zone == LINK )
     {
         TheLink = k;
         for (int vi = 1; vi < MAX_HYD_VARS; vi++)
             HydVar[vi] = MSX.Link[k].HydVar[vi];
-        if ( NumPipeEquilSpecies > 0 ) errcode = evalPipeEquil(c);
+        if ( NumPipeEquilSpecies > 0 )
+        {
+            timer = MSXgpu_wallTimeMs();
+            errcode = evalPipeEquil(c);
+            MSXgpu_addEquilTime(MSXgpu_wallTimeMs() - timer);
+        }
+        timer = MSXgpu_wallTimeMs();
         evalPipeFormulas(c);
+        MSXgpu_addFormulaTime(MSXgpu_wallTimeMs() - timer);
     }
     if ( zone == NODE )
     {
         TheTank = k;
         TheNode = MSX.Tank[k].node;
-        if ( NumTankEquilSpecies > 0 ) errcode = evalTankEquil(c);
+        if ( NumTankEquilSpecies > 0 )
+        {
+            timer = MSXgpu_wallTimeMs();
+            errcode = evalTankEquil(c);
+            MSXgpu_addEquilTime(MSXgpu_wallTimeMs() - timer);
+        }
+        timer = MSXgpu_wallTimeMs();
         evalTankFormulas(c);
+        MSXgpu_addFormulaTime(MSXgpu_wallTimeMs() - timer);
     }
     return errcode;
 }
@@ -516,6 +546,120 @@ void setTankChemistry()
 
 //=============================================================================
 
+int evalPipeSegmentReaction(int k, double dt, Pseg seg)
+/*
+**  Purpose:
+**    updates species concentrations in one WQ segment of a pipe after
+**    reactions occur over time step dt.
+**
+**  Input:
+**    k = link index
+**    dt = time step (sec).
+**    seg = pipe segment.
+**
+**  Output:
+**    updates values in the concentration vector C[] associated with seg.
+**
+**  Returns:
+**    an error code or 0 if no error.
+*/
+{
+    int i, m;
+    int errcode = 0, ierr = 0;
+    double tstep = (double)dt / MSX.Ucf[RATE_UNITS];
+    double c, dh;
+    double odeStartMs;
+
+    TheLink = k;
+    TheSeg = seg;
+
+    for (m = 1; m <= NumSpecies; m++)
+    {
+        ChemC1[m] = TheSeg->c[m];
+        TheSeg->lastc[m] = TheSeg->c[m];
+    }
+    ierr = 0;
+
+    // --- react each reacting species over the time step
+
+    if ( dt > 0.0 )
+    {
+        odeStartMs = MSXgpu_wallTimeMs();
+
+        // --- place current concentrations of species that react in vector Yrate
+
+        for (i=1; i<=NumPipeRateSpecies; i++)
+        {
+            m = PipeRateSpecies[i];
+            Yrate[i] = TheSeg->c[m];
+        }
+        
+        // --- Euler integrator
+
+        if ( MSX.Solver == EUL )
+        {
+            getPipeDcDt(0, Yrate, NumPipeRateSpecies, Yrate);
+            for (i=1; i<=NumPipeRateSpecies; i++)
+            {
+                m = PipeRateSpecies[i];
+                c = TheSeg->c[m] + Yrate[i]*tstep;
+                TheSeg->c[m] = MAX(c, 0.0);
+            }
+        }
+
+        // --- other integrators
+        else
+        {
+            dh = TheSeg->hstep;
+
+            // --- Runge-Kutta integrator
+
+            if ( MSX.Solver == RK5 )
+                ierr = rk5_integrate(Yrate, NumPipeRateSpecies, 0, tstep,
+                                     &dh, Atol, Rtol, getPipeDcDt);
+
+            // --- Rosenbrock integrator
+
+            if ( MSX.Solver == ROS2 )
+                ierr = ros2_integrate(Yrate, NumPipeRateSpecies, 0, tstep,
+                                      &dh, Atol, Rtol, getPipeDcDt);
+
+            // --- save new concentration values of the species that reacted
+
+            for (m=1; m<=NumSpecies; m++) TheSeg->c[m] = ChemC1[m];
+            for (i=1; i<=NumPipeRateSpecies; i++)
+            {
+                m = PipeRateSpecies[i];
+                TheSeg->c[m] = MAX(Yrate[i], 0.0);
+            }
+            TheSeg->hstep = dh;
+        }
+        MSXgpu_addOdeTime(MSXgpu_wallTimeMs() - odeStartMs);
+        if ( ierr < 0 ) return 
+            ERR_INTEGRATOR;
+
+        for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+        {
+            if (MSX.Species[m].type == BULK)
+            {
+                MSX.Link[k].reacted[m] += TheSeg->v * (TheSeg->c[m] - TheSeg->lastc[m]) * LperFT3;
+            }
+            else if (MSX.Link[k].diam > 0)
+            {
+                MSX.Link[k].reacted[m] += TheSeg->v * 4.0 / MSX.Link[k].diam * MSX.Ucf[AREA_UNITS] * (TheSeg->c[m] - TheSeg->lastc[m]);
+            }
+            TheSeg->lastc[m] = TheSeg->c[m];
+        }
+    }
+
+    // --- compute new equilibrium concentrations within segment
+
+    errcode = MSXchem_equil(LINK, k, TheSeg->c);
+    return errcode;
+}
+
+//=============================================================================
+
 int evalPipeReactions(int k, double dt)
 /*
 **  Purpose:
@@ -536,101 +680,56 @@ int evalPipeReactions(int k, double dt)
 **  Re-written to accommodate compiled functions (1.1)                         
 */
 {
-    int i, m;
-    int errcode = 0, ierr = 0;
-    double tstep = (double)dt / MSX.Ucf[RATE_UNITS];
-    double c, dh;
+    int errcode = 0;
+    Pseg seg;
 
 // --- start with the most downstream pipe segment
 
-    TheLink = k;
-    TheSeg = MSX.FirstSeg[TheLink];
-    while ( TheSeg )
+    seg = MSX.FirstSeg[k];
+    while ( seg )
     {
-        for (m = 1; m <= NumSpecies; m++)
-        {
-            ChemC1[m] = TheSeg->c[m];
-            TheSeg->lastc[m] = TheSeg->c[m];
-        }
-        ierr = 0;
-
-    // --- react each reacting species over the time step
-
-        if ( dt > 0.0 )
-        {
-
-        // --- place current concentrations of species that react in vector Yrate
-
-            for (i=1; i<=NumPipeRateSpecies; i++)
-            {
-                m = PipeRateSpecies[i];
-                Yrate[i] = TheSeg->c[m];
-            }
-        
-        // --- Euler integrator
-
-            if ( MSX.Solver == EUL )
-            {
-                getPipeDcDt(0, Yrate, NumPipeRateSpecies, Yrate);
-                for (i=1; i<=NumPipeRateSpecies; i++)
-                {
-                    m = PipeRateSpecies[i];
-                    c = TheSeg->c[m] + Yrate[i]*tstep;
-                    TheSeg->c[m] = MAX(c, 0.0);
-                }
-            }
-
-        // --- other integrators
-            else
-            {
-                dh = TheSeg->hstep;
-
-            // --- Runge-Kutta integrator
-
-                if ( MSX.Solver == RK5 )
-                    ierr = rk5_integrate(Yrate, NumPipeRateSpecies, 0, tstep,
-                                         &dh, Atol, Rtol, getPipeDcDt);
-
-            // --- Rosenbrock integrator
-
-                if ( MSX.Solver == ROS2 )
-                    ierr = ros2_integrate(Yrate, NumPipeRateSpecies, 0, tstep,
-                                          &dh, Atol, Rtol, getPipeDcDt);
-
-            // --- save new concentration values of the species that reacted
-
-                for (m=1; m<=NumSpecies; m++) TheSeg->c[m] = ChemC1[m];
-                for (i=1; i<=NumPipeRateSpecies; i++)
-                {
-                    m = PipeRateSpecies[i];
-                    TheSeg->c[m] = MAX(Yrate[i], 0.0);
-                }
-                TheSeg->hstep = dh;
-            }
-            if ( ierr < 0 ) return 
-                ERR_INTEGRATOR;
-
-            for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
-            {
-                if (MSX.Species[m].type == BULK)
-                {
-                    MSX.Link[k].reacted[m] += TheSeg->v * (TheSeg->c[m] - TheSeg->lastc[m]) * LperFT3;
-                }
-                else if (MSX.Link[k].diam > 0)
-                {
-                    MSX.Link[k].reacted[m] += TheSeg->v * 4.0 / MSX.Link[k].diam * MSX.Ucf[AREA_UNITS] * (TheSeg->c[m] - TheSeg->lastc[m]);
-                }
-                TheSeg->lastc[m] = TheSeg->c[m];
-            }
-        }
-
-    // --- compute new equilibrium concentrations within segment
-
-        errcode = MSXchem_equil(LINK, k, TheSeg->c);
+        errcode = evalPipeSegmentReaction(k, dt, seg);
         if ( errcode ) return errcode;
 
     // --- move to the segment upstream of the current one
-        TheSeg = TheSeg->prev;
+        seg = seg->prev;
+    }
+    return errcode;
+}
+
+//=============================================================================
+
+int evalPipeRingReactions(int k, double dt)
+/*
+**  Purpose:
+**    updates pipe reactions by traversing PIPE_RING slots directly.
+*/
+{
+    int pos, count, slot;
+    int errcode = 0;
+    struct Sseg ringView;
+    double *c, *lastc, *v, *hstep;
+
+    count = MSXsegStorage_pipeCount(k);
+    for (pos = 0; pos < count; pos++)
+    {
+        slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+        c = MSXsegStorage_pipeC(k, slot);
+        lastc = MSXsegStorage_pipeLastC(k, slot);
+        v = MSXsegStorage_pipeVPtr(k, slot);
+        hstep = MSXsegStorage_pipeHstepPtr(k, slot);
+        if (!c || !lastc || !v || !hstep) return ERR_PIPE_RING_CAPACITY;
+
+        // Lightweight React-only view; do not depend on Pseg link or ring metadata.
+        memset(&ringView, 0, sizeof(ringView));
+        ringView.c = c;
+        ringView.lastc = lastc;
+        ringView.v = *v;
+        ringView.hstep = *hstep;
+
+        errcode = evalPipeSegmentReaction(k, dt, &ringView);
+        *hstep = ringView.hstep;
+        if ( errcode ) return errcode;
     }
     return errcode;
 }
@@ -661,6 +760,7 @@ int evalTankReactions(int k, double dt)
     int errcode = 0, ierr = 0;
     double tstep = (double)dt / MSX.Ucf[RATE_UNITS];
     double c, dh;
+    double odeStartMs;
 
 // --- evaluate each volume segment in the tank
 
@@ -681,6 +781,7 @@ int evalTankReactions(int k, double dt)
 
         if ( dt > 0.0 )
         {
+            odeStartMs = MSXgpu_wallTimeMs();
 
         // --- place current concentrations of species that react in vector Yrate
             for (i=1; i<=NumTankRateSpecies; i++)
@@ -730,6 +831,7 @@ int evalTankReactions(int k, double dt)
                 }
                 TheSeg->hstep = dh;
             }
+            MSXgpu_addOdeTime(MSXgpu_wallTimeMs() - odeStartMs);
             if ( ierr < 0 ) return 
                 ERR_INTEGRATOR;
         }

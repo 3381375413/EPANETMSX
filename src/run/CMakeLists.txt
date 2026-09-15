@@ -21,6 +21,10 @@ add_executable(runepanetmsx
     msxmain.c
 )
 
+target_compile_options(runepanetmsx PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/utf-8>
+)
+
 target_include_directories(runepanetmsx
     PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>

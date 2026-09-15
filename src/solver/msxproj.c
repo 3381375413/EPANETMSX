@@ -57,7 +57,24 @@ static char * Errmsg[] =
 
      "Error 522 - could not compile chemistry functions.",                     
      "Error 523 - could not load functions from compiled chemistry file.",     
-     "Error 524 - illegal math operation."};                                   
+     "Error 524 - illegal math operation.",
+     "Error 525 - pipe ring segment storage capacity exceeded."};
+
+static char * GpuErrmsg[] =
+    {"Error 9000 - GPU computation requested but GPU compiler is not enabled.",
+     "Error 9001 - requested GPU feature is not supported by this build.",
+     "Error 9002 - requested GPU solver is not supported.",
+     "Error 9003 - GPU equilibrium solver is not supported.",
+     "Error 9004 - GPU full-coupling equilibrium is not supported.",
+     "Error 9005 - NVRTC compilation failed.",
+     "Error 9006 - GPU memory allocation failed.",
+     "Error 9007 - GPU kernel launch failed.",
+     "Error 9008 - GPU kernel runtime failed.",
+     "Error 9009 - GPU ODE integration failed.",
+     "Error 9010 - GPU equilibrium solver did not converge.",
+     "Error 9011 - GPU formula produced an invalid value.",
+     "Error 9012 - GPU computation produced an invalid numeric value.",
+     "Error 9013 - GPU segment packing failed."};
 
 //  Imported functions
 //--------------------
@@ -287,6 +304,8 @@ char * MSXproj_getErrmsg(int errcode)
 **    text of error message.
 */
 {
+    if ( errcode >= ERR_GPU_NOT_ENABLED && errcode <= ERR_GPU_SEGMENT_PACK_FAILED )
+        return GpuErrmsg[errcode - ERR_GPU_NOT_ENABLED];
     if ( errcode <= ERR_FIRST || errcode >= ERR_MAX ) return Errmsg[0];
     else return Errmsg[errcode - ERR_FIRST];
 }
@@ -323,6 +342,27 @@ void setDefaults()
     MSX.Solver = EUL;
     MSX.Coupling = NO_COUPLING;
     MSX.Compiler = NO_COMPILER;                                                
+    MSX.GpuCompiler = FALSE;
+    MSX.GpuStrict = TRUE;
+    MSX.GpuReact = FALSE;
+    MSX.GpuReactScope = GPU_PIPE_SEGMENT;
+    MSX.GpuOde = FALSE;
+    MSX.GpuEquil = FALSE;
+    MSX.GpuFormula = FALSE;
+    MSX.GpuSolver = EUL;
+    MSX.GpuRk5Mode = GPU_RK5_CPU_ALIGN;
+    MSX.GpuTiming = FALSE;
+    MSX.GpuTimingDetail = TRUE;
+    MSX.CpuTiming = FALSE;
+    MSX.SegmentStorage = SEG_STORAGE_PSEG;
+    MSX.PipeRingCap = 5000;
+    memset(&MSX.GpuTimingRecord, 0, sizeof(MSX.GpuTimingRecord));
+    memset(&MSX.GpuError, 0, sizeof(MSX.GpuError));
+    MSX.GpuError.sid = -1;
+    MSX.GpuError.pipe = -1;
+    MSX.GpuError.species = -1;
+    MSX.GpuError.expr = -1;
+    MSX.GpuError.iter = -1;
     MSX.ErrCode = 0;
     MSX.AreaUnits = FT2;
     MSX.RateUnits = DAYS;

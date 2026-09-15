@@ -650,18 +650,18 @@ int parseOption()
 **    an error code (0 if no error)
 */
 {
-    int k;
+    int k, option;
     double v;
 
 // --- determine which option is being read
 
     if ( Ntokens < 2 ) return 0;
-    k = MSXutils_findmatch(Tok[0], OptionTypeWords);
-    if ( k < 0 ) return ERR_KEYWORD;
+    option = MSXutils_findmatch(Tok[0], OptionTypeWords);
+    if ( option < 0 ) return ERR_KEYWORD;
 
 // --- parse the value for the given option
 
-    switch ( k )
+    switch ( option )
     {
       case AREA_UNITS_OPTION:
           k = MSXutils_findmatch(Tok[1], AreaUnitsWords);
@@ -722,6 +722,60 @@ int parseOption()
           k = atoi(Tok[1]);
           if (k <= 0) return ERR_NUMBER;
           MSX.MaxSegments = MAX(k, 50);  //at least 50 segments
+          break;
+
+      case GPU_COMPILER_OPTION:
+      case GPU_STRICT_OPTION:
+      case GPU_REACT_OPTION:
+      case GPU_ODE_OPTION:
+      case GPU_EQUIL_OPTION:
+      case GPU_FORMULA_OPTION:
+      case GPU_TIMING_OPTION:
+      case GPU_TIMING_DETAIL_OPTION:
+      case CPU_TIMING_OPTION:
+          if ( MSXutils_strcomp(Tok[1], YES) ) k = TRUE;
+          else if ( MSXutils_strcomp(Tok[1], NO) ) k = FALSE;
+          else return ERR_KEYWORD;
+          if ( option == GPU_COMPILER_OPTION ) MSX.GpuCompiler = k;
+          else if ( option == GPU_STRICT_OPTION ) MSX.GpuStrict = k;
+          else if ( option == GPU_REACT_OPTION ) MSX.GpuReact = k;
+          else if ( option == GPU_ODE_OPTION ) MSX.GpuOde = k;
+          else if ( option == GPU_EQUIL_OPTION ) MSX.GpuEquil = k;
+          else if ( option == GPU_FORMULA_OPTION ) MSX.GpuFormula = k;
+          else if ( option == GPU_TIMING_OPTION ) MSX.GpuTiming = k;
+          else if ( option == GPU_TIMING_DETAIL_OPTION ) MSX.GpuTimingDetail = k;
+          else MSX.CpuTiming = k;
+          break;
+
+      case GPU_REACT_SCOPE_OPTION:
+          k = MSXutils_findmatch(Tok[1], GpuReactScopeWords);
+          if ( k < 0 ) return ERR_KEYWORD;
+          MSX.GpuReactScope = k;
+          break;
+
+      case GPU_SOLVER_OPTION:
+          k = MSXutils_findmatch(Tok[1], SolverTypeWords);
+          if ( k < 0 ) return ERR_KEYWORD;
+          MSX.GpuSolver = k;
+          break;
+
+      case GPU_RK5_MODE_OPTION:
+          k = MSXutils_findmatch(Tok[1], GpuRk5ModeWords);
+          if ( k < 0 ) return ERR_KEYWORD;
+          MSX.GpuRk5Mode = k;
+          break;
+
+      case SEGMENT_STORAGE_OPTION:
+          k = MSXutils_findmatch(Tok[1], SegmentStorageWords);
+          if ( k < 0 ) return ERR_KEYWORD;
+          MSX.SegmentStorage = k;
+          break;
+
+      case PIPE_RING_CAP_OPTION:
+          k = atoi(Tok[1]);
+          if ( k <= 0 ) return ERR_NUMBER;
+          MSX.PipeRingCap = k;
+          break;
 
     }
     return 0;
