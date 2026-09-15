@@ -38,7 +38,7 @@ static char *SolverTypeWords[] = {"EUL", "RK5", "ROS2", NULL};
 static char *CouplingWords[]   = {"NONE", "FULL", NULL};
 static char *GpuReactScopeWords[] = {"PIPE_SEGMENT", "FULL_REACT", NULL};
 static char *GpuRk5ModeWords[] = {"CPU_ALIGN", "FAST_BUCKET", NULL};
-static char *SegmentStorageWords[] = {"PSEG", "PIPE_RING", NULL};
+static char *SegmentStorageWords[] = {"PSEG", "PIPE_RING", "HYBRID", NULL};
 static char *ExprTypeWords[]   = {"", "RATE", "FORMULA", "EQUIL", NULL};
 static char *HydVarWords[]     = {"", "D", "Q", "U", "Re",
                                   "Us", "Ff", "Av", "Kc", "Len", NULL};	/*Len added Feng Shang 01/27/2023*/

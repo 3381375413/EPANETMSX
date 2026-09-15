@@ -229,7 +229,8 @@ typedef  float REAL4;
 
  enum SegmentStorageType              // Pipe segment concentration storage
                  {SEG_STORAGE_PSEG,
-                  SEG_STORAGE_PIPE_RING};
+                  SEG_STORAGE_PIPE_RING,
+                  SEG_STORAGE_HYBRID};
 
  enum GpuReactScopeType                // Scope requested for GPU reactions
                  {GPU_PIPE_SEGMENT,
@@ -408,6 +409,9 @@ struct Sseg                            // PIPE SEGMENT OBJECT
     int       ringSlot;                // pipe-local ring slot index
     int       ringIndex;               // flat ring row index
     char      inPipeRing;              // TRUE if c/lastc point to pipe ring row
+    int       hybridSlot;              // dense Core slot index, or -1
+    char      inHybridCore;            // TRUE if this is an active Hybrid Core view
+    unsigned long long hybridId;       // logical water-parcel identity in Hybrid mode
     double    *privateC;               // private segment concentration storage
     double    *privateLastC;           // private previous-step concentration storage
 };

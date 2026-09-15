@@ -27,6 +27,38 @@ int  MSXsegStorage_isPipeRingEnabled(void);
 int  MSXsegStorage_isPipeRingLink(int k);
 int  MSXsegStorage_isPipeRingSegment(Pseg seg);
 
+int  MSXsegStorage_isHybridEnabled(void);
+int  MSXsegStorage_isHybridLink(int k);
+int  MSXsegStorage_isHybridCoreSegment(Pseg seg);
+void MSXsegStorage_hybridAssignIdentity(int k, Pseg seg);
+int  MSXsegStorage_hybridizeAll(void);
+int  MSXsegStorage_hybridRemoveHead(int k, Pseg seg);
+void MSXsegStorage_hybridRebalanceAll(void);
+void MSXsegStorage_hybridAfterListReorder(int k);
+void MSXsegStorage_hybridClear(int k);
+int  MSXsegStorage_hybridCoreCount(int k);
+Pseg MSXsegStorage_hybridCoreSegFromHead(int k, int pos);
+Pseg MSXsegStorage_hybridCoreSegAt(int k, int pos);
+/* Returns one of at most two contiguous downstream-to-upstream Core spans.
+   The returned Pseg views reference the authoritative dense slot arrays. */
+int  MSXsegStorage_hybridCoreSpan(int k, int spanIndex, Pseg **segs,
+                                  int *count);
+void MSXsegStorage_hybridPrepareCore(int k);
+void MSXsegStorage_hybridCommitCore(int k);
+int  MSXsegStorage_hybridTimingEnabled(void);
+void MSXsegStorage_hybridTimingAddCoreReact(double ms);
+void MSXsegStorage_hybridTimingAddBoundaryReact(double ms);
+void MSXsegStorage_hybridTimingAddHandoff(double ms);
+void MSXsegStorage_hybridTimingAddPacking(double ms);
+void MSXsegStorage_hybridTimingAddH2D(double ms);
+void MSXsegStorage_hybridTimingAddKernel(double ms);
+void MSXsegStorage_hybridTimingAddD2H(double ms);
+void MSXsegStorage_hybridTimingAddUnpack(double ms);
+void MSXsegStorage_hybridTimingStepBegin(void);
+void MSXsegStorage_hybridTimingStepEnd(void);
+void MSXsegStorage_hybridSyncSegmentScalars(Pseg seg);
+void MSXsegStorage_hybridSyncAllScalars(void);
+
 int  MSXsegStorage_pipeAppendTail(int k, Pseg seg);
 Pseg MSXsegStorage_pipePeekHead(int k);
 Pseg MSXsegStorage_pipePeekTail(int k);

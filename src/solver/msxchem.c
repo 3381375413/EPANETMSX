@@ -21,6 +21,7 @@
 #include "msxfuncs.h"                                                          
 #include "msxgpu.h"
 #include "msxsegment_storage.h"
+#include "msxsegment_profile.h"
 
 //  External variables
 //--------------------
@@ -83,6 +84,7 @@ static void   setTankChemistry(void);
 //static void   evalHydVariables(int k);           
 static int    evalPipeSegmentReaction(int k, double dt, Pseg seg);
 static int    evalPipeReactions(int k, double dt);
+static int    evalPipeHybridReactions(int k, double dt);
 static int    evalPipeRingReactions(int k, double dt);
 static int    evalTankReactions(int k, double dt);
 static int    evalPipeEquil(double *c);
@@ -286,7 +288,41 @@ int MSXchem_react(double dt)
 
     if (MSX.GpuReact && MSX.GpuReactScope == GPU_PIPE_SEGMENT)
     {
+        for (k = 1; k <= MSX.Nobjects[LINK]; k++)
+            if (MSX.Link[k].len != 0.0)
+                MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
         errcode = MSXgpu_reactPipeSegments(dt);
+    }
+    else if (MSXsegStorage_isHybridEnabled())
+    {
+        /* Keep the exact same per-link OpenMP partitioning as PSEG.  The
+           chemistry scratch state (HydVar, ChemC1, Yrate, etc.) is already
+           declared threadprivate and allocated in MSXchem_open().  Hybrid
+           only changes a link's pipe-segment storage; it never rebalances
+           or mutates another link during this parallel React phase. */
+        int hybridErr = 0;
+#pragma omp parallel
+        {
+#pragma omp for private(k)
+            for (k = 1; k <= MSX.Nobjects[LINK]; k++)
+            {
+                int linkErr = 0;
+                if (MSX.Link[k].len == 0.0) continue;
+                for (int hi = 1; hi < MAX_HYD_VARS; hi++)
+                    HydVar[hi] = MSX.Link[k].HydVar[hi];
+                linkErr = evalPipeHybridReactions(k, dt);
+                if (linkErr)
+                {
+                    /* Do not return out of an OpenMP structured block and
+                       do not race the caller's error aggregate. */
+#pragma omp critical(msx_hybrid_react_error)
+                    {
+                        if (hybridErr == 0) hybridErr = linkErr;
+                    }
+                }
+            }
+        }
+        errcode = hybridErr;
     }
     else
     {
@@ -683,6 +719,8 @@ int evalPipeReactions(int k, double dt)
     int errcode = 0;
     Pseg seg;
 
+    MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
+
 // --- start with the most downstream pipe segment
 
     seg = MSX.FirstSeg[k];
@@ -694,6 +732,74 @@ int evalPipeReactions(int k, double dt)
     // --- move to the segment upstream of the current one
         seg = seg->prev;
     }
+    return errcode;
+}
+
+static int evalPipeHybridReactions(int k, double dt)
+{
+    int errcode = 0;
+    Pseg seg, coreTail, *coreSpan;
+    int coreCount, pos, span, spanCount, spanStep;
+    int timing = MSXsegStorage_hybridTimingEnabled();
+    double timer = 0.0;
+    double boundaryMs = 0.0;
+    double coreMs = 0.0;
+
+    MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
+
+    /* Preserve PSEG's downstream-to-upstream order as three contiguous
+       regions. Boundary segments use their private Pseg records. Core
+       segments are obtained directly from the Dense Core ring, never by
+       following the Pseg prev chain. */
+    seg = MSX.FirstSeg[k];
+    if (timing) timer = MSXgpu_wallTimeMs();
+    while (seg && !seg->inHybridCore)
+    {
+        errcode = evalPipeSegmentReaction(k, dt, seg);
+        if (errcode) return errcode;
+        seg = seg->prev;
+    }
+    if (timing) boundaryMs += MSXgpu_wallTimeMs() - timer;
+
+    coreCount = MSXsegStorage_hybridCoreCount(k);
+    coreTail = NULL;
+    if (coreCount > 0)
+    {
+        MSXsegStorage_hybridPrepareCore(k);
+        if (timing) timer = MSXgpu_wallTimeMs();
+        /* A Core ring interval has at most two physical spans.  This is
+           deliberately independent of the Pseg compatibility chain. */
+        for (span = 0; span < 2; span++)
+        {
+            if (!MSXsegStorage_hybridCoreSpan(k, span, &coreSpan, &spanCount))
+                continue;
+            spanStep = spanCount < 0 ? -1 : 1;
+            spanCount = spanCount < 0 ? -spanCount : spanCount;
+            for (pos = 0; pos < spanCount; pos++)
+            {
+                seg = coreSpan[pos * spanStep];
+                if (!seg || !seg->inHybridCore) return ERR_PIPE_RING_CAPACITY;
+                errcode = evalPipeSegmentReaction(k, dt, seg);
+                if (errcode) return errcode;
+            }
+        }
+        if (timing) coreMs = MSXgpu_wallTimeMs() - timer;
+        MSXsegStorage_hybridCommitCore(k);
+        coreTail = MSXsegStorage_hybridCoreSegAt(k, coreCount - 1);
+        seg = coreTail ? coreTail->prev : NULL;
+    }
+
+    if (timing) timer = MSXgpu_wallTimeMs();
+    while (seg)
+    {
+        errcode = evalPipeSegmentReaction(k, dt, seg);
+        if (errcode) return errcode;
+        seg = seg->prev;
+    }
+    if (timing) boundaryMs += MSXgpu_wallTimeMs() - timer;
+
+    MSXsegStorage_hybridTimingAddBoundaryReact(boundaryMs);
+    MSXsegStorage_hybridTimingAddCoreReact(coreMs);
     return errcode;
 }
 
@@ -711,6 +817,7 @@ int evalPipeRingReactions(int k, double dt)
     double *c, *lastc, *v, *hstep;
 
     count = MSXsegStorage_pipeCount(k);
+    MSXsegProfile_reactVisitsForLink(k, count);
     for (pos = 0; pos < count; pos++)
     {
         slot = MSXsegStorage_pipeSlotFromHead(k, pos);

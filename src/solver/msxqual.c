@@ -20,6 +20,7 @@
 #include "dispersion.h"
 #include "msxgpu.h"
 #include "msxsegment_storage.h"
+#include "msxsegment_profile.h"
 
 // Macros to identify upstream & downstream nodes of a link
 // under the current flow and to compute link volume
@@ -203,6 +204,7 @@ int  MSXqual_open()
     CALL(errcode, MEMCHECK(MSX.MassBalance.final));
     CALL(errcode, MEMCHECK(MSX.MassBalance.ratio));
     if (!errcode) CALL(errcode, MSXsegStorage_open());
+    if (!errcode) CALL(errcode, MSXsegProfile_open());
 
 // --- check if wall species are present
 
@@ -291,6 +293,7 @@ int  MSXqual_init()
     MSX.FreeSeg = NULL;
     AllocReset();
     MSXsegStorage_reset();
+    MSXsegProfile_reset();
 
 // --- re-position hydraulics file
 
@@ -596,6 +599,7 @@ int MSXqual_close()
 {
     int errcode = 0;
     if (!MSX.ProjectOpened) return 0;
+    MSXsegProfile_close();
     MSXchem_close();
     MSXcpu_closeTiming();
     MSXgpu_closeTiming();
@@ -758,7 +762,9 @@ int  transport(int64_t tstep)
         dt = dt64 / 1000.;                  // time step as fractional seconds
 
         MSXgpu_beginStep((MSX.Qtime + qtime) / 1000.0);
+        MSXsegStorage_hybridTimingStepBegin();
         MSXsegStorage_syncAllPsegMirrors();
+        MSXsegProfile_beginStep((MSX.Qtime + qtime) / 1000.0);
         timer = MSXgpu_wallTimeMs();
         MSXgpu_reactBegin();
         errcode = MSXchem_react(dt);        // react species in each pipe & tank
@@ -767,6 +773,7 @@ int  transport(int64_t tstep)
         MSXsegStorage_syncAllScalarsFromPseg();
         if ( errcode )
         {
+            MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
             MSXgpu_endStep(errcode);
             return errcode;
         }
@@ -775,11 +782,13 @@ int  transport(int64_t tstep)
         MSX.GpuTimingRecord.advect_ms += MSXgpu_wallTimeMs() - timer;
         if (MSX.ErrCode)
         {
+            MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
             MSXgpu_endStep(MSX.ErrCode);
             return MSX.ErrCode;
         }
 
         topological_transport(dt);          //replace accumulate, updateNodes, sourceInput and release
+        MSXsegStorage_hybridRebalanceAll();
         MSXsegStorage_syncAllPsegMirrors();
         if (MSX.ErrCode)
         {
@@ -789,8 +798,10 @@ int  transport(int64_t tstep)
 		if (MSXerr_mathError())             // check for any math error        
 		{
 			MSXerr_writeMathErrorMsg();
-			errcode = ERR_ILLEGAL_MATH;
+            errcode = ERR_ILLEGAL_MATH;
 		}
+        MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
+        MSXsegStorage_hybridTimingStepEnd();
         MSXgpu_endStep(errcode);
    }
    return errcode;
@@ -895,6 +906,11 @@ void  initSegs()
     }
 
     MSXsegStorage_syncAllPsegMirrors();
+    if (MSXsegStorage_isHybridEnabled())
+    {
+        MSX.ErrCode = MSXsegStorage_hybridizeAll();
+        if (MSX.ErrCode) return;
+    }
     findstoredmass(MSX.MassBalance.initial);    // initial mass
 }
 
@@ -930,6 +946,7 @@ int  flowdirchanged()
         if (newdir*MSX.FlowDir[k] < 0)
         {
             MSXqual_reversesegs(k);
+            MSXsegStorage_hybridAfterListReorder(k);
         }
         if (newdir != MSX.FlowDir[k])
         {
@@ -1505,6 +1522,11 @@ void  removeAllSegs(int k)
 */
 {
     Pseg seg;
+    if (MSXsegStorage_isHybridLink(k))
+    {
+        MSXsegStorage_hybridClear(k);
+        return;
+    }
     if (MSXsegStorage_isPipeRingLink(k))
     {
         MSXsegStorage_pipeClear(k);
@@ -1609,6 +1631,8 @@ void topological_transport(double dt)
             segqual_update(m, dt);
         }
     }
+    if (MSXsegStorage_isHybridEnabled() && MSX.DispersionFlag)
+        MSXsegStorage_hybridSyncAllScalars();
     MSX.GpuTimingRecord.disperse_ms += MSXgpu_wallTimeMs() - timer;
 }
 
@@ -1656,17 +1680,20 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
             if (useNewSeg == 0)
             {
                 MSXsegStorage_pipeMergeTail(k, upnodequal, v);
+                MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_MERGE);
                 MSXqual_removeSeg(MSX.NewSeg[k]);
             }
             else
             {
                 MSX.NewSeg[k]->v = v;
+                MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_NEW_SEGMENT);
                 MSX.ErrCode = MSXsegStorage_pipeAppendTail(k, MSX.NewSeg[k]);
             }
         }
         else
         {
             MSX.NewSeg[k]->v = v;
+            MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_NEW_SEGMENT);
             MSX.ErrCode = MSXsegStorage_pipeAppendTail(k, MSX.NewSeg[k]);
         }
         return;
@@ -1695,6 +1722,7 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
                    seg->c[m] = (seg->c[m]*seg->v+upnodequal[m]*v)/(seg->v+v);
             }
             seg->v += v;
+            MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_MERGE);
             MSXqual_removeSeg(MSX.NewSeg[k]);
         }
 
@@ -1703,6 +1731,7 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
         else
         {
             MSX.NewSeg[k]->v = v;
+            MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_NEW_SEGMENT);
             MSXqual_addSeg(k, MSX.NewSeg[k]);
         }
     }
@@ -1711,6 +1740,7 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
     else
     {
         MSX.NewSeg[k]->v = v;
+        MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_NEW_SEGMENT);
         MSXqual_addSeg(k, MSX.NewSeg[k]);
     }
 
@@ -1757,10 +1787,26 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
 
             if (v >= 0.0 && vseg >= seg->v)
             {
+            MSXsegProfile_event(k, MSX_PROFILE_DOWNSTREAM_COMPLETE_DELETE);
+            if (MSXsegStorage_isHybridCoreSegment(seg))
+            {
+                MSX.ErrCode = MSXsegStorage_hybridRemoveHead(k, seg);
+                if (MSX.ErrCode) return;
+            }
+            else if (MSXsegStorage_isPipeRingLink(k))
                 MSXsegStorage_pipePopHead(k);
+            else
+            {
+                MSX.FirstSeg[k] = seg->prev;
+                MSX.Link[k].nsegs--;
+                if (MSX.FirstSeg[k] == NULL) MSX.LastSeg[k] = NULL;
+                else MSX.FirstSeg[k]->next = NULL;
+                MSXqual_removeSeg(seg);
+            }
             }
             else
             {
+                MSXsegProfile_event(k, MSX_PROFILE_DOWNSTREAM_PARTIAL_CONSUME);
                 MSXsegStorage_pipeConsumeHead(k, vseg);
             }
         }
@@ -1790,18 +1836,32 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
         // ... if all of segment's volume was transferred
         if (v >= 0.0 && vseg >= seg->v)
         {
-            // ... replace this leading segment with the one behind it
-            MSX.FirstSeg[k] = seg->prev;
-            MSX.Link[k].nsegs--;
-            if (MSX.FirstSeg[k] == NULL) MSX.LastSeg[k] = NULL;
-            else MSX.FirstSeg[k]->next = NULL; //03/19/2024 added to break the linked segments 
-		    
-            // ... recycle the used up segment
-            MSXqual_removeSeg(seg);
+            MSXsegProfile_event(k, MSX_PROFILE_DOWNSTREAM_COMPLETE_DELETE);
+            if (MSXsegStorage_isHybridCoreSegment(seg))
+            {
+                MSX.ErrCode = MSXsegStorage_hybridRemoveHead(k, seg);
+                if (MSX.ErrCode) return;
+            }
+            else
+            {
+                // ... replace this leading segment with the one behind it
+                MSX.FirstSeg[k] = seg->prev;
+                MSX.Link[k].nsegs--;
+                if (MSX.FirstSeg[k] == NULL) MSX.LastSeg[k] = NULL;
+                else MSX.FirstSeg[k]->next = NULL; //03/19/2024 added to break the linked segments
+
+                // ... recycle the used up segment
+                MSXqual_removeSeg(seg);
+            }
         }
 
         // ... otherwise just reduce this segment's volume
-        else seg->v -= vseg;
+        else
+        {
+            MSXsegProfile_event(k, MSX_PROFILE_DOWNSTREAM_PARTIAL_CONSUME);
+            seg->v -= vseg;
+            MSXsegStorage_hybridSyncSegmentScalars(seg);
+        }
     }
 }
 
@@ -2206,10 +2266,12 @@ void MSXqual_reversesegs(int k)
 
     if (MSXsegStorage_isPipeRingLink(k))
     {
+        MSXsegProfile_event(k, MSX_PROFILE_FLOW_REVERSAL);
         MSXsegStorage_pipeReverse(k);
         return;
     }
 
+    MSXsegProfile_event(k, MSX_PROFILE_FLOW_REVERSAL);
     seg = MSX.FirstSeg[k];
     MSX.FirstSeg[k] = MSX.LastSeg[k];
     MSX.LastSeg[k] = seg;
@@ -2238,6 +2300,10 @@ void MSXqual_removeSeg(Pseg seg)
 */
 {
     if ( seg == NULL ) return;
+    /* A Hybrid Core view is owned by the dense slot allocator, not the
+       segment pool.  Complete downstream consumption is handled through
+       MSXsegStorage_hybridRemoveHead(). */
+    if (MSXsegStorage_isHybridCoreSegment(seg)) return;
     MSXsegStorage_unbindSegment(seg);
     seg->prev = MSX.FreeSeg;
     seg->next = NULL;
@@ -2285,6 +2351,13 @@ Pseg MSXqual_getFreeSeg(double v, double c[])
     if (MSXsegStorage_preparePrivate(seg))
         return NULL;
 
+    seg->hybridId = 0;
+
+    /* Profiler identity is assigned at every allocation/reuse.  A recycled
+       address therefore receives a new generation and cannot masquerade as
+       the previous water parcel in the read-only shadow. */
+    MSXsegProfile_segmentAllocated(seg);
+
 // --- assign volume, WQ, & integration time step to the new segment
 
     seg->v = v;
@@ -2309,6 +2382,12 @@ void  MSXqual_addSeg(int k, Pseg seg)
     int errcode;
     if (seg == NULL) return;
     if (MSX.ErrCode) return;
+    if (MSXsegStorage_isHybridLink(k) && seg->hybridId == 0)
+    {
+        /* Identity is assigned when a newly allocated parcel enters a link;
+           core/boundary transfers copy this value unchanged. */
+        MSXsegStorage_hybridAssignIdentity(k, seg);
+    }
     if (MSXsegStorage_isPipeRingLink(k))
     {
         errcode = MSXsegStorage_pipeAppendTail(k, seg);
