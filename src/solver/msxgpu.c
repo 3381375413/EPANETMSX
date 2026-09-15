@@ -41,7 +41,8 @@ extern MSXproject MSX;
 #define GPU_MAX_SPECIES 64
 #define GPU_MAX_EQUIL   16
 #define GPU_MAX_STACK   128
-#define GPU_CACHE_VERSION "v20"
+#define GPU_CACHE_VERSION "v22"
+#define GPU_ROS2_MAX_RATE_SPECIES 16
 #define RK5_FAST_BUCKETS 6
 #define GPU_CACHE_MAX_BYTES (200LL * 1024LL * 1024LL)
 #define GPU_CACHE_MAX_AGE_SECONDS (30LL * 24LL * 60LL * 60LL)
@@ -79,6 +80,8 @@ static int ReactActive = 0;
 static double StepStartMs = 0.0;
 static MSXGpuTiming TotalTiming;
 static MSXGpuTiming CpuTotalTiming;
+static int Ros2RawErrorReason = 0;
+static int Ros2RawErrorSid = -1;
 #ifdef EPANETMSX_CUDA_ENABLED
 static int ReactTransferReady = 0;
 #endif
@@ -126,9 +129,10 @@ static void setGpuError(int code, int stage, int sid, int pipe, int species,
         {
             long pos = ftell(f);
             if (pos == 0)
-                fprintf(f, "code,stage,sid,pipe,species,expr,iter,value\n");
-            fprintf(f, "%d,%d,%d,%d,%d,%d,%d,%.17g\n",
-                    code, stage, sid, pipe, species, expr, iter, value);
+                fprintf(f, "code,stage,sid,pipe,species,expr,iter,value,ros2_raw_reason,ros2_raw_sid\n");
+            fprintf(f, "%d,%d,%d,%d,%d,%d,%d,%.17g,%d,%d\n",
+                    code, stage, sid, pipe, species, expr, iter, value,
+                    Ros2RawErrorReason, Ros2RawErrorSid);
             fclose(f);
         }
     }
@@ -195,10 +199,11 @@ static int validateModelForGpu(void)
     int hasEquil = 0;
     int hasFormula = 0;
     int nEquil = 0;
+    int nRate = 0;
 
     if (MSX.GpuReactScope != GPU_PIPE_SEGMENT) return ERR_GPU_UNSUPPORTED_FEATURE;
-    if (MSX.GpuSolver != EUL && MSX.GpuSolver != RK5) return ERR_GPU_SOLVER_UNSUPPORTED;
-    if (MSX.Solver != EUL && MSX.Solver != RK5) return ERR_GPU_SOLVER_UNSUPPORTED;
+    if (MSX.GpuSolver != EUL && MSX.GpuSolver != RK5 && MSX.GpuSolver != ROS2) return ERR_GPU_SOLVER_UNSUPPORTED;
+    if (MSX.Solver != EUL && MSX.Solver != RK5 && MSX.Solver != ROS2) return ERR_GPU_SOLVER_UNSUPPORTED;
     if (MSX.GpuSolver != MSX.Solver) return ERR_GPU_SOLVER_UNSUPPORTED;
     if (MSXsegStorage_isPipeRingEnabled() &&
         MSX.GpuSolver == RK5 &&
@@ -220,6 +225,7 @@ static int validateModelForGpu(void)
         if (MSX.Species[m].pipeExprType == RATE)
         {
             hasRate = 1;
+            nRate++;
             if (exprHasUnsupportedReference(MSX.Species[m].pipeExpr, 0, 1))
                 return ERR_GPU_UNSUPPORTED_FEATURE;
         }
@@ -239,6 +245,10 @@ static int validateModelForGpu(void)
         if (countExprNodes(MSX.Species[m].pipeExpr) > GPU_MAX_STACK)
             return ERR_GPU_UNSUPPORTED_FEATURE;
     }
+
+    if (MSX.GpuSolver == ROS2 &&
+        (nRate < 1 || nRate > GPU_ROS2_MAX_RATE_SPECIES))
+        return ERR_GPU_UNSUPPORTED_FEATURE;
 
     if (nEquil > GPU_MAX_EQUIL) return ERR_GPU_EQUIL_UNSUPPORTED;
     if (hasRate && !MSX.GpuOde) return ERR_GPU_UNSUPPORTED_FEATURE;
@@ -273,7 +283,8 @@ int MSXgpu_openTiming(void)
         "rk5_nfcn,rk5_naccpt,rk5_nrejct,rk5_last_hstep,rk5_bucket_count,rk5_bucket_launches,"
         "rk5_bucket_max_size,rk5_bucket_reorder_ms,react_count_parallel_ms,react_count_prefix_ms,"
         "react_pack_segment_ms,react_host_alloc_ms,react_device_alloc_ms,react_scatter_ms,"
-        "rk5_fast_mode,rk5_error_code,error_code\n");
+        "ros2_nfcn,ros2_njac,ros2_naccept,ros2_nreject,ros2_last_hstep,"
+        "rk5_fast_mode,rk5_error_code,ros2_error_code,error_code\n");
     fflush(TimingFile);
     return 0;
 }
@@ -327,7 +338,8 @@ void MSXgpu_closeTiming(void)
         fprintf(TimingFile,
             "TOTAL,%lld,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
             "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%.6f,%.17g,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d\n",
+            "%.6f,%.6f,%.6f,%.17g,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+            "%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d\n",
             TotalTiming.step_index, TotalTiming.sim_time_sec,
             TotalTiming.gpu_enabled, TotalTiming.gpu_strict,
             TotalTiming.react_gpu, TotalTiming.advect_gpu, TotalTiming.mix_gpu,
@@ -348,8 +360,12 @@ void MSXgpu_closeTiming(void)
             TotalTiming.react_count_parallel_ms, TotalTiming.react_count_prefix_ms,
             TotalTiming.react_pack_segment_ms, TotalTiming.react_host_alloc_ms,
             TotalTiming.react_device_alloc_ms, TotalTiming.react_scatter_ms,
+            TotalTiming.ros2_nfcn, TotalTiming.ros2_njac,
+            TotalTiming.ros2_naccept, TotalTiming.ros2_nreject,
+            TotalTiming.ros2_last_hstep,
             TotalTiming.rk5_fast_mode,
-            TotalTiming.rk5_error_code, TotalTiming.error_code);
+            TotalTiming.rk5_error_code, TotalTiming.ros2_error_code,
+            TotalTiming.error_code);
         fclose(TimingFile);
     }
     TimingFile = NULL;
@@ -366,6 +382,8 @@ void MSXgpu_beginStep(double simTimeSec)
 {
     MSXGpuTiming *t = &MSX.GpuTimingRecord;
     memset(t, 0, sizeof(*t));
+    Ros2RawErrorReason = 0;
+    Ros2RawErrorSid = -1;
     t->step_index = StepIndex++;
     t->sim_time_sec = simTimeSec;
     t->gpu_enabled = (MSX.GpuReact || MSX.GpuCompiler);
@@ -427,8 +445,14 @@ void MSXgpu_endStep(int errorCode)
     TotalTiming.react_host_alloc_ms += t->react_host_alloc_ms;
     TotalTiming.react_device_alloc_ms += t->react_device_alloc_ms;
     TotalTiming.react_scatter_ms += t->react_scatter_ms;
+    TotalTiming.ros2_nfcn += t->ros2_nfcn;
+    TotalTiming.ros2_njac += t->ros2_njac;
+    TotalTiming.ros2_naccept += t->ros2_naccept;
+    TotalTiming.ros2_nreject += t->ros2_nreject;
+    if (t->ros2_last_hstep != 0.0) TotalTiming.ros2_last_hstep = t->ros2_last_hstep;
     TotalTiming.rk5_fast_mode |= t->rk5_fast_mode;
     if (!TotalTiming.rk5_error_code && t->rk5_error_code) TotalTiming.rk5_error_code = t->rk5_error_code;
+    if (!TotalTiming.ros2_error_code && t->ros2_error_code) TotalTiming.ros2_error_code = t->ros2_error_code;
     if (!TotalTiming.error_code && errorCode) TotalTiming.error_code = errorCode;
     if (CpuTimingFile)
     {
@@ -547,9 +571,9 @@ static const char *GpuReactCudaSource =
 "__global__ void rk5_kernel(int nSeg,int nSpecies,int nRate,double tstep,const int* segPipe,const int* segRow,const double* segVol,double* hstep,const int* rateSpecies,const int* speciesType,const double* linkDiam,double areaUcf,double lperFt3,double* c,double* cOde,double* reacted,const double* params,int pStride,const double* constants,const double* hyd,int hStride,const Prog* prog,const Prog* termProg,const Instr* instr,int lastSpecies,int lastTerm,int lastParam,int lastConst,GpuErr* err){ int sid=blockIdx.x*blockDim.x+threadIdx.x; if(sid>=nSeg) return; int pipe=segPipe[sid]; double vol=segVol[sid]; int base=segRow[sid]*(nSpecies+1); int hBase=sid*hStride; double old[65],state[65],tmp[65],k1[65],k2[65],k3[65],k4[65],k5[65],k6[65],k7[65]; const double a21=0.20,a31=3.0/40.0,a32=9.0/40.0,a41=44.0/45.0,a42=-56.0/15.0,a43=32.0/9.0,a51=19372.0/6561.0,a52=-25360.0/2187.0,a53=64448.0/6561.0,a54=-212.0/729.0,a61=9017.0/3168.0,a62=-355.0/33.0,a63=46732.0/5247.0,a64=49.0/176.0,a65=-5103.0/18656.0,a71=35.0/384.0,a73=500.0/1113.0,a74=125.0/192.0,a75=-2187.0/6784.0,a76=11.0/84.0; for(int m=1;m<=nSpecies;m++){ old[m]=c[base+m]; state[m]=c[base+m]; } if(tstep>0.0&&nRate>0){ double h=hstep[sid]; if(!(h>0.0)||h>tstep) h=tstep; int nSub=(int)ceil(tstep/h); if(nSub<1) nSub=1; if(nSub>1000){ set_err(err,9012,1,sid,pipe,rateSpecies[1],rateSpecies[1],0,(double)nSub); return; } h=tstep/(double)nSub; for(int step=0;step<nSub;step++){ eval_rates(nRate,rateSpecies,state,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k1); for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*a21*k1[i]; } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k2); for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a31*k1[i]+a32*k2[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k3); for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a41*k1[i]+a42*k2[i]+a43*k3[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k4); for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a51*k1[i]+a52*k2[i]+a53*k3[i]+a54*k4[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k5); for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a61*k1[i]+a62*k2[i]+a63*k3[i]+a64*k4[i]+a65*k5[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k6); for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a71*k1[i]+a73*k3[i]+a74*k4[i]+a75*k5[i]+a76*k6[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k7); for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; double v=tmp[m]; state[m]=(v>=0.0?v:0.0); } } hstep[sid]=h; for(int m=1;m<=nSpecies;m++) c[base+m]=state[m]; } for(int m=1;m<=nSpecies;m++){ cOde[base+m]=c[base+m]; double delta=c[base+m]-old[m]; double add=speciesType[m]==0?vol*delta*lperFt3:(linkDiam[pipe]>0.0?vol*4.0/linkDiam[pipe]*areaUcf*delta:0.0); atomicAdd(&reacted[pipe*(nSpecies+1)+m],add); if(!(c[base+m]==c[base+m])) c[base+m]=0.0; }}\n"
 "#endif\n"
 "__device__ void rk5_align_one(int sid,int nSeg,int nSpecies,int nRate,double tstep,const int* segPipe,const int* segRow,const double* segVol,double* hstep,const double* rateAtol,const double* rateRtol,const int* rateSpecies,const int* speciesType,const double* linkDiam,double areaUcf,double lperFt3,double* c,double* cOde,double* reacted,const double* params,int pStride,const double* constants,const double* hyd,int hStride,const Prog* prog,const Prog* termProg,const Instr* instr,int lastSpecies,int lastTerm,int lastParam,int lastConst,int* rk5Nfcn,int* rk5Naccpt,int* rk5Nrejct,double* rk5LastHstep,int* rk5Err,GpuErr* err){ int pipe=segPipe[sid]; double vol=segVol[sid]; int base=segRow[sid]*(nSpecies+1); int hBase=sid*hStride; double old[65],state[65],ynew[65],tmp[65],k1[65],k2[65],k3[65],k4[65],k5[65],k6[65],k7[65]; const double c2=0.20,c3=0.30,c4c=0.80,c5c=8.0/9.0; const double a21=0.20,a31=3.0/40.0,a32=9.0/40.0,a41=44.0/45.0,a42=-56.0/15.0,a43=32.0/9.0,a51=19372.0/6561.0,a52=-25360.0/2187.0,a53=64448.0/6561.0,a54=-212.0/729.0,a61=9017.0/3168.0,a62=-355.0/33.0,a63=46732.0/5247.0,a64=49.0/176.0,a65=-5103.0/18656.0,a71=35.0/384.0,a73=500.0/1113.0,a74=125.0/192.0,a75=-2187.0/6784.0,a76=11.0/84.0; const double e1=71.0/57600.0,e3=-71.0/16695.0,e4=71.0/1920.0,e5=-17253.0/339200.0,e6=22.0/525.0,e7=-1.0/40.0; const double UROUND=2.3e-16,SAFE=0.90,fac1=0.2,fac2=10.0,beta=0.04,expo1=0.2-0.04*0.75,facc1=1.0/fac1,facc2=1.0/fac2; int nfcn=0,naccpt=0,nrejct=0,reject=0,nstep=1; for(int m=1;m<=nSpecies;m++){ old[m]=c[base+m]; state[m]=c[base+m]; } if(tstep>0.0&&nRate>0){ double t=0.0,h=hstep[sid],hmax=tstep,facold=1.0e-4; eval_rates(nRate,rateSpecies,state,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k1); nfcn++; if(h==0.0){ h=tstep; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; double ytol=rateAtol[i]+rateRtol[i]*fabs(state[m]); if(k1[i]!=0.0) h=fmin(h,ytol/fabs(k1[i])); }} h=fmax(1.0e-8,h); while(t<tstep){ double tnew,hnew,errest=0.0,fac11=1.0,fac; if(0.10*fabs(h)<=fabs(t)*UROUND){ rk5Err[sid]=9009; set_err(err,9009,1,sid,pipe,rateSpecies[1],rateSpecies[1],nstep,h); return; } if((t+1.01*h-tstep)>0.0) h=tstep-t; tnew=t+c2*h; for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*a21*k1[i]; } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k2); tnew=t+c3*h; for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a31*k1[i]+a32*k2[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k3); tnew=t+c4c*h; for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a41*k1[i]+a42*k2[i]+a43*k3[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k4); tnew=t+c5c*h; for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a51*k1[i]+a52*k2[i]+a53*k3[i]+a54*k4[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k5); tnew=t+h; for(int m=1;m<=nSpecies;m++) tmp[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; tmp[m]=state[m]+h*(a61*k1[i]+a62*k2[i]+a63*k3[i]+a64*k4[i]+a65*k5[i]); } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k6); for(int m=1;m<=nSpecies;m++) ynew[m]=state[m]; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; ynew[m]=state[m]+h*(a71*k1[i]+a73*k3[i]+a74*k4[i]+a75*k5[i]+a76*k6[i]); tmp[m]=ynew[m]; } eval_rates(nRate,rateSpecies,tmp,pipe,params,pStride,constants,hyd,hBase,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,k7); nfcn+=6; hnew=h; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; double ee=(e1*k1[i]+e3*k3[i]+e4*k4[i]+e5*k5[i]+e6*k6[i]+e7*k7[i])*h; double sk=rateAtol[i]+rateRtol[i]*fmax(fabs(state[m]),fabs(ynew[m])); if(sk!=0.0){ double q=ee/sk; errest+=q*q; }} errest=sqrt(errest/(double)nRate); fac11=pow(errest,expo1); fac=fac11/pow(facold,beta); fac=fmax(facc2,fmin(facc1,fac/SAFE)); hnew=h/fac; if(errest<=1.0){ facold=fmax(errest,1.0e-4); naccpt++; for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; k1[i]=k7[i]; state[m]=ynew[m]; } t=t+h; hstep[sid]=h; if(fabs(hnew)>hmax) hnew=hmax; if(reject) hnew=fmin(fabs(hnew),fabs(h)); reject=0; } else { hnew=h/fmin(facc1,fac11/SAFE); reject=1; if(naccpt>=1) nrejct++; } h=hnew; hstep[sid]=h; nstep++; if(nstep>=1000){ rk5Err[sid]=9009; set_err(err,9009,1,sid,pipe,rateSpecies[1],rateSpecies[1],nstep,h); return; }} for(int i=1;i<=nRate;i++){ int m=rateSpecies[i]; double v=state[m]; c[base+m]=(v>=0.0?v:0.0); }} for(int m=1;m<=nSpecies;m++){ cOde[base+m]=c[base+m]; double delta=c[base+m]-old[m]; double add=speciesType[m]==0?vol*delta*lperFt3:(linkDiam[pipe]>0.0?vol*4.0/linkDiam[pipe]*areaUcf*delta:0.0); atomicAdd(&reacted[pipe*(nSpecies+1)+m],add); if(!(c[base+m]==c[base+m])) c[base+m]=0.0; } rk5Nfcn[sid]=nfcn; rk5Naccpt[sid]=naccpt; rk5Nrejct[sid]=nrejct; rk5LastHstep[sid]=hstep[sid]; rk5Err[sid]=0; }\n"
-"#endif\n"
 "__global__ void rk5_align_kernel(int nSeg,int nSpecies,int nRate,double tstep,const int* segPipe,const int* segRow,const double* segVol,double* hstep,const double* rateAtol,const double* rateRtol,const int* rateSpecies,const int* speciesType,const double* linkDiam,double areaUcf,double lperFt3,double* c,double* cOde,double* reacted,const double* params,int pStride,const double* constants,const double* hyd,int hStride,const Prog* prog,const Prog* termProg,const Instr* instr,int lastSpecies,int lastTerm,int lastParam,int lastConst,int* rk5Nfcn,int* rk5Naccpt,int* rk5Nrejct,double* rk5LastHstep,int* rk5Err,GpuErr* err){ int sid=blockIdx.x*blockDim.x+threadIdx.x; if(sid>=nSeg) return; rk5_align_one(sid,nSeg,nSpecies,nRate,tstep,segPipe,segRow,segVol,hstep,rateAtol,rateRtol,rateSpecies,speciesType,linkDiam,areaUcf,lperFt3,c,cOde,reacted,params,pStride,constants,hyd,hStride,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,rk5Nfcn,rk5Naccpt,rk5Nrejct,rk5LastHstep,rk5Err,err);}\n"
 "__global__ void rk5_align_pipe_warp_kernel(int nActiveLinks,const int* activeLink,const int* pipeSegOffset,const int* pipeSegCount,int nSeg,int nSpecies,int nRate,double tstep,const int* segPipe,const int* segRow,const double* segVol,double* hstep,const double* rateAtol,const double* rateRtol,const int* rateSpecies,const int* speciesType,const double* linkDiam,double areaUcf,double lperFt3,double* c,double* cOde,double* reacted,const double* params,int pStride,const double* constants,const double* hyd,int hStride,const Prog* prog,const Prog* termProg,const Instr* instr,int lastSpecies,int lastTerm,int lastParam,int lastConst,int* rk5Nfcn,int* rk5Naccpt,int* rk5Nrejct,double* rk5LastHstep,int* rk5Err,GpuErr* err){ int globalThread=blockIdx.x*blockDim.x+threadIdx.x; int warpIndex=globalThread>>5; int lane=threadIdx.x&31; if(warpIndex>=nActiveLinks) return; int start=pipeSegOffset[warpIndex]; int end=start+pipeSegCount[warpIndex]; (void)activeLink[warpIndex]; for(int sid=start+lane;sid<end;sid+=32){ rk5_align_one(sid,nSeg,nSpecies,nRate,tstep,segPipe,segRow,segVol,hstep,rateAtol,rateRtol,rateSpecies,speciesType,linkDiam,areaUcf,lperFt3,c,cOde,reacted,params,pStride,constants,hyd,hStride,prog,termProg,instr,lastSpecies,lastTerm,lastParam,lastConst,rk5Nfcn,rk5Naccpt,rk5Nrejct,rk5LastHstep,rk5Err,err); }}\n"
+"#endif\n"
 "__device__ void eval_equil(double* x,int nEq,const int* eqSpecies,const Prog* prog,const Prog* termProg,const Instr* instr,double* c,int pipe,const double* params,int pStride,const double* constants,const double* hyd,int hBase,int lastSpecies,int lastTerm,int lastParam,int lastConst,double* f){ for(int i=1;i<=nEq;i++) c[eqSpecies[i]]=x[i]; for(int i=1;i<=nEq;i++){ int m=eqSpecies[i]; f[i]=eval_prog(m,prog,instr,c,pipe,params,pStride,constants,hyd,hBase,termProg,lastSpecies,lastTerm,lastParam,lastConst); }}\n"
 "__device__ int lu_factor(double a[17][17],int n,double* w,int* indx){ for(int i=1;i<=n;i++){ double big=0.0; for(int j=1;j<=n;j++){ double temp=fabs(a[i][j]); if(temp>big) big=temp; } if(big==0.0 || !(big==big)) return -i; w[i]=1.0/big; } for(int j=1;j<=n;j++){ for(int i=1;i<j;i++){ double sum=a[i][j]; for(int k=1;k<i;k++) sum-=a[i][k]*a[k][j]; a[i][j]=sum; } double big=0.0; int imax=j; for(int i=j;i<=n;i++){ double sum=a[i][j]; for(int k=1;k<j;k++) sum-=a[i][k]*a[k][j]; a[i][j]=sum; double dum=w[i]*fabs(sum); if(dum>=big){ big=dum; imax=i; }} if(j!=imax){ for(int k=1;k<=n;k++){ double dum=a[imax][k]; a[imax][k]=a[j][k]; a[j][k]=dum; } w[imax]=w[j]; } indx[j]=imax; if(a[j][j]==0.0) a[j][j]=1.0e-20; if(j!=n){ double dum=1.0/a[j][j]; for(int i=j+1;i<=n;i++) a[i][j]*=dum; }} return 1; }\n"
 "__device__ void lu_solve(double a[17][17],int n,int* indx,double* b){ int ii=0; for(int i=1;i<=n;i++){ int ip=indx[i]; double sum=b[ip]; b[ip]=b[i]; if(ii) for(int j=ii;j<=i-1;j++) sum-=a[i][j]*b[j]; else if(sum) ii=i; b[i]=sum; } for(int i=n;i>=1;i--){ double sum=b[i]; for(int j=i+1;j<=n;j++) sum-=a[i][j]*b[j]; b[i]=sum/a[i][i]; }}\n"
@@ -557,10 +581,21 @@ static const char *GpuReactCudaSource =
 "__global__ void formula_kernel(int nSeg,int nSpecies,int nFormula,const int* segPipe,const int* segRow,const int* formulaSpecies,double* c,const double* params,int pStride,const double* constants,const double* hyd,int hStride,const Prog* prog,const Prog* termProg,const Instr* instr,int lastSpecies,int lastTerm,int lastParam,int lastConst,GpuErr* err){ int sid=blockIdx.x*blockDim.x+threadIdx.x; if(sid>=nSeg) return; int pipe=segPipe[sid]; int base=segRow[sid]*(nSpecies+1); int hBase=sid*hStride; for(int i=1;i<=nFormula;i++){ int m=formulaSpecies[i]; double v=eval_prog(m,prog,instr,&c[base],pipe,params,pStride,constants,hyd,hBase,termProg,lastSpecies,lastTerm,lastParam,lastConst); if(!(v==v)) v=0.0; c[base+m]=v; }}\n"
 "}\n";
 
+/* ROS2 is kept in a separate source fragment so its kernel and diagnostics
+   remain independent from the existing EUL/RK5 source branches. */
+static const char *GpuRos2CudaSource =
+"extern \"C\" {\n"
+"__device__ void ros2_eval_rates(int n,const int* rs,double* y,int pipe,const double* p,int ps,const double* co,const double* hyd,int hb,const Prog* pr,const Prog* tr,const Instr* in,int ls,int lt,int lp,int lc,double* out){for(int i=1;i<=n;i++){int m=rs[i];double v=eval_prog(m,pr,in,y,pipe,p,ps,co,hyd,hb,tr,ls,lt,lp,lc);out[i]=(v==v?v:0.0);}}\n"
+"__device__ int ros2_lu_factor(double a[17][17],int n,double* w,int* ix){for(int i=1;i<=n;i++){double big=0.0;for(int j=1;j<=n;j++){double z=fabs(a[i][j]);if(z>big)big=z;}if(big==0.0||!(big==big))return 0;w[i]=1.0/big;}for(int j=1;j<=n;j++){for(int i=1;i<j;i++){double s=a[i][j];for(int k=1;k<i;k++)s-=a[i][k]*a[k][j];a[i][j]=s;}double big=0.0;int im=j;for(int i=j;i<=n;i++){double s=a[i][j];for(int k=1;k<j;k++)s-=a[i][k]*a[k][j];a[i][j]=s;double z=w[i]*fabs(s);if(z>=big){big=z;im=i;}}if(j!=im){for(int k=1;k<=n;k++){double z=a[im][k];a[im][k]=a[j][k];a[j][k]=z;}w[im]=w[j];}ix[j]=im;if(a[j][j]==0.0)a[j][j]=1.0e-20;if(j!=n){double z=1.0/a[j][j];for(int i=j+1;i<=n;i++)a[i][j]*=z;}}return 1;}\n"
+"__device__ void ros2_lu_solve(double a[17][17],int n,int* ix,double* b){int ii=0;for(int i=1;i<=n;i++){int ip=ix[i];double s=b[ip];b[ip]=b[i];if(ii)for(int j=ii;j<=i-1;j++)s-=a[i][j]*b[j];else if(s)ii=i;b[i]=s;}for(int i=n;i>=1;i--){double s=b[i];for(int j=i+1;j<=n;j++)s-=a[i][j]*b[j];b[i]=s/a[i][i];}}\n"
+"__global__ void ros2_kernel(int ns,int nsp,int nr,double step,const int* pipe,const int* row,const double* vol,double* hs,const double* at,const double* rt,const int* rs,const int* st,const double* diam,double au,double lpf,double* c,double* co,double* reacted,const double* par,int pstride,const double* con,const double* hyd,int hstride,const Prog* prog,const Prog* term,const Instr* instr,int ls,int lt,int lp,int lc,int* nf,int* nj,int* na,int* nn,double* lh,int* re,GpuErr* ge){int sid=blockIdx.x*blockDim.x+threadIdx.x;if(sid>=ns)return;int pk=pipe[sid],base=row[sid]*(nsp+1),hb=sid*hstride;double ov=vol[sid],old[65],y[65],yn[65],k1[17],k2[17],fp[17],fm[17],w[17],a[17][17];int ix[17];int f=0,jc=0,ac=0,rc=0,reject=0;const double ur=2.3e-16,g=1.7071067811865475,eps=1.0e-7;double t=0.0,gh0=0.0,hmax=step,hmin=1.0e-8,h=hs[sid];for(int m=1;m<=nsp;m++){old[m]=c[base+m];y[m]=c[base+m];}if(nr>16){re[sid]=-3;set_err(ge,9001,1,sid,pk,rs[1],rs[1],0,(double)nr);return;}if(step>0.0&&nr>0){if(h==0.0){ros2_eval_rates(nr,rs,y,pk,par,pstride,con,hyd,hb,prog,term,instr,ls,lt,lp,lc,k1);f++;h=step;for(int i=1;i<=nr;i++){int m=rs[i];double tol=at[i]+rt[i]*fabs(y[m]);if(k1[i]!=0.0)h=fmin(h,tol/fabs(k1[i]));}}h=fmax(hmin,h);h=fmin(hmax,h);while(t<step){if(0.10*fabs(h)<=fabs(t)*ur){re[sid]=-2;set_err(ge,513,1,sid,pk,rs[1],rs[1],ac,h);return;}double tplus=t+h;if(tplus>step){h=step-t;tplus=step;}if(!reject){for(int col=1;col<=nr;col++){int m=rs[col],i;double tmp=y[m];y[m]=tmp+eps;ros2_eval_rates(nr,rs,y,pk,par,pstride,con,hyd,hb,prog,term,instr,ls,lt,lp,lc,fp);y[m]=tmp==0.0?tmp:tmp-eps;double e2=tmp==0.0?eps:2.0*eps;ros2_eval_rates(nr,rs,y,pk,par,pstride,con,hyd,hb,prog,term,instr,ls,lt,lp,lc,fm);for(i=1;i<=nr;i++)a[i][col]=(fp[i]-fm[i])/e2;y[m]=tmp;}jc++;f+=2*nr;gh0=0.0;}double gh=-1.0/(g*h),dgh=gh-gh0;for(int i=1;i<=nr;i++)a[i][i]+=dgh;gh0=gh;if(!ros2_lu_factor(a,nr,w,ix)){re[sid]=-1;set_err(ge,513,1,sid,pk,rs[1],rs[1],ac,0.0);return;}ros2_eval_rates(nr,rs,y,pk,par,pstride,con,hyd,hb,prog,term,instr,ls,lt,lp,lc,k1);f++;for(int i=1;i<=nr;i++)k1[i]*=gh;ros2_lu_solve(a,nr,ix,k1);for(int m=1;m<=nsp;m++)yn[m]=y[m];for(int i=1;i<=nr;i++){int m=rs[i];yn[m]=y[m]+h*k1[i];}ros2_eval_rates(nr,rs,yn,pk,par,pstride,con,hyd,hb,prog,term,instr,ls,lt,lp,lc,k2);f++;for(int i=1;i<=nr;i++)k2[i]=(k2[i]-2.0*k1[i])*gh;ros2_lu_solve(a,nr,ix,k2);for(int m=1;m<=nsp;m++)yn[m]=y[m];double er=0.0;for(int i=1;i<=nr;i++){int m=rs[i];yn[m]=y[m]+1.5*h*k1[i]+0.5*h*k2[i];double tol=at[i]+rt[i]*fabs(yn[m]);double q=fabs((yn[m]-y[m]-h*k1[i])/tol);er+=q*q;}er=fmax(ur,sqrt(er/(double)nr));double fac=0.9/sqrt(er);fac=fmin(fac,reject?1.0:10.0);fac=fmax(fac,0.1);h=fmin(hmax,fac*h);if(er>1.0){reject=1;rc++;h=0.5*h;}else{reject=0;for(int i=1;i<=nr;i++){int m=rs[i];y[m]=yn[m];if(y[m]<=ur)y[m]=0.0;}hs[sid]=h;t=tplus;ac++;}}}for(int m=1;m<=nsp;m++){c[base+m]=y[m];co[base+m]=c[base+m];double d=c[base+m]-old[m];double add=st[m]==0?ov*d*lpf:(diam[pk]>0.0?ov*4.0/diam[pk]*au*d:0.0);atomicAdd(&reacted[pk*(nsp+1)+m],add);if(!(c[base+m]==c[base+m]))c[base+m]=0.0;}nf[sid]=f;nj[sid]=jc;na[sid]=ac;nn[sid]=rc;lh[sid]=hs[sid];re[sid]=0;}\n"
+"}\n";
+
 typedef struct
 {
     CUmodule module;
     CUfunction odeKernel;
+    CUfunction ros2Kernel;
     CUfunction rk5Kernel;
     CUfunction rk5PipeWarpKernel;
     CUfunction equilKernel;
@@ -1509,9 +1544,12 @@ static int ensureModule(void)
     startMs = MSXgpu_wallTimeMs();
     if (MSX.GpuSolver == RK5)
         solverName = (MSX.GpuRk5Mode == GPU_RK5_FAST_BUCKET) ? "rk5_fast_bucket" : "rk5_align";
+    else if (MSX.GpuSolver == ROS2)
+        solverName = "ros2";
     else
         solverName = "eul";
-    solverMacro = (MSX.GpuSolver == RK5) ? "-DMSX_GPU_SOLVER_RK5" : "-DMSX_GPU_SOLVER_EUL";
+    solverMacro = (MSX.GpuSolver == RK5) ? "-DMSX_GPU_SOLVER_RK5" :
+                  (MSX.GpuSolver == ROS2 ? "-DMSX_GPU_SOLVER_ROS2" : "-DMSX_GPU_SOLVER_EUL");
     if (MSX.GpuSolver == RK5 && MSX.GpuRk5Mode == GPU_RK5_FAST_BUCKET)
         modeMacro = "-DMSX_GPU_RK5_FAST_BUCKET";
     err = checkCu(cuInit(0), ERR_GPU_NOT_ENABLED);
@@ -1555,6 +1593,7 @@ static int ensureModule(void)
     else
     {
         char *specializedSource = NULL;
+        char *ros2Source = NULL;
         const char *compileSource = GpuReactCudaSource;
         timer = MSXgpu_wallTimeMs();
         if (MSX.GpuCompiler)
@@ -1563,7 +1602,22 @@ static int ensureModule(void)
             if (err) return err;
             compileSource = specializedSource;
         }
+        if (MSX.GpuSolver == ROS2)
+        {
+            size_t baseLen = strlen(compileSource);
+            size_t ros2Len = strlen(GpuRos2CudaSource);
+            ros2Source = (char*)malloc(baseLen + ros2Len + 1);
+            if (!ros2Source)
+            {
+                free(specializedSource);
+                return ERR_MEMORY;
+            }
+            memcpy(ros2Source, compileSource, baseLen);
+            memcpy(ros2Source + baseLen, GpuRos2CudaSource, ros2Len + 1);
+            compileSource = ros2Source;
+        }
         err = compileSourceToPtx(compileSource, arch, solverMacro, modeMacro, cachePath, &ptx, &ptxSize);
+        free(ros2Source);
         free(specializedSource);
         MSX.GpuTimingRecord.nvrtc_compile_ms += MSXgpu_wallTimeMs() - timer;
         if (err) return err;
@@ -1583,6 +1637,11 @@ static int ensureModule(void)
         if (err) return err;
         err = checkCu(cuModuleGetFunction(&GpuModule.rk5PipeWarpKernel, GpuModule.module,
                                           "rk5_align_pipe_warp_kernel"), ERR_GPU_KERNEL_LAUNCH_FAILED);
+        if (err) return err;
+    }
+    else if (MSX.GpuSolver == ROS2)
+    {
+        err = checkCu(cuModuleGetFunction(&GpuModule.ros2Kernel, GpuModule.module, "ros2_kernel"), ERR_GPU_KERNEL_LAUNCH_FAILED);
         if (err) return err;
     }
     else
@@ -1832,6 +1891,7 @@ int MSXgpu_reactPipeSegments(double dt)
     CUdeviceptr d_c = 0, d_cOde = 0, d_hyd = 0, d_params = 0, d_consts = 0, d_linkDiam = 0, d_reacted = 0;
     CUdeviceptr d_instr = 0, d_speciesProg = 0, d_termProg = 0, d_err = 0;
     CUdeviceptr d_rk5Nfcn = 0, d_rk5Naccpt = 0, d_rk5Nrejct = 0, d_rk5LastHstep = 0, d_rk5Err = 0;
+    CUdeviceptr d_ros2Nfcn = 0, d_ros2Njac = 0, d_ros2Naccept = 0, d_ros2Nreject = 0, d_ros2LastHstep = 0, d_ros2Err = 0;
     CUevent evStart = NULL, evStop = NULL;
     GpuErrorHost gpuErr;
     MSXReactTransferView transfer;
@@ -1943,6 +2003,12 @@ int MSXgpu_reactPipeSegments(double dt)
     d_rk5Nrejct = (CUdeviceptr)transfer.d_rk5Nrejct;
     d_rk5Err = (CUdeviceptr)transfer.d_rk5Err;
     d_rk5LastHstep = (CUdeviceptr)transfer.d_rk5LastHstep;
+    d_ros2Nfcn = (CUdeviceptr)transfer.d_ros2Nfcn;
+    d_ros2Njac = (CUdeviceptr)transfer.d_ros2Njac;
+    d_ros2Naccept = (CUdeviceptr)transfer.d_ros2Naccept;
+    d_ros2Nreject = (CUdeviceptr)transfer.d_ros2Nreject;
+    d_ros2Err = (CUdeviceptr)transfer.d_ros2Err;
+    d_ros2LastHstep = (CUdeviceptr)transfer.d_ros2LastHstep;
     d_err = (CUdeviceptr)transfer.d_err;
 
     timer = MSXgpu_wallTimeMs();
@@ -1997,6 +2063,11 @@ int MSXgpu_reactPipeSegments(double dt)
             &d_c, &d_cOde, &d_reacted, &d_params, &paramStride, &d_consts, &d_hyd, &hStride,
             &d_speciesProg, &d_termProg, &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst,
             &d_rk5Nfcn, &d_rk5Naccpt, &d_rk5Nrejct, &d_rk5LastHstep, &d_rk5Err, &d_err };
+        void *ros2Args[] = { &nSeg, &nSpecies, &rateCount, &tstep, &d_segPipe, &d_segRow, &d_segVol, &d_hstep,
+            &d_rateAtol, &d_rateRtol, &d_rateSpecies, &d_speciesType, &d_linkDiam, &areaUcf, &lperFt3,
+            &d_c, &d_cOde, &d_reacted, &d_params, &paramStride, &d_consts, &d_hyd, &hStride,
+            &d_speciesProg, &d_termProg, &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst,
+            &d_ros2Nfcn, &d_ros2Njac, &d_ros2Naccept, &d_ros2Nreject, &d_ros2LastHstep, &d_ros2Err, &d_err };
         void *equilArgs[] = { &nSeg, &nSpecies, &eqCount, &d_segPipe, &d_segRow, &d_eqSpecies, &d_c, &d_params,
             &paramStride, &d_consts, &d_hyd, &hStride, &d_speciesProg, &d_termProg,
             &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst, &d_err };
@@ -2085,6 +2156,13 @@ int MSXgpu_reactPipeSegments(double dt)
                           ERR_GPU_KERNEL_LAUNCH_FAILED);
             if (err) goto cleanup;
         }
+        else if (MSX.GpuSolver == ROS2)
+        {
+            err = checkCu(cuLaunchKernel(GpuModule.ros2Kernel, grid, 1, 1, block, 1, 1, 0, 0,
+                                         ros2Args, NULL),
+                          ERR_GPU_KERNEL_LAUNCH_FAILED);
+            if (err) goto cleanup;
+        }
         else
         {
             err = checkCu(cuLaunchKernel((MSX.GpuSolver == RK5) ? GpuModule.rk5Kernel : GpuModule.odeKernel,
@@ -2133,6 +2211,32 @@ int MSXgpu_reactPipeSegments(double dt)
             MSX.GpuTimingRecord.rk5_nrejct += transfer.rk5Nrejct[sid];
             if (transfer.rk5LastHstep[sid] != 0.0) MSX.GpuTimingRecord.rk5_last_hstep = transfer.rk5LastHstep[sid];
             if (!MSX.GpuTimingRecord.rk5_error_code && transfer.rk5Err[sid]) MSX.GpuTimingRecord.rk5_error_code = transfer.rk5Err[sid];
+        }
+    }
+
+    if (MSX.GpuSolver == ROS2)
+    {
+        for (sid = 0; sid < nSeg; sid++)
+        {
+            if (MSX.GpuTimingDetail)
+            {
+                MSX.GpuTimingRecord.ros2_nfcn += transfer.ros2Nfcn[sid];
+                MSX.GpuTimingRecord.ros2_njac += transfer.ros2Njac[sid];
+                MSX.GpuTimingRecord.ros2_naccept += transfer.ros2Naccept[sid];
+                MSX.GpuTimingRecord.ros2_nreject += transfer.ros2Nreject[sid];
+                if (transfer.ros2LastHstep[sid] != 0.0)
+                    MSX.GpuTimingRecord.ros2_last_hstep = transfer.ros2LastHstep[sid];
+            }
+            if (transfer.ros2Err[sid])
+            {
+                if (!MSX.GpuTimingRecord.ros2_error_code)
+                    MSX.GpuTimingRecord.ros2_error_code = transfer.ros2Err[sid];
+                if (!Ros2RawErrorReason)
+                {
+                    Ros2RawErrorReason = transfer.ros2Err[sid];
+                    Ros2RawErrorSid = sid;
+                }
+            }
         }
     }
 

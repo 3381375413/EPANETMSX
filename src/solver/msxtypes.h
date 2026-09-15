@@ -518,6 +518,11 @@ typedef struct                         // Per-quality-substep timing record
     double rk5_bucket_launches;
     double rk5_bucket_max_size;
     double rk5_bucket_reorder_ms;
+    double ros2_nfcn;
+    double ros2_njac;
+    double ros2_naccept;
+    double ros2_nreject;
+    double ros2_last_hstep;
     double react_count_parallel_ms;
     double react_count_prefix_ms;
     double react_pack_segment_ms;
@@ -526,6 +531,7 @@ typedef struct                         // Per-quality-substep timing record
     double react_scatter_ms;
     int rk5_fast_mode;
     int rk5_error_code;
+    int ros2_error_code;
     int error_code;
 } MSXGpuTiming;
 

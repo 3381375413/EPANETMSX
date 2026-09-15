@@ -58,6 +58,12 @@ typedef struct
     int *rk5Nrejct;
     int *rk5Err;
     double *rk5LastHstep;
+    int *ros2Nfcn;
+    int *ros2Njac;
+    int *ros2Naccept;
+    int *ros2Nreject;
+    int *ros2Err;
+    double *ros2LastHstep;
 
     int deviceNSegCap;
     int deviceActiveCap;
@@ -82,6 +88,12 @@ typedef struct
     int *d_rk5Nrejct;
     int *d_rk5Err;
     double *d_rk5LastHstep;
+    int *d_ros2Nfcn;
+    int *d_ros2Njac;
+    int *d_ros2Naccept;
+    int *d_ros2Nreject;
+    int *d_ros2Err;
+    double *d_ros2LastHstep;
     void *d_err;
     size_t errCap;
 } ReactTransferWorkspace;
@@ -234,6 +246,12 @@ static int ensureSegmentCapacity(int nSeg, int nSpecies)
         if (growPinnedInt(&Ws.rk5Nrejct, oldSegCap, newSegCap)) return 1;
         if (growPinnedInt(&Ws.rk5Err, oldSegCap, newSegCap)) return 1;
         if (growPinnedDouble(&Ws.rk5LastHstep, oldSegCap, newSegCap)) return 1;
+        if (growPinnedInt(&Ws.ros2Nfcn, oldSegCap, newSegCap)) return 1;
+        if (growPinnedInt(&Ws.ros2Njac, oldSegCap, newSegCap)) return 1;
+        if (growPinnedInt(&Ws.ros2Naccept, oldSegCap, newSegCap)) return 1;
+        if (growPinnedInt(&Ws.ros2Nreject, oldSegCap, newSegCap)) return 1;
+        if (growPinnedInt(&Ws.ros2Err, oldSegCap, newSegCap)) return 1;
+        if (growPinnedDouble(&Ws.ros2LastHstep, oldSegCap, newSegCap)) return 1;
         Ws.nSegCap = newSegCap;
     }
     cValues = Ws.nSegCap * (nSpecies + 1);
@@ -280,9 +298,17 @@ static int ensureDevice(MSXReactTransferView *view, size_t errSize)
         if (Ws.d_rk5Nrejct) cudaFree(Ws.d_rk5Nrejct);
         if (Ws.d_rk5Err) cudaFree(Ws.d_rk5Err);
         if (Ws.d_rk5LastHstep) cudaFree(Ws.d_rk5LastHstep);
+        if (Ws.d_ros2Nfcn) cudaFree(Ws.d_ros2Nfcn);
+        if (Ws.d_ros2Njac) cudaFree(Ws.d_ros2Njac);
+        if (Ws.d_ros2Naccept) cudaFree(Ws.d_ros2Naccept);
+        if (Ws.d_ros2Nreject) cudaFree(Ws.d_ros2Nreject);
+        if (Ws.d_ros2Err) cudaFree(Ws.d_ros2Err);
+        if (Ws.d_ros2LastHstep) cudaFree(Ws.d_ros2LastHstep);
         Ws.d_segRow = NULL; Ws.d_segPipe = NULL; Ws.d_segVol = NULL; Ws.d_hstep = NULL;
         Ws.d_rk5Nfcn = NULL; Ws.d_rk5Naccpt = NULL; Ws.d_rk5Nrejct = NULL;
         Ws.d_rk5Err = NULL; Ws.d_rk5LastHstep = NULL;
+        Ws.d_ros2Nfcn = NULL; Ws.d_ros2Njac = NULL; Ws.d_ros2Naccept = NULL;
+        Ws.d_ros2Nreject = NULL; Ws.d_ros2Err = NULL; Ws.d_ros2LastHstep = NULL;
         if (cudaMalloc((void **)&Ws.d_segRow, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
         if (cudaMalloc((void **)&Ws.d_segPipe, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
         if (cudaMalloc((void **)&Ws.d_segVol, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
@@ -292,6 +318,12 @@ static int ensureDevice(MSXReactTransferView *view, size_t errSize)
         if (cudaMalloc((void **)&Ws.d_rk5Nrejct, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
         if (cudaMalloc((void **)&Ws.d_rk5Err, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
         if (cudaMalloc((void **)&Ws.d_rk5LastHstep, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (cudaMalloc((void **)&Ws.d_ros2Nfcn, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (cudaMalloc((void **)&Ws.d_ros2Njac, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (cudaMalloc((void **)&Ws.d_ros2Naccept, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (cudaMalloc((void **)&Ws.d_ros2Nreject, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (cudaMalloc((void **)&Ws.d_ros2Err, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (cudaMalloc((void **)&Ws.d_ros2LastHstep, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
         Ws.deviceNSegCap = newCap;
     }
     if (view->nActiveLinks > Ws.deviceActiveCap)
@@ -362,6 +394,12 @@ static int ensureDevice(MSXReactTransferView *view, size_t errSize)
     view->d_rk5Nrejct = (MSXGpuDevicePtr)(size_t)Ws.d_rk5Nrejct;
     view->d_rk5Err = (MSXGpuDevicePtr)(size_t)Ws.d_rk5Err;
     view->d_rk5LastHstep = (MSXGpuDevicePtr)(size_t)Ws.d_rk5LastHstep;
+    view->d_ros2Nfcn = (MSXGpuDevicePtr)(size_t)Ws.d_ros2Nfcn;
+    view->d_ros2Njac = (MSXGpuDevicePtr)(size_t)Ws.d_ros2Njac;
+    view->d_ros2Naccept = (MSXGpuDevicePtr)(size_t)Ws.d_ros2Naccept;
+    view->d_ros2Nreject = (MSXGpuDevicePtr)(size_t)Ws.d_ros2Nreject;
+    view->d_ros2Err = (MSXGpuDevicePtr)(size_t)Ws.d_ros2Err;
+    view->d_ros2LastHstep = (MSXGpuDevicePtr)(size_t)Ws.d_ros2LastHstep;
     view->d_err = (MSXGpuDevicePtr)(size_t)Ws.d_err;
     return 0;
 }
@@ -420,6 +458,12 @@ extern "C" void MSXreactTransfer_close(void)
     if (Ws.rk5Nrejct) cudaFreeHost(Ws.rk5Nrejct);
     if (Ws.rk5Err) cudaFreeHost(Ws.rk5Err);
     if (Ws.rk5LastHstep) cudaFreeHost(Ws.rk5LastHstep);
+    if (Ws.ros2Nfcn) cudaFreeHost(Ws.ros2Nfcn);
+    if (Ws.ros2Njac) cudaFreeHost(Ws.ros2Njac);
+    if (Ws.ros2Naccept) cudaFreeHost(Ws.ros2Naccept);
+    if (Ws.ros2Nreject) cudaFreeHost(Ws.ros2Nreject);
+    if (Ws.ros2Err) cudaFreeHost(Ws.ros2Err);
+    if (Ws.ros2LastHstep) cudaFreeHost(Ws.ros2LastHstep);
     if (Ws.d_segRow) cudaFree(Ws.d_segRow);
     if (Ws.d_segPipe) cudaFree(Ws.d_segPipe);
     if (Ws.d_activeLink) cudaFree(Ws.d_activeLink);
@@ -436,6 +480,12 @@ extern "C" void MSXreactTransfer_close(void)
     if (Ws.d_rk5Nrejct) cudaFree(Ws.d_rk5Nrejct);
     if (Ws.d_rk5Err) cudaFree(Ws.d_rk5Err);
     if (Ws.d_rk5LastHstep) cudaFree(Ws.d_rk5LastHstep);
+    if (Ws.d_ros2Nfcn) cudaFree(Ws.d_ros2Nfcn);
+    if (Ws.d_ros2Njac) cudaFree(Ws.d_ros2Njac);
+    if (Ws.d_ros2Naccept) cudaFree(Ws.d_ros2Naccept);
+    if (Ws.d_ros2Nreject) cudaFree(Ws.d_ros2Nreject);
+    if (Ws.d_ros2Err) cudaFree(Ws.d_ros2Err);
+    if (Ws.d_ros2LastHstep) cudaFree(Ws.d_ros2LastHstep);
     if (Ws.d_err) cudaFree(Ws.d_err);
     memset(&Ws, 0, sizeof(Ws));
 }
@@ -557,6 +607,12 @@ extern "C" int MSXreactTransfer_countAndPack(double dt, int nSpecies, MSXReactTr
     memset(Ws.rk5Nrejct, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
     memset(Ws.rk5Err, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
     memset(Ws.rk5LastHstep, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(double));
+    memset(Ws.ros2Nfcn, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2Njac, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2Naccept, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2Nreject, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2Err, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2LastHstep, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(double));
     MSX.GpuTimingRecord.react_pack_segment_ms += hostWallTimeMs() - packTimer;
 
     view->nSeg = nSeg;
@@ -584,6 +640,12 @@ extern "C" int MSXreactTransfer_countAndPack(double dt, int nSpecies, MSXReactTr
     view->rk5Nrejct = Ws.rk5Nrejct;
     view->rk5Err = Ws.rk5Err;
     view->rk5LastHstep = Ws.rk5LastHstep;
+    view->ros2Nfcn = Ws.ros2Nfcn;
+    view->ros2Njac = Ws.ros2Njac;
+    view->ros2Naccept = Ws.ros2Naccept;
+    view->ros2Nreject = Ws.ros2Nreject;
+    view->ros2Err = Ws.ros2Err;
+    view->ros2LastHstep = Ws.ros2LastHstep;
     return 0;
 }
 
@@ -656,6 +718,12 @@ extern "C" int MSXreactTransfer_ringView(double dt, int nSpecies, MSXReactTransf
     memset(Ws.rk5Nrejct, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
     memset(Ws.rk5Err, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
     memset(Ws.rk5LastHstep, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(double));
+    memset(Ws.ros2Nfcn, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2Njac, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2Naccept, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2Nreject, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2Err, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(int));
+    memset(Ws.ros2LastHstep, 0, (size_t)(nSeg > 0 ? nSeg : 1) * sizeof(double));
     MSX.GpuTimingRecord.react_pack_segment_ms += hostWallTimeMs() - packTimer;
 
     view->nSeg = nSeg;
@@ -683,6 +751,12 @@ extern "C" int MSXreactTransfer_ringView(double dt, int nSpecies, MSXReactTransf
     view->rk5Nrejct = Ws.rk5Nrejct;
     view->rk5Err = Ws.rk5Err;
     view->rk5LastHstep = Ws.rk5LastHstep;
+    view->ros2Nfcn = Ws.ros2Nfcn;
+    view->ros2Njac = Ws.ros2Njac;
+    view->ros2Naccept = Ws.ros2Naccept;
+    view->ros2Nreject = Ws.ros2Nreject;
+    view->ros2Err = Ws.ros2Err;
+    view->ros2LastHstep = Ws.ros2LastHstep;
     if (!view->c || !view->cOde || view->ringSlotCount <= 0 || view->ringStride != nSpecies + 1)
         return ERR_GPU_SEGMENT_PACK_FAILED;
     return 0;
@@ -731,6 +805,12 @@ extern "C" int MSXreactTransfer_upload(MSXReactTransferView *view, const void *z
     CUDA_COPY(cudaMemset(Ws.d_rk5Nrejct, 0, (size_t)nSeg * sizeof(int)));
     CUDA_COPY(cudaMemset(Ws.d_rk5Err, 0, (size_t)nSeg * sizeof(int)));
     CUDA_COPY(cudaMemset(Ws.d_rk5LastHstep, 0, (size_t)nSeg * sizeof(double)));
+    CUDA_COPY(cudaMemset(Ws.d_ros2Nfcn, 0, (size_t)nSeg * sizeof(int)));
+    CUDA_COPY(cudaMemset(Ws.d_ros2Njac, 0, (size_t)nSeg * sizeof(int)));
+    CUDA_COPY(cudaMemset(Ws.d_ros2Naccept, 0, (size_t)nSeg * sizeof(int)));
+    CUDA_COPY(cudaMemset(Ws.d_ros2Nreject, 0, (size_t)nSeg * sizeof(int)));
+    CUDA_COPY(cudaMemset(Ws.d_ros2Err, 0, (size_t)nSeg * sizeof(int)));
+    CUDA_COPY(cudaMemset(Ws.d_ros2LastHstep, 0, (size_t)nSeg * sizeof(double)));
     if (zeroErr && errSize > 0) CUDA_COPY(cudaMemcpy(Ws.d_err, zeroErr, errSize, cudaMemcpyHostToDevice));
 #undef CUDA_COPY
     MSX.GpuTimingRecord.h2d_ms += hostWallTimeMs() - timer;
@@ -763,6 +843,12 @@ extern "C" int MSXreactTransfer_download(MSXReactTransferView *view, void *hostE
     CUDA_COPY(cudaMemcpy(view->rk5Nrejct, Ws.d_rk5Nrejct, (size_t)nSeg * sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_COPY(cudaMemcpy(view->rk5Err, Ws.d_rk5Err, (size_t)nSeg * sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_COPY(cudaMemcpy(view->rk5LastHstep, Ws.d_rk5LastHstep, (size_t)nSeg * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_COPY(cudaMemcpy(view->ros2Nfcn, Ws.d_ros2Nfcn, (size_t)nSeg * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_COPY(cudaMemcpy(view->ros2Njac, Ws.d_ros2Njac, (size_t)nSeg * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_COPY(cudaMemcpy(view->ros2Naccept, Ws.d_ros2Naccept, (size_t)nSeg * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_COPY(cudaMemcpy(view->ros2Nreject, Ws.d_ros2Nreject, (size_t)nSeg * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_COPY(cudaMemcpy(view->ros2Err, Ws.d_ros2Err, (size_t)nSeg * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_COPY(cudaMemcpy(view->ros2LastHstep, Ws.d_ros2LastHstep, (size_t)nSeg * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_COPY(cudaMemcpy(view->reacted, Ws.d_reacted, reactedBytes, cudaMemcpyDeviceToHost));
     if (hostErr && errSize > 0) CUDA_COPY(cudaMemcpy(hostErr, Ws.d_err, errSize, cudaMemcpyDeviceToHost));
 #undef CUDA_COPY

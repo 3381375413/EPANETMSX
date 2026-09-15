@@ -39,6 +39,12 @@ typedef struct
     int *rk5Nrejct;
     int *rk5Err;
     double *rk5LastHstep;
+    int *ros2Nfcn;
+    int *ros2Njac;
+    int *ros2Naccept;
+    int *ros2Nreject;
+    int *ros2Err;
+    double *ros2LastHstep;
 
     MSXGpuDevicePtr d_segPipe;
     MSXGpuDevicePtr d_segRow;
@@ -56,6 +62,12 @@ typedef struct
     MSXGpuDevicePtr d_rk5Nrejct;
     MSXGpuDevicePtr d_rk5Err;
     MSXGpuDevicePtr d_rk5LastHstep;
+    MSXGpuDevicePtr d_ros2Nfcn;
+    MSXGpuDevicePtr d_ros2Njac;
+    MSXGpuDevicePtr d_ros2Naccept;
+    MSXGpuDevicePtr d_ros2Nreject;
+    MSXGpuDevicePtr d_ros2Err;
+    MSXGpuDevicePtr d_ros2LastHstep;
     MSXGpuDevicePtr d_err;
 } MSXReactTransferView;
 
