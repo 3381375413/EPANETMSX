@@ -32,10 +32,12 @@
 //  External variables
 //--------------------
 extern MSXproject  MSX;                // MSX project data
+static char PendingInpFileName[MAXFNAME];
 
 //  Imported functions
 //--------------------
 int    MSXproj_open(char *fname);
+void   MSXproj_setInpFile(const char *fname);
 int    MSXproj_close(void);
 int    MSXproj_addObject(int type, char *id, int n);
 int    MSXproj_findObject(int type, char *id);
@@ -67,6 +69,8 @@ int MSXDLLEXPORT   MSXENopen(const char *inpFile, const char *rptFile, const cha
 */
 {
     int err = 0;
+    if (inpFile && strlen(inpFile) < MAXFNAME) strcpy(PendingInpFileName, inpFile);
+    else PendingInpFileName[0] = '\0';
     err = ENopen(inpFile, rptFile, outFile);
     return err;
 }
@@ -80,6 +84,7 @@ int MSXDLLEXPORT   MSXENclose(void)
 {
     int err = 0;
     err = ENclose();
+    PendingInpFileName[0] = '\0';
     return err;
 }
 
@@ -97,8 +102,10 @@ int  MSXDLLEXPORT  MSXopen(char *fname)
 */
 {
     int err = 0;
+    if (!fname || strlen(fname) >= MAXFNAME) return ERR_OPEN_MSX_FILE;
     if (MSX.ProjectOpened) return(ERR_MSX_OPENED);
     CALL(err, MSXproj_open(fname));
+    if (!err) MSXproj_setInpFile(PendingInpFileName);
     CALL(err, MSXqual_open());
 
     if ( err )

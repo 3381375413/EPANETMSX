@@ -25,6 +25,11 @@ file(GLOB
     CONFIGURE_DEPENDS
     RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *.c *.h *.dat
 )
+# The glob sees the non-CUDA implementation too.  It must never be linked
+# with the CUDA object because both export the same ABI.
+list(REMOVE_ITEM EPANETMSX_SOURCES
+    msxresident_core_cuda_stub.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_core_cuda_stub.c)
 
 if(EPANETMSX_REACT_TRANSFER_STATIC_CUDA)
     set(REACT_TRANSFER_CUDA_OBJ ${CMAKE_CURRENT_BINARY_DIR}/msxreact_transfer_cuda.obj)
@@ -60,6 +65,14 @@ if(EPANETMSX_REACT_TRANSFER_STATIC_CUDA)
         VERBATIM
     )
     list(APPEND EPANETMSX_SOURCES ${REACT_TRANSFER_CUDA_OBJ})
+    set(RESIDENT_CORE_CUDA_OBJ ${CMAKE_CURRENT_BINARY_DIR}/msxresident_core_cuda.obj)
+    add_custom_command(OUTPUT ${RESIDENT_CORE_CUDA_OBJ}
+        COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} -c ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_core_cuda.cu -allow-unsupported-compiler -o ${RESIDENT_CORE_CUDA_OBJ} -I${CMAKE_CURRENT_SOURCE_DIR} -I${CMAKE_CURRENT_SOURCE_DIR}/.. -I${PROJECT_SOURCE_DIR}/EPANET2.2/SRC_engines/include ${REACT_TRANSFER_CUDA_INCLUDE_FLAGS} -D_CRT_SECURE_NO_WARNINGS -Xcompiler=/MD
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_core_cuda.cu ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_core_cuda.h ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_core.h ${CMAKE_CURRENT_SOURCE_DIR}/msxtypes.h
+        VERBATIM)
+    list(APPEND EPANETMSX_SOURCES ${RESIDENT_CORE_CUDA_OBJ})
+else()
+    list(APPEND EPANETMSX_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_core_cuda_stub.c)
 endif()
 
 if(BUILD_DEF)

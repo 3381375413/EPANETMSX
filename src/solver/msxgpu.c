@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 
 #include <math.h>
 #include <errno.h>
@@ -284,7 +284,10 @@ int MSXgpu_openTiming(void)
         "rk5_bucket_max_size,rk5_bucket_reorder_ms,react_count_parallel_ms,react_count_prefix_ms,"
         "react_pack_segment_ms,react_host_alloc_ms,react_device_alloc_ms,react_scatter_ms,"
         "ros2_nfcn,ros2_njac,ros2_naccept,ros2_nreject,ros2_last_hstep,"
-        "rk5_fast_mode,rk5_error_code,ros2_error_code,error_code\n");
+        "rk5_fast_mode,rk5_error_code,ros2_error_code,error_code,"
+        "resident_boundary_cpu_ms,resident_enumerate_filter_ms,resident_patch_h2d_ms,"
+        "resident_active_h2d_ms,resident_diag_d2h_hstep_ms,resident_sync_ms,"
+        "resident_initial_upload_ms,resident_handoff_ms,resident_fallback_ms,resident_active_rows\n");
     fflush(TimingFile);
     return 0;
 }
@@ -339,7 +342,7 @@ void MSXgpu_closeTiming(void)
             "TOTAL,%lld,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
             "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
             "%.6f,%.6f,%.6f,%.17g,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d\n",
+            "%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
             TotalTiming.step_index, TotalTiming.sim_time_sec,
             TotalTiming.gpu_enabled, TotalTiming.gpu_strict,
             TotalTiming.react_gpu, TotalTiming.advect_gpu, TotalTiming.mix_gpu,
@@ -365,7 +368,12 @@ void MSXgpu_closeTiming(void)
             TotalTiming.ros2_last_hstep,
             TotalTiming.rk5_fast_mode,
             TotalTiming.rk5_error_code, TotalTiming.ros2_error_code,
-            TotalTiming.error_code);
+            TotalTiming.error_code,
+            TotalTiming.resident_boundary_cpu_ms, TotalTiming.resident_enumerate_filter_ms,
+            TotalTiming.resident_patch_h2d_ms, TotalTiming.resident_active_h2d_ms,
+            TotalTiming.resident_diag_d2h_hstep_ms, TotalTiming.resident_sync_ms,
+            TotalTiming.resident_initial_upload_ms, TotalTiming.resident_handoff_ms,
+            TotalTiming.resident_fallback_ms, TotalTiming.resident_active_rows);
         fclose(TimingFile);
     }
     TimingFile = NULL;
@@ -445,6 +453,16 @@ void MSXgpu_endStep(int errorCode)
     TotalTiming.react_host_alloc_ms += t->react_host_alloc_ms;
     TotalTiming.react_device_alloc_ms += t->react_device_alloc_ms;
     TotalTiming.react_scatter_ms += t->react_scatter_ms;
+    TotalTiming.resident_boundary_cpu_ms += t->resident_boundary_cpu_ms;
+    TotalTiming.resident_enumerate_filter_ms += t->resident_enumerate_filter_ms;
+    TotalTiming.resident_patch_h2d_ms += t->resident_patch_h2d_ms;
+    TotalTiming.resident_active_h2d_ms += t->resident_active_h2d_ms;
+    TotalTiming.resident_diag_d2h_hstep_ms += t->resident_diag_d2h_hstep_ms;
+    TotalTiming.resident_sync_ms += t->resident_sync_ms;
+    TotalTiming.resident_initial_upload_ms += t->resident_initial_upload_ms;
+    TotalTiming.resident_handoff_ms += t->resident_handoff_ms;
+    TotalTiming.resident_fallback_ms += t->resident_fallback_ms;
+    TotalTiming.resident_active_rows += t->resident_active_rows;
     TotalTiming.ros2_nfcn += t->ros2_nfcn;
     TotalTiming.ros2_njac += t->ros2_njac;
     TotalTiming.ros2_naccept += t->ros2_naccept;
@@ -490,6 +508,51 @@ void MSXgpu_addEquilTime(double ms) { addTime(&MSX.GpuTimingRecord.react_equil_m
 void MSXgpu_addFormulaTime(double ms) { addTime(&MSX.GpuTimingRecord.react_formula_ms, ms); }
 
 #ifndef EPANETMSX_CUDA_ENABLED
+int MSXgpu_prepareResidentContext(void)
+{
+    setGpuError(ERR_GPU_NOT_ENABLED, GPU_STAGE_NONE, -1, -1, -1, -1, -1, 0.0);
+    return ERR_GPU_NOT_ENABLED;
+}
+
+int MSXgpu_openResidentPrograms(void)
+{
+    setGpuError(ERR_GPU_NOT_ENABLED, GPU_STAGE_NONE, -1, -1, -1, -1, -1, 0.0);
+    return ERR_GPU_NOT_ENABLED;
+}
+
+void MSXgpu_closeResidentPrograms(void)
+{
+    /* Non-CUDA builds have no program cache. */
+}
+
+static int mapResidentStatus(MSXResidentStatus status)
+{
+    switch (status)
+    {
+    case MSX_RESIDENT_ERR_ARGUMENT:
+    case MSX_RESIDENT_ERR_CONFIG:
+    case MSX_RESIDENT_ERR_SCOPE:
+    case MSX_RESIDENT_ERR_SOLVER:
+        return ERR_GPU_UNSUPPORTED_FEATURE;
+    case MSX_RESIDENT_ERR_CAPACITY:
+    case MSX_RESIDENT_ERR_GENERATION:
+    case MSX_RESIDENT_ERR_OVERFLOW:
+        return ERR_GPU_SEGMENT_PACK_FAILED;
+    case MSX_RESIDENT_ERR_TRANSFER:
+    case MSX_RESIDENT_ERR_GPU:
+    case MSX_RESIDENT_ERR_POISONED:
+        return ERR_GPU_KERNEL_RUNTIME_ERROR;
+    default:
+        return ERR_GPU_NOT_ENABLED;
+    }
+}
+int MSXgpu_reactResidentCore(MSXResidentGpu *gpu, const MSXResidentActiveBatch *batch,
+                             double dt, MSXResidentGpuReactResult *result)
+{
+    (void)gpu; (void)batch; (void)dt;
+    if (result) memset(result, 0, sizeof(*result));
+    return MSXgpu_prepareResidentContext();
+}
 int MSXgpu_reactPipeSegments(double dt)
 {
     (void)dt;
@@ -497,6 +560,23 @@ int MSXgpu_reactPipeSegments(double dt)
     return ERR_GPU_NOT_ENABLED;
 }
 #else
+
+static int mapResidentStatus(MSXResidentStatus status)
+{
+    switch (status)
+    {
+    case MSX_RESIDENT_ERR_ARGUMENT: case MSX_RESIDENT_ERR_CONFIG:
+    case MSX_RESIDENT_ERR_SCOPE: case MSX_RESIDENT_ERR_SOLVER:
+        return ERR_GPU_UNSUPPORTED_FEATURE;
+    case MSX_RESIDENT_ERR_CAPACITY: case MSX_RESIDENT_ERR_GENERATION:
+    case MSX_RESIDENT_ERR_OVERFLOW:
+        return ERR_GPU_SEGMENT_PACK_FAILED;
+    case MSX_RESIDENT_ERR_TRANSFER: case MSX_RESIDENT_ERR_GPU:
+    case MSX_RESIDENT_ERR_POISONED:
+        return ERR_GPU_KERNEL_RUNTIME_ERROR;
+    default: return ERR_GPU_NOT_ENABLED;
+    }
+}
 
 #ifndef EPANETMSX_REACT_TRANSFER_STATIC_CUDA
 int MSXreactTransfer_init(char *errmsg, int errmsgLen)
@@ -607,6 +687,11 @@ typedef struct
 
 static GpuModuleState GpuModule;
 static CUcontext GpuContext = NULL;
+
+/* Immutable NH2CL chemistry/program tables.  Parameter changes after open
+   are unsupported in this phase; Phase 3 uses a fixed compiled case. */
+typedef struct { int ready,nLinks,nSpecies,nParams,nConsts,rateCount,eqCount,formulaCount,nInstr; int *rateSpecies,*eqSpecies,*formulaSpecies,*speciesType; double *rateAtol,*rateRtol,*params,*consts,*linkDiam; GpuInstrHost *instr; GpuProgramHost *speciesProg,*termProg; CUdeviceptr d_rateAtol,d_rateRtol,d_rateSpecies,d_eqSpecies,d_formulaSpecies,d_speciesType,d_params,d_consts,d_linkDiam,d_instr,d_speciesProg,d_termProg,d_err; CUevent evStart,evStop; unsigned long long allocCount; } ResidentPrograms;
+static ResidentPrograms ResidentProgram;
 
 static int checkCu(CUresult r, int code)
 {
@@ -1749,6 +1834,179 @@ static double eventElapsedMs(CUevent start, CUevent stop)
     cuEventSynchronize(stop);
     cuEventElapsedTime(&ms, start, stop);
     return (double)ms;
+}
+
+int MSXgpu_prepareResidentContext(void)
+{
+    int err = validateModelForGpu();
+    if (err) return err;
+    err = ensureModule();
+    if (err) return err;
+    return checkCu(cuCtxSetCurrent(GpuContext), ERR_GPU_NOT_ENABLED);
+}
+
+void MSXgpu_closeResidentPrograms(void)
+{
+    if (GpuContext) cuCtxSetCurrent(GpuContext);
+#define RP_FREE_D(x) do { if (ResidentProgram.x) cuMemFree(ResidentProgram.x); } while (0)
+    RP_FREE_D(d_rateAtol); RP_FREE_D(d_rateRtol); RP_FREE_D(d_rateSpecies);
+    RP_FREE_D(d_eqSpecies); RP_FREE_D(d_formulaSpecies); RP_FREE_D(d_speciesType);
+    RP_FREE_D(d_params); RP_FREE_D(d_consts); RP_FREE_D(d_linkDiam); RP_FREE_D(d_instr);
+    RP_FREE_D(d_speciesProg); RP_FREE_D(d_termProg); RP_FREE_D(d_err);
+#undef RP_FREE_D
+    if (ResidentProgram.evStart) cuEventDestroy(ResidentProgram.evStart);
+    if (ResidentProgram.evStop) cuEventDestroy(ResidentProgram.evStop);
+    free(ResidentProgram.rateSpecies); free(ResidentProgram.eqSpecies);
+    free(ResidentProgram.formulaSpecies); free(ResidentProgram.speciesType);
+    free(ResidentProgram.rateAtol); free(ResidentProgram.rateRtol); free(ResidentProgram.params);
+    free(ResidentProgram.consts); free(ResidentProgram.linkDiam); free(ResidentProgram.instr);
+    free(ResidentProgram.speciesProg); free(ResidentProgram.termProg);
+    memset(&ResidentProgram, 0, sizeof(ResidentProgram));
+}
+
+int MSXgpu_openResidentPrograms(void)
+{
+    int err, nLinks, nSpecies, nParams, nConsts, rateCount = 0, eqCount = 0, formulaCount = 0;
+    int m, k, nInstr = 0;
+    GpuErrorHost zeroErr;
+    err = MSXgpu_prepareResidentContext(); if (err) return err;
+    if (ResidentProgram.ready) return 0;
+    nLinks=MSX.Nobjects[LINK]; nSpecies=MSX.Nobjects[SPECIES]; nParams=MSX.Nobjects[PARAMETER]; nConsts=MSX.Nobjects[CONSTANT];
+    for(m=1;m<=nSpecies;m++) { if(MSX.Species[m].pipeExprType==RATE)rateCount++; else if(MSX.Species[m].pipeExprType==EQUIL)eqCount++; else if(MSX.Species[m].pipeExprType==FORMULA)formulaCount++; }
+    ResidentProgram.params=(double*)calloc((size_t)(nLinks+1)*(nParams+1),sizeof(double)); ResidentProgram.consts=(double*)calloc(nConsts+1,sizeof(double)); ResidentProgram.linkDiam=(double*)calloc(nLinks+1,sizeof(double));
+    ResidentProgram.rateSpecies=(int*)calloc(rateCount+1,sizeof(int)); ResidentProgram.rateAtol=(double*)calloc(rateCount+1,sizeof(double)); ResidentProgram.rateRtol=(double*)calloc(rateCount+1,sizeof(double)); ResidentProgram.eqSpecies=(int*)calloc(eqCount+1,sizeof(int)); ResidentProgram.formulaSpecies=(int*)calloc(formulaCount+1,sizeof(int)); ResidentProgram.speciesType=(int*)calloc(nSpecies+1,sizeof(int));
+    if(!ResidentProgram.params||!ResidentProgram.consts||!ResidentProgram.linkDiam||!ResidentProgram.rateSpecies||!ResidentProgram.rateAtol||!ResidentProgram.rateRtol||!ResidentProgram.eqSpecies||!ResidentProgram.formulaSpecies||!ResidentProgram.speciesType) { err=ERR_MEMORY; goto fail; }
+    ResidentProgram.rateCount=ResidentProgram.eqCount=ResidentProgram.formulaCount=0;
+    for(m=1;m<=nSpecies;m++){ ResidentProgram.speciesType[m]=MSX.Species[m].type; if(MSX.Species[m].pipeExprType==RATE){int i=++ResidentProgram.rateCount;ResidentProgram.rateSpecies[i]=m;ResidentProgram.rateAtol[i]=MSX.Species[m].aTol;ResidentProgram.rateRtol[i]=MSX.Species[m].rTol;}else if(MSX.Species[m].pipeExprType==EQUIL)ResidentProgram.eqSpecies[++ResidentProgram.eqCount]=m;else if(MSX.Species[m].pipeExprType==FORMULA)ResidentProgram.formulaSpecies[++ResidentProgram.formulaCount]=m; }
+    for(m=1;m<=nConsts;m++)ResidentProgram.consts[m]=MSX.Const[m].value;
+    for(k=1;k<=nLinks;k++){ResidentProgram.linkDiam[k]=MSX.Link[k].diam;for(m=1;m<=nParams;m++)ResidentProgram.params[k*(nParams+1)+m]=MSX.Link[k].param[m];}
+    err=buildPrograms(&ResidentProgram.instr,&nInstr,&ResidentProgram.speciesProg,&ResidentProgram.termProg); if(err)goto fail; ResidentProgram.nInstr=nInstr; memset(&zeroErr,0,sizeof(zeroErr));
+#define RP_ALLOC_COPY(x,h,n) do { err=checkCu(cuMemAlloc(&ResidentProgram.x,(n)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(cuMemcpyHtoD(ResidentProgram.x,(h),(n)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;} while(0)
+    RP_ALLOC_COPY(d_rateAtol,ResidentProgram.rateAtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateRtol,ResidentProgram.rateRtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateSpecies,ResidentProgram.rateSpecies,(rateCount+1)*sizeof(int)); RP_ALLOC_COPY(d_eqSpecies,ResidentProgram.eqSpecies,(eqCount+1)*sizeof(int)); RP_ALLOC_COPY(d_formulaSpecies,ResidentProgram.formulaSpecies,(formulaCount+1)*sizeof(int)); RP_ALLOC_COPY(d_speciesType,ResidentProgram.speciesType,(nSpecies+1)*sizeof(int)); RP_ALLOC_COPY(d_params,ResidentProgram.params,(size_t)(nLinks+1)*(nParams+1)*sizeof(double)); RP_ALLOC_COPY(d_consts,ResidentProgram.consts,(nConsts+1)*sizeof(double)); RP_ALLOC_COPY(d_linkDiam,ResidentProgram.linkDiam,(nLinks+1)*sizeof(double)); RP_ALLOC_COPY(d_instr,ResidentProgram.instr,(nInstr?nInstr:1)*sizeof(GpuInstrHost)); RP_ALLOC_COPY(d_speciesProg,ResidentProgram.speciesProg,(nSpecies+1)*sizeof(GpuProgramHost)); RP_ALLOC_COPY(d_termProg,ResidentProgram.termProg,(MSX.Nobjects[TERM]+1)*sizeof(GpuProgramHost));
+#undef RP_ALLOC_COPY
+    err=checkCu(cuMemAlloc(&ResidentProgram.d_err,sizeof(zeroErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(cuMemcpyHtoD(ResidentProgram.d_err,&zeroErr,sizeof(zeroErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+    err=checkCu(cuEventCreate(&ResidentProgram.evStart,CU_EVENT_DEFAULT),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(cuEventCreate(&ResidentProgram.evStop,CU_EVENT_DEFAULT),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+    ResidentProgram.ready=1; ResidentProgram.allocCount++; return 0;
+fail: MSXgpu_closeResidentPrograms(); return err;
+}
+
+/* Phase 3B dispatches the already compiled ROS2/EQUIL/FORMULA functions over
+   resident active rows.  Chemistry/program tables are currently transient;
+   deliberately no Core concentration, lastc, hyd, hstep, or reacted payload
+   is allocated or copied here. */
+int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBatch *batch,
+                             double dt, MSXResidentGpuReactResult *result)
+{
+    int err = 0, finishNeeded = 0, nLinks = MSX.Nobjects[LINK];
+    int nSpecies = MSX.Nobjects[SPECIES], nParams = MSX.Nobjects[PARAMETER];
+    int nConsts = MSX.Nobjects[CONSTANT], rateCount = 0, eqCount = 0, formulaCount = 0;
+    int m, k, nInstr = 0, block = 128, grid, lastSpecies, lastTerm, lastParam, lastConst;
+    int *rateSpecies = NULL, *eqSpecies = NULL, *formulaSpecies = NULL, *speciesType = NULL;
+    double *rateAtol = NULL, *rateRtol = NULL, *params = NULL, *consts = NULL, *linkDiam = NULL;
+    GpuInstrHost *instr = NULL; GpuProgramHost *speciesProg = NULL, *termProg = NULL;
+    CUdeviceptr d_rateAtol = 0, d_rateRtol = 0, d_rateSpecies = 0, d_eqSpecies = 0, d_formulaSpecies = 0, d_speciesType = 0;
+    CUdeviceptr d_params = 0, d_consts = 0, d_linkDiam = 0, d_instr = 0, d_speciesProg = 0, d_termProg = 0, d_err = 0;
+    CUevent evStart = NULL, evStop = NULL;
+    GpuErrorHost gpuErr;
+    MSXResidentGpuDeviceView view;
+    MSXResidentGpuReactResult finished;
+    double tstep, areaUcf, lperFt3, odeMs = 0.0, equilMs = 0.0, formulaMs = 0.0;
+
+    if (result) memset(result, 0, sizeof(*result));
+    if (!resident || !batch || (!batch->item && batch->itemCount)) return ERR_GPU_UNSUPPORTED_FEATURE;
+    err = MSXgpu_prepareResidentContext();
+    if (err) return err;
+    /* Program tables are an explicit resident lifecycle resource. */
+    if (!ResidentProgram.ready)
+    {
+        setGpuError(ERR_GPU_KERNEL_RUNTIME_ERROR, GPU_STAGE_NONE, -1, -1, -1, -1, -1, 0.0);
+        return ERR_GPU_KERNEL_RUNTIME_ERROR;
+    }
+    if (MSX.GpuSolver != ROS2 || MSX.Solver != ROS2)
+    {
+        setGpuError(ERR_GPU_SOLVER_UNSUPPORTED, GPU_STAGE_NONE, -1, -1, -1, -1, -1, 0.0);
+        return ERR_GPU_SOLVER_UNSUPPORTED;
+    }
+    MSX.GpuTimingRecord.react_gpu = 1;
+    MSX.GpuTimingRecord.ode_gpu = 1;
+    MSX.GpuTimingRecord.equil_gpu = (MSX.GpuEquil != 0);
+    MSX.GpuTimingRecord.formula_gpu = (MSX.GpuFormula != 0);
+    {
+        MSXResidentStatus residentStatus = MSXresidentGpu_prepareActive(resident, batch, &view, NULL);
+        if (residentStatus != MSX_RESIDENT_OK)
+        {
+            err = mapResidentStatus(residentStatus);
+            setGpuError(err, GPU_STAGE_NONE, -1, -1, -1, -1, -1, (double)residentStatus);
+            return err;
+        }
+    }
+    finishNeeded = 1;
+    if (view.speciesStride != (uint32_t)(nSpecies + 1) || view.hydStride != MAX_HYD_VARS)
+    { err = ERR_GPU_UNSUPPORTED_FEATURE; goto cleanup; }
+    for (m = 1; m <= nSpecies; m++)
+    {
+        if (MSX.Species[m].pipeExprType == RATE) rateCount++;
+        else if (MSX.Species[m].pipeExprType == EQUIL) eqCount++;
+        else if (MSX.Species[m].pipeExprType == FORMULA) formulaCount++;
+    }
+    /* Kept here only as source history while the cache builder above owns all
+       allocations.  Dispatch must never resurrect this path. */
+#if 0
+    if (!ResidentProgram.ready) {
+    params = (double*)calloc((size_t)(nLinks + 1) * (nParams + 1), sizeof(double));
+    consts = (double*)calloc(nConsts + 1, sizeof(double)); linkDiam = (double*)calloc(nLinks + 1, sizeof(double));
+    rateSpecies = (int*)calloc(rateCount + 1, sizeof(int)); rateAtol = (double*)calloc(rateCount + 1, sizeof(double));
+    rateRtol = (double*)calloc(rateCount + 1, sizeof(double)); eqSpecies = (int*)calloc(eqCount + 1, sizeof(int));
+    formulaSpecies = (int*)calloc(formulaCount + 1, sizeof(int)); speciesType = (int*)calloc(nSpecies + 1, sizeof(int));
+    if (!params || !consts || !linkDiam || !rateSpecies || !rateAtol || !rateRtol || !eqSpecies || !formulaSpecies || !speciesType)
+    { err = ERR_MEMORY; goto cleanup; }
+    rateCount = eqCount = formulaCount = 0;
+    for (m = 1; m <= nSpecies; m++) { speciesType[m] = MSX.Species[m].type; if (MSX.Species[m].pipeExprType == RATE) { rateSpecies[++rateCount] = m; rateAtol[rateCount] = MSX.Species[m].aTol; rateRtol[rateCount] = MSX.Species[m].rTol; } else if (MSX.Species[m].pipeExprType == EQUIL) eqSpecies[++eqCount] = m; else if (MSX.Species[m].pipeExprType == FORMULA) formulaSpecies[++formulaCount] = m; }
+    for (m = 1; m <= nConsts; m++) consts[m] = MSX.Const[m].value;
+    for (k = 1; k <= nLinks; k++) { linkDiam[k] = MSX.Link[k].diam; for (m = 1; m <= nParams; m++) params[k * (nParams + 1) + m] = MSX.Link[k].param[m]; }
+    err = buildPrograms(&instr, &nInstr, &speciesProg, &termProg); if (err) goto cleanup;
+    memset(&gpuErr, 0, sizeof(gpuErr));
+#define RESIDENT_ALLOC_COPY(ptr, host, bytes) do { err = checkCu(cuMemAlloc(&(ptr), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; err = checkCu(cuMemcpyHtoD((ptr), (host), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; } while (0)
+    RESIDENT_ALLOC_COPY(d_rateAtol, rateAtol, (rateCount + 1) * sizeof(double)); RESIDENT_ALLOC_COPY(d_rateRtol, rateRtol, (rateCount + 1) * sizeof(double));
+    RESIDENT_ALLOC_COPY(d_rateSpecies, rateSpecies, (rateCount + 1) * sizeof(int)); RESIDENT_ALLOC_COPY(d_eqSpecies, eqSpecies, (eqCount + 1) * sizeof(int)); RESIDENT_ALLOC_COPY(d_formulaSpecies, formulaSpecies, (formulaCount + 1) * sizeof(int)); RESIDENT_ALLOC_COPY(d_speciesType, speciesType, (nSpecies + 1) * sizeof(int));
+    RESIDENT_ALLOC_COPY(d_params, params, (size_t)(nLinks + 1) * (nParams + 1) * sizeof(double)); RESIDENT_ALLOC_COPY(d_consts, consts, (nConsts + 1) * sizeof(double)); RESIDENT_ALLOC_COPY(d_linkDiam, linkDiam, (nLinks + 1) * sizeof(double));
+    RESIDENT_ALLOC_COPY(d_instr, instr, (nInstr > 0 ? nInstr : 1) * sizeof(GpuInstrHost)); RESIDENT_ALLOC_COPY(d_speciesProg, speciesProg, (nSpecies + 1) * sizeof(GpuProgramHost)); RESIDENT_ALLOC_COPY(d_termProg, termProg, (MSX.Nobjects[TERM] + 1) * sizeof(GpuProgramHost));
+    err = checkCu(cuMemAlloc(&d_err, sizeof(gpuErr)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup;
+    err = checkCu(cuMemcpyHtoD(d_err, &gpuErr, sizeof(gpuErr)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup;
+#undef RESIDENT_ALLOC_COPY
+    ResidentProgram.ready=1; ResidentProgram.rateCount=rateCount; ResidentProgram.eqCount=eqCount; ResidentProgram.formulaCount=formulaCount; ResidentProgram.nInstr=nInstr; ResidentProgram.rateSpecies=rateSpecies; ResidentProgram.eqSpecies=eqSpecies; ResidentProgram.formulaSpecies=formulaSpecies; ResidentProgram.speciesType=speciesType; ResidentProgram.rateAtol=rateAtol; ResidentProgram.rateRtol=rateRtol; ResidentProgram.params=params; ResidentProgram.consts=consts; ResidentProgram.linkDiam=linkDiam; ResidentProgram.instr=instr; ResidentProgram.speciesProg=speciesProg; ResidentProgram.termProg=termProg; ResidentProgram.d_rateAtol=d_rateAtol; ResidentProgram.d_rateRtol=d_rateRtol; ResidentProgram.d_rateSpecies=d_rateSpecies; ResidentProgram.d_eqSpecies=d_eqSpecies; ResidentProgram.d_formulaSpecies=d_formulaSpecies; ResidentProgram.d_speciesType=d_speciesType; ResidentProgram.d_params=d_params; ResidentProgram.d_consts=d_consts; ResidentProgram.d_linkDiam=d_linkDiam; ResidentProgram.d_instr=d_instr; ResidentProgram.d_speciesProg=d_speciesProg; ResidentProgram.d_termProg=d_termProg; ResidentProgram.d_err=d_err; ResidentProgram.allocCount++;
+    }
+#else
+    { rateCount=ResidentProgram.rateCount; eqCount=ResidentProgram.eqCount; formulaCount=ResidentProgram.formulaCount; nInstr=ResidentProgram.nInstr; rateSpecies=ResidentProgram.rateSpecies; eqSpecies=ResidentProgram.eqSpecies; formulaSpecies=ResidentProgram.formulaSpecies; speciesType=ResidentProgram.speciesType; rateAtol=ResidentProgram.rateAtol; rateRtol=ResidentProgram.rateRtol; params=ResidentProgram.params; consts=ResidentProgram.consts; linkDiam=ResidentProgram.linkDiam; instr=ResidentProgram.instr; speciesProg=ResidentProgram.speciesProg; termProg=ResidentProgram.termProg; d_rateAtol=ResidentProgram.d_rateAtol; d_rateRtol=ResidentProgram.d_rateRtol; d_rateSpecies=ResidentProgram.d_rateSpecies; d_eqSpecies=ResidentProgram.d_eqSpecies; d_formulaSpecies=ResidentProgram.d_formulaSpecies; d_speciesType=ResidentProgram.d_speciesType; d_params=ResidentProgram.d_params; d_consts=ResidentProgram.d_consts; d_linkDiam=ResidentProgram.d_linkDiam; d_instr=ResidentProgram.d_instr; d_speciesProg=ResidentProgram.d_speciesProg; d_termProg=ResidentProgram.d_termProg; d_err=ResidentProgram.d_err; }
+#endif
+    if (view.itemCount)
+    {
+        CUdeviceptr d_segPipe=(CUdeviceptr)view.segPipe,d_segRow=(CUdeviceptr)view.segRow,d_segVol=(CUdeviceptr)view.segVol,d_hstep=(CUdeviceptr)view.hstep,d_c=(CUdeviceptr)view.c,d_cOde=(CUdeviceptr)view.lastc,d_hyd=(CUdeviceptr)view.hyd,d_reacted=(CUdeviceptr)view.reacted;
+        CUdeviceptr d_nf=(CUdeviceptr)view.ros2Nfcn,d_nj=(CUdeviceptr)view.ros2Njac,d_na=(CUdeviceptr)view.ros2Naccept,d_nr=(CUdeviceptr)view.ros2Nreject,d_lh=(CUdeviceptr)view.ros2LastHstep,d_re=(CUdeviceptr)view.ros2Err;
+        int nSeg=(int)view.itemCount, hStride=(int)view.hydStride, paramStride=nParams+1; grid=(nSeg+block-1)/block; tstep=dt/MSX.Ucf[RATE_UNITS]; areaUcf=MSX.Ucf[AREA_UNITS]; lperFt3=LperFT3; lastSpecies=lastIndex(SPECIES); lastTerm=lastIndex(TERM); lastParam=lastIndex(PARAMETER); lastConst=lastIndex(CONSTANT);
+        void *ros2Args[]={&nSeg,&nSpecies,&rateCount,&tstep,&d_segPipe,&d_segRow,&d_segVol,&d_hstep,&d_rateAtol,&d_rateRtol,&d_rateSpecies,&d_speciesType,&d_linkDiam,&areaUcf,&lperFt3,&d_c,&d_cOde,&d_reacted,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_nf,&d_nj,&d_na,&d_nr,&d_lh,&d_re,&d_err};
+        void *equilArgs[]={&nSeg,&nSpecies,&eqCount,&d_segPipe,&d_segRow,&d_eqSpecies,&d_c,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_err};
+        void *formulaArgs[]={&nSeg,&nSpecies,&formulaCount,&d_segPipe,&d_segRow,&d_formulaSpecies,&d_c,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_err};
+        evStart=ResidentProgram.evStart; evStop=ResidentProgram.evStop;
+        cuEventRecord(evStart,0); err=checkCu(cuLaunchKernel(GpuModule.ros2Kernel,grid,1,1,block,1,1,0,0,ros2Args,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED); if(err)goto cleanup; cuEventRecord(evStop,0); odeMs=eventElapsedMs(evStart,evStop);
+        if(eqCount){cuEventRecord(evStart,0);err=checkCu(cuLaunchKernel(GpuModule.equilKernel,grid,1,1,block,1,1,0,0,equilArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err)goto cleanup;cuEventRecord(evStop,0);equilMs=eventElapsedMs(evStart,evStop);}
+        if(formulaCount){cuEventRecord(evStart,0);err=checkCu(cuLaunchKernel(GpuModule.formulaKernel,grid,1,1,block,1,1,0,0,formulaArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err)goto cleanup;cuEventRecord(evStop,0);formulaMs=eventElapsedMs(evStart,evStop);}
+        err=checkCu(cuCtxSynchronize(),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto cleanup;
+        err=checkCu(cuMemcpyDtoH(&gpuErr,d_err,sizeof(gpuErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto cleanup;
+        if(gpuErr.code){setGpuError(gpuErr.code,gpuErr.stage,gpuErr.sid,gpuErr.pipe,gpuErr.species,gpuErr.expr,gpuErr.iter,gpuErr.value);err=gpuErr.code;goto cleanup;}
+    }
+    memset(&finished,0,sizeof(finished));
+    { MSXResidentStatus residentStatus = MSXresidentGpu_finishActive(resident,&finished); if(residentStatus!=MSX_RESIDENT_OK){err=mapResidentStatus(residentStatus);finishNeeded=0;setGpuError(err,GPU_STAGE_NONE,-1,-1,-1,-1,-1,(double)residentStatus);goto cleanup;} } finishNeeded=0;
+    finished.ros2Ms=odeMs; finished.equilMs=equilMs; finished.formulaMs=formulaMs;
+    if(result)*result=finished;
+    MSX.GpuTimingRecord.react_ode_ms+=odeMs; MSX.GpuTimingRecord.react_equil_ms+=equilMs; MSX.GpuTimingRecord.react_formula_ms+=formulaMs;
+    if (MSX.GpuTimingDetail) { MSX.GpuTimingRecord.ros2_nfcn += finished.ros2Nfcn; MSX.GpuTimingRecord.ros2_njac += finished.ros2Njac; MSX.GpuTimingRecord.ros2_naccept += finished.ros2Naccept; MSX.GpuTimingRecord.ros2_nreject += finished.ros2Nreject; if (finished.ros2LastHstep != 0.0) MSX.GpuTimingRecord.ros2_last_hstep = finished.ros2LastHstep; }
+    if (finished.ros2Error && !MSX.GpuTimingRecord.ros2_error_code) MSX.GpuTimingRecord.ros2_error_code = finished.ros2Error;
+cleanup:
+    if(finishNeeded) MSXresidentGpu_abortActive(resident);
+    if(!ResidentProgram.ready) { if(evStart)cuEventDestroy(evStart);if(evStop)cuEventDestroy(evStop);if(d_rateAtol)cuMemFree(d_rateAtol);if(d_rateRtol)cuMemFree(d_rateRtol);if(d_rateSpecies)cuMemFree(d_rateSpecies);if(d_eqSpecies)cuMemFree(d_eqSpecies);if(d_formulaSpecies)cuMemFree(d_formulaSpecies);if(d_speciesType)cuMemFree(d_speciesType);if(d_params)cuMemFree(d_params);if(d_consts)cuMemFree(d_consts);if(d_linkDiam)cuMemFree(d_linkDiam);if(d_instr)cuMemFree(d_instr);if(d_speciesProg)cuMemFree(d_speciesProg);if(d_termProg)cuMemFree(d_termProg);if(d_err)cuMemFree(d_err);
+    free(params);free(consts);free(linkDiam);free(rateSpecies);free(rateAtol);free(rateRtol);free(eqSpecies);free(formulaSpecies);free(speciesType);free(instr);free(speciesProg);free(termProg); }
+    if(err)setGpuError(err,GPU_STAGE_NONE,-1,-1,-1,-1,-1,0.0); return err;
 }
 
 static int rk5FastBucket(double hstep, double tstep)

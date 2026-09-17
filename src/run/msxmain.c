@@ -175,7 +175,8 @@ int main(int argc, char* argv[])
     printf("\n  o Processing EPANET input file");
     startupMs = wall_time_ms() - totalStartMs;
     stageStartMs = wall_time_ms();
-    err = ENopen(inpFile, repFile, outFile);
+    /* Keep the actual copied/self-contained INP path for resident case hashing. */
+    err = MSXENopen(inpFile, repFile, outFile);
     epanetOpenMs = wall_time_ms() - stageStartMs;
     printf("\nTIMING,module=ENopen,seconds=%.6f", epanetOpenMs / 1000.0);
     do

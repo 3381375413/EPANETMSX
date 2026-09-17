@@ -655,7 +655,7 @@ int parseOption()
 
 // --- determine which option is being read
 
-    if ( Ntokens < 2 ) return 0;
+    if ( Ntokens < 2 ) return ERR_ITEMS;
     option = MSXutils_findmatch(Tok[0], OptionTypeWords);
     if ( option < 0 ) return ERR_KEYWORD;
 
@@ -775,6 +775,22 @@ int parseOption()
           k = atoi(Tok[1]);
           if ( k <= 0 ) return ERR_NUMBER;
           MSX.PipeRingCap = k;
+          break;
+
+      case GPU_CORE_MODE_OPTION:
+          k = MSXutils_findmatch(Tok[1], GpuCoreModeWords);
+          if ( k < 0 ) return ERR_KEYWORD;
+          MSX.GpuCoreMode = k;
+          break;
+
+      case GPU_CORE_GUARD_OPTION:
+          if ( !MSXutils_getInt(Tok[1], &k) || (k != 2 && k != 4) ) return ERR_NUMBER;
+          MSX.GpuCoreGuard = k;
+          break;
+
+      case GPU_CORE_CAPACITY_FILE_OPTION:
+          if ( strlen(Tok[1]) >= MAXFNAME ) return ERR_ITEMS;
+          strcpy(MSX.GpuCoreCapacityFile, Tok[1]);
           break;
 
     }

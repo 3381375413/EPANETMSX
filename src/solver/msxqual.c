@@ -21,6 +21,7 @@
 #include "msxgpu.h"
 #include "msxsegment_storage.h"
 #include "msxsegment_profile.h"
+#include "msxresident_runtime.h"
 
 // Macros to identify upstream & downstream nodes of a link
 // under the current flow and to compute link volume
@@ -363,7 +364,7 @@ int MSXqual_step(double *t, double *tleft)
     int m;
     double smassin, smassout, sreacted;
     int64_t  hstep, tstep, dt;
-    
+
 // --- set the shared memory pool to the water quality pool
 //     and the overall time step to nominal WQ time step
 
@@ -443,6 +444,7 @@ int MSXqual_step(double *t, double *tleft)
         {
             CALL(errcode, transport(dt));
             MSX.Qtime += dt;
+            if (!errcode) CALL(errcode, MSXresidentRuntime_flushPatches());
         }
 
     // --- reduce overall time step by the size of the current time step
@@ -599,6 +601,8 @@ int MSXqual_close()
 {
     int errcode = 0;
     if (!MSX.ProjectOpened) return 0;
+    /* GPU mirror must close while chemistry and the primary CUDA context are valid. */
+    MSXresidentRuntime_close();
     MSXsegProfile_close();
     MSXchem_close();
     MSXcpu_closeTiming();
@@ -765,18 +769,33 @@ int  transport(int64_t tstep)
         MSXsegStorage_hybridTimingStepBegin();
         MSXsegStorage_syncAllPsegMirrors();
         MSXsegProfile_beginStep((MSX.Qtime + qtime) / 1000.0);
+        errcode = MSXresidentRuntime_beginStep(dt);
+        if (errcode)
+        {
+            MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
+            MSXgpu_endStep(errcode);
+            return errcode;
+        }
         timer = MSXgpu_wallTimeMs();
         MSXgpu_reactBegin();
         errcode = MSXchem_react(dt);        // react species in each pipe & tank
         MSXgpu_reactEnd();
         MSX.GpuTimingRecord.react_ms += MSXgpu_wallTimeMs() - timer;
-        MSXsegStorage_syncAllScalarsFromPseg();
         if ( errcode )
         {
             MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
             MSXgpu_endStep(errcode);
             return errcode;
         }
+        errcode = MSXresidentRuntime_completeHandoffs();
+        if (errcode || (MSXresidentRuntime_isResident() && !MSXresidentRuntime_handoffReady()))
+        {
+            if (!errcode) errcode = ERR_GPU_KERNEL_RUNTIME_ERROR;
+            MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
+            MSXgpu_endStep(errcode);
+            return errcode;
+        }
+        MSXsegStorage_syncAllScalarsFromPseg();
         timer = MSXgpu_wallTimeMs();
         advectSegs(dt);                     // advect segments in each pipe
         MSX.GpuTimingRecord.advect_ms += MSXgpu_wallTimeMs() - timer;
@@ -908,9 +927,13 @@ void  initSegs()
     MSXsegStorage_syncAllPsegMirrors();
     if (MSXsegStorage_isHybridEnabled())
     {
+        MSX.ErrCode = MSXresidentRuntime_preHybridInit();
+        if (MSX.ErrCode) return;
         MSX.ErrCode = MSXsegStorage_hybridizeAll();
         if (MSX.ErrCode) return;
     }
+    MSX.ErrCode = MSXresidentRuntime_afterHybridInit();
+    if (MSX.ErrCode) return;
     findstoredmass(MSX.MassBalance.initial);    // initial mass
 }
 

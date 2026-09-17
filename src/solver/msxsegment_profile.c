@@ -18,6 +18,7 @@
 #include "msxsegment_profile.h"
 #include "msxtypes.h"
 #include "msxsegment_storage.h"
+#include "epanet2.h"
 
 extern MSXproject MSX;
 
@@ -65,6 +66,13 @@ typedef struct
     long long reversals;
     long long boundary_ops;
     int max_segments;
+    int max_core_count[PROFILE_G_COUNT];
+    double core_updates[PROFILE_G_COUNT];
+    long long boundary_to_core[PROFILE_G_COUNT];
+    long long core_to_boundary[PROFILE_G_COUNT];
+    BurstHistogram downstream_delete_burst;
+    BurstHistogram upstream_create_burst;
+    BurstHistogram combined_burst;
 } ProfileLink;
 
 typedef struct
@@ -501,8 +509,16 @@ static void build_exact_shadow(void)
         for (g = 0; g < PROFILE_G_COUNT; g++)
         {
             unsigned char bit = (unsigned char)(1u << g);
-            if (entered & bit) P.step_boundary_to_core[g]++;
-            if (exited & bit) P.step_core_to_boundary[g]++;
+            if (entered & bit)
+            {
+                P.step_boundary_to_core[g]++;
+                P.link[entry->link].boundary_to_core[g]++;
+            }
+            if (exited & bit)
+            {
+                P.step_core_to_boundary[g]++;
+                P.link[entry->link].core_to_boundary[g]++;
+            }
         }
     }
 }
@@ -521,6 +537,16 @@ static void free_arrays(void)
     free(P.step_up_new);
     free(P.step_up_merge);
     free(P.step_reversals);
+    if (P.link)
+    {
+        int k;
+        for (k = 1; k <= P.nlinks; k++)
+        {
+            free_histogram(&P.link[k].downstream_delete_burst);
+            free_histogram(&P.link[k].upstream_create_burst);
+            free_histogram(&P.link[k].combined_burst);
+        }
+    }
     free(P.link);
     free(P.generations);
     free(P.shadow_hash);
@@ -551,9 +577,19 @@ static void write_steps_header(void)
 static void write_links_header(void)
 {
     fprintf(P.links,
-            "link_index,total_react_segment_visits,max_segments,"
+            "link_index,link_id,total_react_segment_visits,max_segments,"
             "downstream_complete_deletes,downstream_partial_consumes,"
-            "upstream_new_segments,upstream_merges,flow_reversals,boundary_operations\n");
+            "upstream_new_segments,upstream_merges,flow_reversals,boundary_operations,"
+            "downstream_delete_burst_p99,upstream_create_burst_p99,"
+            "combined_boundary_burst_p99,step_link_samples");
+    {
+        int g;
+        for (g = 0; g < PROFILE_G_COUNT; g++)
+            fprintf(P.links, ",max_core_count_g%d,boundary_to_core_g%d,"
+                    "core_to_boundary_g%d,core_segment_updates_g%d", ProfileG[g],
+                    ProfileG[g], ProfileG[g], ProfileG[g]);
+    }
+    fputc('\n', P.links);
 }
 
 int MSXsegProfile_open(void)
@@ -618,6 +654,12 @@ void MSXsegProfile_reset(void)
     memset(P.step_up_new, 0, n);
     memset(P.step_up_merge, 0, n);
     memset(P.step_reversals, 0, n);
+    for (int k = 1; k <= P.nlinks; k++)
+    {
+        free_histogram(&P.link[k].downstream_delete_burst);
+        free_histogram(&P.link[k].upstream_create_burst);
+        free_histogram(&P.link[k].combined_burst);
+    }
     memset(P.link, 0, ((size_t)P.nlinks + 1) * sizeof(ProfileLink));
     if (P.generations && P.generation_capacity)
         memset(P.generations, 0, P.generation_capacity * sizeof(GenerationEntry));
@@ -765,6 +807,9 @@ void MSXsegProfile_endStep(double sim_time_sec)
         histogram_add(&P.downstream_delete_burst, delete_burst);
         histogram_add(&P.upstream_create_burst, create_burst);
         histogram_add(&P.combined_burst, combined);
+        histogram_add(&P.link[k].downstream_delete_burst, delete_burst);
+        histogram_add(&P.link[k].upstream_create_burst, create_burst);
+        histogram_add(&P.link[k].combined_burst, combined);
         if (delete_burst > max_delete_burst) max_delete_burst = delete_burst;
         if (create_burst > max_create_burst) max_create_burst = create_burst;
         if (combined > max_combined_burst) max_combined_burst = combined;
@@ -780,12 +825,18 @@ void MSXsegProfile_endStep(double sim_time_sec)
         for (g = 0; g < PROFILE_G_COUNT; g++)
         {
             int pre_core = core_count(P.pre_count[k], ProfileG[g]);
+            int post_core = core_count(P.post_count[k], ProfileG[g]);
             double core_visit = P.pre_count[k] > 0
                 ? (double)P.step_visits[k] * (double)pre_core /
                   (double)P.pre_count[k] : 0.0;
             P.step_core_updates[g] += core_visit;
             P.core_updates[g] += core_visit;
-            P.core_segments[g] += core_count(P.post_count[k], ProfileG[g]);
+            P.core_segments[g] += post_core;
+            P.link[k].core_updates[g] += core_visit;
+            if (pre_core > P.link[k].max_core_count[g])
+                P.link[k].max_core_count[g] = pre_core;
+            if (post_core > P.link[k].max_core_count[g])
+                P.link[k].max_core_count[g] = post_core;
         }
     }
     for (g = 0; g < PROFILE_G_COUNT; g++)
@@ -838,11 +889,24 @@ void MSXsegProfile_close(void)
     if (P.links)
     {
         for (k = 1; k <= P.nlinks; k++)
-            fprintf(P.links, "%d,%lld,%d,%lld,%lld,%lld,%lld,%lld,%lld\n", k,
+        {
+            char id[256] = "";
+            (void)ENgetlinkid(k, id);
+            fprintf(P.links, "%d,%s,%lld,%d,%lld,%lld,%lld,%lld,%lld,%lld,%llu,%llu,%llu,%lld", k, id,
                     P.link[k].react_visits, P.link[k].max_segments,
                     P.link[k].down_complete, P.link[k].down_partial,
                     P.link[k].up_new, P.link[k].up_merge, P.link[k].reversals,
-                    P.link[k].boundary_ops);
+                    P.link[k].boundary_ops,
+                    histogram_p99(&P.link[k].downstream_delete_burst),
+                    histogram_p99(&P.link[k].upstream_create_burst),
+                    histogram_p99(&P.link[k].combined_burst),
+                    P.link[k].combined_burst.samples);
+            for (g = 0; g < PROFILE_G_COUNT; g++)
+                fprintf(P.links, ",%d,%lld,%lld,%.6f", P.link[k].max_core_count[g],
+                        P.link[k].boundary_to_core[g], P.link[k].core_to_boundary[g],
+                        P.link[k].core_updates[g]);
+            fputc('\n', P.links);
+        }
         fclose(P.links);
     }
     {

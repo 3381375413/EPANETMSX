@@ -74,7 +74,8 @@ static char * GpuErrmsg[] =
      "Error 9010 - GPU equilibrium solver did not converge.",
      "Error 9011 - GPU formula produced an invalid value.",
      "Error 9012 - GPU computation produced an invalid numeric value.",
-     "Error 9013 - GPU segment packing failed."};
+     "Error 9013 - GPU segment packing failed.",
+     "Error 9014 - resident runtime initialized but Phase 3C-2 dispatch is not ready."};
 
 //  Imported functions
 //--------------------
@@ -86,6 +87,7 @@ int    MSXinp_readMsxData(void);
 //  Exported functions
 //--------------------
 int    MSXproj_open(char *fname);
+void   MSXproj_setInpFile(const char *fname);
 int    MSXproj_addObject(int type, char *id, int n);
 int    MSXproj_findObject(int type, char *id);
 char * MSXproj_findID(int type, char *id);
@@ -214,6 +216,13 @@ void MSXproj_close()
     deleteObjects();
     deleteHashTables();
     MSX.ProjectOpened = FALSE;
+    MSX.InpFileName[0] = '\0';
+}
+
+void MSXproj_setInpFile(const char *fname)
+{
+    if (fname && strlen(fname) < MAXFNAME) strcpy(MSX.InpFileName, fname);
+    else MSX.InpFileName[0] = '\0';
 }
 
 //=============================================================================
@@ -356,6 +365,10 @@ void setDefaults()
     MSX.CpuTiming = FALSE;
     MSX.SegmentStorage = SEG_STORAGE_PSEG;
     MSX.PipeRingCap = 5000;
+    MSX.GpuCoreMode = 0;              // GPU_CORE_MODE OFF
+    MSX.GpuCoreGuard = 2;
+    MSX.InpFileName[0] = '\0';
+    MSX.GpuCoreCapacityFile[0] = '\0';
     memset(&MSX.GpuTimingRecord, 0, sizeof(MSX.GpuTimingRecord));
     memset(&MSX.GpuError, 0, sizeof(MSX.GpuError));
     MSX.GpuError.sid = -1;

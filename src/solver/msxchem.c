@@ -22,6 +22,7 @@
 #include "msxgpu.h"
 #include "msxsegment_storage.h"
 #include "msxsegment_profile.h"
+#include "msxresident_runtime.h"
 
 //  External variables
 //--------------------
@@ -85,6 +86,7 @@ static void   setTankChemistry(void);
 static int    evalPipeSegmentReaction(int k, double dt, Pseg seg);
 static int    evalPipeReactions(int k, double dt);
 static int    evalPipeHybridReactions(int k, double dt);
+static int    evalPipeHybridBoundaryReactions(int k, double dt);
 static int    evalPipeRingReactions(int k, double dt);
 static int    evalTankReactions(int k, double dt);
 static int    evalPipeEquil(double *c);
@@ -274,6 +276,12 @@ int MSXchem_react(double dt)
 {
     int k, m;
     int errcode = 0;
+    int hybridGpuTiming = 0;
+    double packBefore = 0.0;
+    double h2dBefore = 0.0;
+    double kernelBefore = 0.0;
+    double d2hBefore = 0.0;
+    double unpackBefore = 0.0;
 
 // --- save tolerances of pipe rate species
 
@@ -286,12 +294,65 @@ int MSXchem_react(double dt)
 
 // --- examine each link
 
-    if (MSX.GpuReact && MSX.GpuReactScope == GPU_PIPE_SEGMENT)
+    if (MSXresidentRuntime_isResident())
     {
+        int residentErr = 0;
+        /* CPU owns only boundary Psegs.  Core rows have no CPU chemistry
+           writeback path in RESIDENT mode. */
+#pragma omp parallel
+        {
+#pragma omp for private(k)
+            for (k = 1; k <= MSX.Nobjects[LINK]; k++)
+            {
+                int linkErr = 0;
+                if (MSX.Link[k].len == 0.0) continue;
+                for (int hi = 1; hi < MAX_HYD_VARS; hi++) HydVar[hi] = MSX.Link[k].HydVar[hi];
+                if (MSXresidentRuntime_linkFallback(k))
+                {
+                    double fallbackStart = MSXgpu_wallTimeMs();
+                    linkErr = evalPipeHybridReactions(k, dt);
+#pragma omp critical(msx_resident_fallback_timing)
+                    { MSX.GpuTimingRecord.resident_fallback_ms += MSXgpu_wallTimeMs() - fallbackStart; }
+                }
+                else linkErr = evalPipeHybridBoundaryReactions(k, dt);
+                if (linkErr)
+                {
+#pragma omp critical(msx_resident_boundary_react_error)
+                    { if (!residentErr) residentErr = linkErr; }
+                }
+            }
+        }
+        if (!residentErr) residentErr = MSXresidentRuntime_reactCore(dt);
+        errcode = residentErr;
+    }
+    else if (MSX.GpuReact && MSX.GpuReactScope == GPU_PIPE_SEGMENT)
+    {
+        hybridGpuTiming = MSXsegStorage_hybridTimingEnabled();
+        if (hybridGpuTiming)
+        {
+            packBefore = MSX.GpuTimingRecord.react_pack_ms;
+            h2dBefore = MSX.GpuTimingRecord.h2d_ms;
+            kernelBefore = MSX.GpuTimingRecord.react_ode_ms +
+                           MSX.GpuTimingRecord.react_equil_ms +
+                           MSX.GpuTimingRecord.react_formula_ms;
+            d2hBefore = MSX.GpuTimingRecord.d2h_ms;
+            unpackBefore = MSX.GpuTimingRecord.react_unpack_ms;
+        }
         for (k = 1; k <= MSX.Nobjects[LINK]; k++)
             if (MSX.Link[k].len != 0.0)
                 MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
         errcode = MSXgpu_reactPipeSegments(dt);
+        if (hybridGpuTiming)
+        {
+            MSXsegStorage_hybridTimingAddPacking(MSX.GpuTimingRecord.react_pack_ms - packBefore);
+            MSXsegStorage_hybridTimingAddH2D(MSX.GpuTimingRecord.h2d_ms - h2dBefore);
+            MSXsegStorage_hybridTimingAddKernel(
+                MSX.GpuTimingRecord.react_ode_ms +
+                MSX.GpuTimingRecord.react_equil_ms +
+                MSX.GpuTimingRecord.react_formula_ms - kernelBefore);
+            MSXsegStorage_hybridTimingAddD2H(MSX.GpuTimingRecord.d2h_ms - d2hBefore);
+            MSXsegStorage_hybridTimingAddUnpack(MSX.GpuTimingRecord.react_unpack_ms - unpackBefore);
+        }
     }
     else if (MSXsegStorage_isHybridEnabled())
     {
@@ -801,6 +862,23 @@ static int evalPipeHybridReactions(int k, double dt)
     MSXsegStorage_hybridTimingAddBoundaryReact(boundaryMs);
     MSXsegStorage_hybridTimingAddCoreReact(coreMs);
     return errcode;
+}
+
+static int evalPipeHybridBoundaryReactions(int k, double dt)
+{
+    int errcode = 0;
+    Pseg seg = MSX.FirstSeg[k];
+    MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
+    while (seg)
+    {
+        if (!MSXsegStorage_isHybridCoreSegment(seg))
+        {
+            errcode = evalPipeSegmentReaction(k, dt, seg);
+            if (errcode) return errcode;
+        }
+        seg = seg->prev;
+    }
+    return 0;
 }
 
 //=============================================================================

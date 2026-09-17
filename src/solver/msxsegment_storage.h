@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include "msxtypes.h"
+#include "msxresident_core.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,13 +31,36 @@ int  MSXsegStorage_isPipeRingSegment(Pseg seg);
 int  MSXsegStorage_isHybridEnabled(void);
 int  MSXsegStorage_isHybridLink(int k);
 int  MSXsegStorage_isHybridCoreSegment(Pseg seg);
+/* Identity-only Core membership query for Resident active-row filtering.
+   It reads the dense Core view and never follows or changes CPU topology. */
+int  MSXsegStorage_isHybridCoreIdentity(int k, uint64_t hybridId);
+/* O(1), fail-closed validation of a Resident active row. ``slot`` is the
+   Resident row slot, not an assumed dense-Core slot. */
+int  MSXsegStorage_isHybridCoreSlotIdentity(int k, int slot,
+                                            uint64_t hybridId);
 void MSXsegStorage_hybridAssignIdentity(int k, Pseg seg);
+MSXResidentStatus MSXsegStorage_residentLastStatus(void);
 int  MSXsegStorage_hybridizeAll(void);
+/* Reserve every dense Core row before hybridization.  Once reserved, Hybrid
+   promotion is fixed-capacity and never allocates in the quality loop. */
+int  MSXsegStorage_hybridReserve(const MSXResidentLayout *layout);
+/* Resident startup transaction. Prepare records the prospective CPU Core
+   without touching FirstSeg/LastSeg/prev/next/nsegs. Commit is a preflighted,
+   allocation-free topology replacement. */
+int  MSXsegStorage_hybridPrepareInitialImage(void);
+int  MSXsegStorage_hybridStageInitialImage(void);
+int  MSXsegStorage_hybridCommitInitialImage(void);
+void MSXsegStorage_hybridAbortInitialImage(void);
+/* Observer-only rescan used when a resident runtime opens after hybridizeAll. */
+int  MSXsegStorage_hybridObserveAll(void);
 int  MSXsegStorage_hybridRemoveHead(int k, Pseg seg);
 void MSXsegStorage_hybridRebalanceAll(void);
 void MSXsegStorage_hybridAfterListReorder(int k);
 void MSXsegStorage_hybridClear(int k);
 int  MSXsegStorage_hybridCoreCount(int k);
+int  MSXsegStorage_hybridCoreCapacity(int k);
+int  MSXsegStorage_hybridCoreSlotAt(int k, int pos);
+int  MSXsegStorage_hybridOrientation(int k);
 Pseg MSXsegStorage_hybridCoreSegFromHead(int k, int pos);
 Pseg MSXsegStorage_hybridCoreSegAt(int k, int pos);
 /* Returns one of at most two contiguous downstream-to-upstream Core spans.
@@ -58,6 +82,30 @@ void MSXsegStorage_hybridTimingStepBegin(void);
 void MSXsegStorage_hybridTimingStepEnd(void);
 void MSXsegStorage_hybridSyncSegmentScalars(Pseg seg);
 void MSXsegStorage_hybridSyncAllScalars(void);
+/* Opaque prepared topology mapping.  Its fixed per-link arena is allocated
+   during Hybrid reserve; preparation only fills and validates it. Commit is
+   only the precomputed bounded list/dense stores. */
+typedef struct { void *opaque; } MSXHybridResidentMaterialization;
+/* Copies a complete Resident-owned row into a new CPU Boundary Pseg.  The
+   caller owns the subsequent linked-list insertion/removal transaction. */
+int  MSXsegStorage_hybridMaterializeResident(uint32_t linkIndex, uint32_t slot,
+                                              uint32_t generation, Pseg *segment);
+/* Internal no-fail-after-preflight half of a Resident handoff transaction. */
+int  MSXsegStorage_hybridCommitResidentMaterialization(
+    const MSXResidentHandoffPlan *plan, const MSXResidentHandoffResult *result,
+    Pseg *boundary, uint32_t count);
+int  MSXsegStorage_hybridValidateResidentMaterialization(
+    const MSXResidentHandoffPlan *plan, const MSXResidentHandoffResult *result,
+    Pseg *boundary, uint32_t count);
+int  MSXsegStorage_hybridPrepareResidentMaterialization(
+    const MSXResidentHandoffPlan *plan, const MSXResidentHandoffResult *result,
+    Pseg *boundary, uint32_t count, MSXHybridResidentMaterialization *token);
+int  MSXsegStorage_hybridValidatePreparedResidentMaterialization(
+    const MSXHybridResidentMaterialization *token);
+void MSXsegStorage_hybridCommitPreparedResidentMaterialization(
+    MSXHybridResidentMaterialization *token);
+void MSXsegStorage_hybridAbortPreparedResidentMaterialization(
+    MSXHybridResidentMaterialization *token);
 
 int  MSXsegStorage_pipeAppendTail(int k, Pseg seg);
 Pseg MSXsegStorage_pipePeekHead(int k);

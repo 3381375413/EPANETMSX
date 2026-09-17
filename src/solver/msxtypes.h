@@ -225,7 +225,10 @@ typedef  float REAL4;
                   GPU_TIMING_OPTION,
                   CPU_TIMING_OPTION,
                   SEGMENT_STORAGE_OPTION,
-                  PIPE_RING_CAP_OPTION};
+                  PIPE_RING_CAP_OPTION,
+                  GPU_CORE_MODE_OPTION,
+                  GPU_CORE_GUARD_OPTION,
+                  GPU_CORE_CAPACITY_FILE_OPTION};
 
  enum SegmentStorageType              // Pipe segment concentration storage
                  {SEG_STORAGE_PSEG,
@@ -316,7 +319,8 @@ typedef  float REAL4;
            ERR_GPU_EQUIL_NOT_CONVERGED,
            ERR_GPU_FORMULA_INVALID,
            ERR_GPU_NUMERIC_INVALID,
-           ERR_GPU_SEGMENT_PACK_FAILED};
+           ERR_GPU_SEGMENT_PACK_FAILED,
+           ERR_GPU_RESIDENT_NOT_READY};
 
 
 //-----------------------------------------------------------------------------
@@ -529,6 +533,16 @@ typedef struct                         // Per-quality-substep timing record
     double react_host_alloc_ms;
     double react_device_alloc_ms;
     double react_scatter_ms;
+    double resident_boundary_cpu_ms;
+    double resident_enumerate_filter_ms;
+    double resident_patch_h2d_ms;
+    double resident_active_h2d_ms;
+    double resident_diag_d2h_hstep_ms;
+    double resident_sync_ms;
+    double resident_initial_upload_ms;
+    double resident_handoff_ms;
+    double resident_fallback_ms;
+    double resident_active_rows;
     int rk5_fast_mode;
     int rk5_error_code;
     int ros2_error_code;
@@ -635,7 +649,11 @@ typedef struct                         // MSX PROJECT VARIABLES
           GpuTimingDetail,             // React detail timing enabled
           CpuTiming,                   // CPU timing CSV enabled
           SegmentStorage,              // SEGMENT_STORAGE option
-          PipeRingCap;                 // fixed slots per pipe for PIPE_RING
+          PipeRingCap,                 // fixed slots per pipe for PIPE_RING
+          GpuCoreMode,                 // OFF, SHADOW, or RESIDENT
+          GpuCoreGuard;                // requested resident boundary guard
+   char   InpFileName[MAXFNAME],       // actual EPANET input path, not reconstructed
+          GpuCoreCapacityFile[MAXFNAME]; // resident capacity CSV path
    int    MaxSegments;                 // Maximum number of segments in a link  
    long   HydOffset,                   // Hydraulics file byte offset
           Pstep,                       // Time pattern time step (sec)
