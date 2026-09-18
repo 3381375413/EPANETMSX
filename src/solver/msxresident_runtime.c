@@ -12,7 +12,8 @@ extern MSXproject MSX;
 
 typedef struct { int opened, resident, dispatchReady, handoffReady; MSXResidentGpu *gpu;
     uint64_t wouldDescriptors, wouldSlots, stale, fallbacks; MSXResidentStatus lastStatus;
-    MSXResidentActiveRow *rows; MSXResidentActiveItem *active; uint32_t activeCap, stride;
+    MSXResidentActiveRow *rows,*activeRows; MSXResidentActiveItem *active;
+    MSXResidentGpuActiveSyncRow *sync; MSXResidentPayload *payload; uint32_t activeCap, stride;
     MSXResidentHandoffPlan *plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *out;
     double *c,*lastc; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
     uint32_t *offset; uint32_t itemCap, itemCount;
@@ -71,15 +72,18 @@ static int resolveCapacityPath(char out[MAXFNAME], const char *capacity, const c
 
 static void runtimeFreeBuffers(void)
 {
-    free(R.rows); free(R.active); free(R.plan); free(R.item); free(R.out);
+    free(R.rows); free(R.activeRows); free(R.active); free(R.sync); free(R.payload); free(R.plan); free(R.item); free(R.out);
     free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset);
-    R.rows=0; R.active=0; R.plan=0; R.item=0; R.out=0; R.c=0; R.lastc=0;
+    R.rows=0; R.activeRows=0; R.active=0; R.sync=0; R.payload=0; R.plan=0; R.item=0; R.out=0; R.c=0; R.lastc=0;
     R.tx=0; R.fallback=0; R.offset=0;
 }
 static int runtimeAllocateBuffers(const MSXResidentLayout *l)
 {
     R.rows=(MSXResidentActiveRow*)calloc(l->totalSlots,sizeof(*R.rows));
+    R.activeRows=(MSXResidentActiveRow*)calloc(l->totalSlots,sizeof(*R.activeRows));
     R.active=(MSXResidentActiveItem*)calloc(l->totalSlots,sizeof(*R.active));
+    R.sync=(MSXResidentGpuActiveSyncRow*)calloc(l->totalSlots,sizeof(*R.sync));
+    R.payload=(MSXResidentPayload*)calloc(l->totalSlots,sizeof(*R.payload));
     R.plan=(MSXResidentHandoffPlan*)calloc((size_t)l->nLinks+1,sizeof(*R.plan));
     R.item=(MSXResidentHandoffItem*)calloc(l->totalSlots,sizeof(*R.item));
     R.out=(MSXResidentHandoffResult*)calloc(l->totalSlots,sizeof(*R.out));
@@ -88,7 +92,7 @@ static int runtimeAllocateBuffers(const MSXResidentLayout *l)
     R.tx=(MSXResidentHandoffTransaction*)calloc((size_t)l->nLinks+1,sizeof(*R.tx));
     R.fallback=(unsigned char*)calloc((size_t)l->nLinks+1,1);
     R.offset=(uint32_t*)calloc((size_t)l->nLinks+1,sizeof(*R.offset));
-    if(!R.rows||!R.active||!R.plan||!R.item||!R.out||!R.c||!R.lastc||!R.tx||!R.fallback||!R.offset)
+    if(!R.rows||!R.activeRows||!R.active||!R.sync||!R.payload||!R.plan||!R.item||!R.out||!R.c||!R.lastc||!R.tx||!R.fallback||!R.offset)
     { runtimeFreeBuffers(); return fail(MSX_RESIDENT_ERR_MEMORY,"runtime_buffers"); }
     R.activeCap=R.itemCap=l->totalSlots; R.stride=l->speciesStride;
     return 0;
@@ -181,7 +185,8 @@ int MSXresidentRuntime_flushPatches(void)
     R.wouldDescriptors+=b.descriptorCount; R.wouldSlots+=b.slotCount;
     if (!b.descriptorCount && !b.slotCount) return 0;
     if (!R.resident) { MSXresident_clearPatches(); return 0; }
-    s=MSXresidentGpu_applyPatches(R.gpu,&b);
+    { double t=MSXgpu_wallTimeMs(); s=MSXresidentGpu_applyPatches(R.gpu,&b);
+      MSX.GpuTimingRecord.resident_patch_h2d_ms+=MSXgpu_wallTimeMs()-t; }
     if (s!=MSX_RESIDENT_OK) { R.stale++; return fail(s,"patch_apply"); }
     MSXresident_clearPatches(); return 0;
 }
@@ -193,7 +198,7 @@ void MSXresidentRuntime_close(void)
     MSXsegStorage_hybridAbortInitialImage();
     MSXresident_abortInitialImage();
     if (R.opened || MSXresident_isOpen()) MSXresident_close();
-    free(R.rows); free(R.active); free(R.plan); free(R.item); free(R.out); free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset); memset(&R,0,sizeof(R));
+    free(R.rows); free(R.activeRows); free(R.active); free(R.sync); free(R.payload); free(R.plan); free(R.item); free(R.out); free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset); memset(&R,0,sizeof(R));
 }
 int MSXresidentRuntime_residentNotReady(void)
 { return R.resident && !R.dispatchReady; }
@@ -228,7 +233,8 @@ int MSXresidentRuntime_beginStep(double dt){uint32_t k,off=0;MSXResidentStatus z
 int MSXresidentRuntime_completeHandoffs(void){uint32_t k;MSXResidentStatus z;double t;if(!R.resident)return 0;t=MSXgpu_wallTimeMs();for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)if(R.plan[k].itemCount){MSXResidentGpuFetchOutput f;uint32_t o=R.offset[k];memset(&f,0,sizeof(f));f.meta=R.out+o;f.cOut=R.c+(size_t)o*R.stride;f.lastcOut=R.lastc+(size_t)o*R.stride;f.stride=R.stride;z=MSXresidentGpu_fetchHandoffs(R.gpu,&R.plan[k],&f,R.plan[k].itemCount);if(z!=MSX_RESIDENT_OK){for(uint32_t j=1;j<=k;j++)MSXresident_abortHandoffTransaction(&R.tx[j]);return fail(z,"handoff_fetch");}z=MSXresident_prepareHandoffTransaction(&R.plan[k],f.meta,R.plan[k].itemCount,&R.tx[k]);if(z!=MSX_RESIDENT_OK){for(uint32_t j=1;j<=k;j++)MSXresident_abortHandoffTransaction(&R.tx[j]);return fail(z,"handoff_prepare");}}z=MSXresident_validateHandoffTransactions(R.tx,(uint32_t)MSX.Nobjects[LINK]+1);if(z!=MSX_RESIDENT_OK){for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"handoff_final_validate");}for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)if(R.tx[k].opaque)MSXresident_commitHandoffTransaction(&R.tx[k]);/* CPU transactions are committed atomically as a batch. A GPU flush failure is fail-stop; it never rolls CPU topology back. */if(MSXresidentRuntime_flushPatches()){R.dispatchReady=0;return MSX.ErrCode;}R.handoffReady=1;MSX.GpuTimingRecord.resident_handoff_ms+=MSXgpu_wallTimeMs()-t;return 0;}
 int MSXresidentRuntime_reactCore(double dt)
 {
-    MSXResidentStatus s; MSXResidentGpuReactResult out; uint32_t n=0,i,active=0,m;
+    MSXResidentStatus s; MSXResidentGpuReactResult out; MSXResidentGpuActiveSyncOutput sync;
+    uint32_t n=0,i,active=0,m;
     int err; double timer;
     if(!R.resident || !R.dispatchReady || !R.gpu) return fail(MSX_RESIDENT_ERR_POISONED,"react_not_ready");
     if((err=MSXresidentRuntime_flushPatches())) return err;
@@ -236,12 +242,27 @@ int MSXresidentRuntime_reactCore(double dt)
     MSX.GpuTimingRecord.resident_enumerate_filter_ms += MSXgpu_wallTimeMs()-timer;
     if(s!=MSX_RESIDENT_OK) return fail(s,"active_enumerate");
     for(i=0;i<n;i++) if(MSXsegStorage_isHybridCoreSlotIdentity((int)R.rows[i].linkIndex,(int)R.rows[i].slot,R.rows[i].parcelId)){
-        MSXResidentActiveItem *a=&R.active[active++]; a->linkIndex=R.rows[i].linkIndex; a->globalRow=R.rows[i].globalRow; a->generation=R.rows[i].generation; a->descriptorEpoch=R.rows[i].descriptorEpoch; a->volume=R.rows[i].volume; a->hyd=MSX.Link[a->linkIndex].HydVar;
+        MSXResidentActiveItem *a=&R.active[active];
+        R.activeRows[active]=R.rows[i];
+        a->linkIndex=R.rows[i].linkIndex; a->globalRow=R.rows[i].globalRow; a->generation=R.rows[i].generation; a->descriptorEpoch=R.rows[i].descriptorEpoch; a->volume=R.rows[i].volume; a->hyd=MSX.Link[a->linkIndex].HydVar;
+        active++;
     }
     memset(&out,0,sizeof(out));
     MSX.GpuTimingRecord.resident_active_rows += active;
     { MSXResidentActiveBatch b; b.item=R.active; b.itemCount=active; err=MSXgpu_reactResidentCore(R.gpu,&b,dt,&out); }
     if(err){R.dispatchReady=0;R.lastStatus=MSX_RESIDENT_ERR_POISONED;return fail(MSX_RESIDENT_ERR_POISONED,"react_dispatch");}
+    memset(&sync,0,sizeof(sync)); sync.row=R.sync; sync.cOut=R.c; sync.lastcOut=R.lastc; sync.stride=R.stride;
+    timer=MSXgpu_wallTimeMs(); s=MSXresidentGpu_syncActive(R.gpu,&sync,active);
+    MSX.GpuTimingRecord.resident_sync_ms+=MSXgpu_wallTimeMs()-timer;
+    if(s!=MSX_RESIDENT_OK){R.dispatchReady=0;return fail(s,"active_sync");}
+    for(i=0;i<active;i++){
+        MSXResidentGpuActiveSyncRow *q=&R.sync[i]; MSXResidentPayload *p=&R.payload[i];
+        if(q->linkIndex!=R.activeRows[i].linkIndex||q->globalRow!=R.activeRows[i].globalRow||q->generation!=R.activeRows[i].generation||q->descriptorEpoch!=R.activeRows[i].descriptorEpoch||!MSXsegStorage_isHybridCoreSlotIdentity((int)q->linkIndex,(int)R.activeRows[i].slot,R.activeRows[i].parcelId)){R.dispatchReady=0;return fail(MSX_RESIDENT_ERR_GENERATION,"active_sync_validate");}
+        p->volume=R.activeRows[i].volume; p->hstep=q->hstep; p->hresponse=q->hresponse; p->uresponse=q->uresponse; p->dresponse=q->dresponse; p->parcelId=R.activeRows[i].parcelId; p->generation=q->generation; p->c=R.c+(size_t)i*R.stride; p->lastc=R.lastc+(size_t)i*R.stride;
+    }
+    s=MSXresident_applyActivePayload(R.activeRows,R.payload,active);
+    if(s!=MSX_RESIDENT_OK){R.dispatchReady=0;return fail(s,"active_cpu_apply");}
+    for(i=0;i<active;i++)if(!MSXsegStorage_hybridApplyResidentPayload((int)R.activeRows[i].linkIndex,(int)R.activeRows[i].slot,R.activeRows[i].parcelId,&R.payload[i])){R.dispatchReady=0;return fail(MSX_RESIDENT_ERR_GENERATION,"active_dense_apply");}
     if(!out.reacted || out.reactedStride<(uint32_t)MSX.Nobjects[SPECIES]+1 || out.reactedLinkCount<(uint32_t)MSX.Nobjects[LINK]+1){R.dispatchReady=0;return fail(MSX_RESIDENT_ERR_TRANSFER,"react_result");}
     for(i=1;i<=MSX.Nobjects[LINK];i++) for(m=1;m<=MSX.Nobjects[SPECIES];m++) MSX.Link[i].reacted[m]+=out.reacted[(size_t)i*out.reactedStride+m];
     return 0;

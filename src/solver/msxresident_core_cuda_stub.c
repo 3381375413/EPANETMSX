@@ -10,5 +10,6 @@ MSXResidentStatus MSXresidentGpu_reduce(MSXResidentGpu*a,double*b,uint32_t c,MSX
 MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu*a,const MSXResidentActiveBatch*b,MSXResidentGpuDeviceView*c,MSXResidentGpuReactResult*d){(void)a;(void)b;if(c)memset(c,0,sizeof(*c));if(d)memset(d,0,sizeof(*d));return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_getDeviceView(MSXResidentGpu*a,MSXResidentGpuDeviceView*b){(void)a;if(b)memset(b,0,sizeof(*b));return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_finishActive(MSXResidentGpu*a,MSXResidentGpuReactResult*b){(void)a;if(b)memset(b,0,sizeof(*b));return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu*a,MSXResidentGpuActiveSyncOutput*b,uint32_t c){(void)a;(void)b;(void)c;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu*a){(void)a;return MSX_RESIDENT_DISABLED;}
 void MSXresidentGpu_close(MSXResidentGpu*a){(void)a;}

@@ -76,22 +76,24 @@ MSXResidentStatus MSXresident_observePipe(uint32_t k,const uint64_t*id,const MSX
 { Pipe*p;MSXResidentStatus z;uint32_t*i2s,*keep,i,s,m,newPatches=0;
   if(S.mode==MSX_RESIDENT_OFF)return MSX_RESIDENT_OK; z=pipeok(k,&p);if(z)return z;
   if((count&&(!id||!in))||count>p->d.capacity||(orient!=1&&orient!=-1))return MSX_RESIDENT_ERR_ARGUMENT;
-  /* Open reserves both arrays at the largest possible per-pipe batch. */
+  /* Open reserves both arrays at the largest possible per-pipe batch.  The
+     descriptor is a cyclic span, so publish the input order in that span
+     rather than preserving arbitrary old slots. */
   i2s=p->obsI2s; keep=p->obsKeep; memset(keep,0,(size_t)p->d.capacity*sizeof(*keep));
-  for(i=0;i<count;i++){int q;if(!id[i]||!in[i].c||!in[i].lastc)return MSX_RESIDENT_ERR_ARGUMENT;for(s=0;s<i;s++)if(id[s]==id[i])return MSX_RESIDENT_ERR_ARGUMENT;q=find(p,id[i]);if(q>=0){i2s[i]=(uint32_t)q;keep[q]=1;}else i2s[i]=NONE;}
-  /* A new ID may take a slot released by this very observation. */
-  for(i=0;i<count;i++)if(i2s[i]==NONE){for(s=0;s<p->d.capacity;s++)if(!keep[s])break;if(s==p->d.capacity)return MSX_RESIDENT_ERR_CAPACITY;if(p->gen[s]==UINT32_MAX)return MSX_RESIDENT_ERR_GENERATION;i2s[i]=s;keep[s]=2;}
+  for(i=0;i<count;i++){if(!id[i]||!in[i].c||!in[i].lastc)return MSX_RESIDENT_ERR_ARGUMENT;for(s=0;s<i;s++)if(id[s]==id[i])return MSX_RESIDENT_ERR_ARGUMENT;i2s[i]=(uint32_t)(((int64_t)orient*i+(int64_t)p->d.capacity)%(int64_t)p->d.capacity);keep[i2s[i]]=1;}
   /* Validate every bounded publication resource before changing state. */
   if(p->d.epoch==UINT64_MAX)return MSX_RESIDENT_ERR_OVERFLOW;
   if(S.dirty[k]==NONE&&S.ndesc>=S.nlinks)return MSX_RESIDENT_ERR_CAPACITY;
+  for(i=0;i<count;i++){s=i2s[i];if((!p->used[s]||p->id[s]!=id[i])&&p->gen[s]==UINT32_MAX)return MSX_RESIDENT_ERR_GENERATION;}
   for(s=0;s<p->d.capacity;s++)if((p->used[s]&&!keep[s])||keep[s])if(p->patch[s]==NONE)newPatches++;
   if(newPatches>S.slots-S.nslot)return MSX_RESIDENT_ERR_CAPACITY;
   /* Commit is allocation-free and cannot fail after the preflight above. */
   for(s=0;s<p->d.capacity;s++)if(p->used[s]&&!keep[s]){p->used[s]=0;p->id[s]=0;memset(crow(p,s),0,2*(size_t)S.rowWidth*sizeof(double));markslot(k,s,0);}
   for(i=0;i<count;i++){double*r;s=i2s[i];if(!p->used[s]||p->id[s]!=id[i]){p->gen[s]++;p->used[s]=1;}p->id[s]=id[i];r=crow(p,s);r[0]=in[i].volume;r[1]=in[i].hstep;r[2]=in[i].hresponse;r[3]=in[i].uresponse;r[4]=in[i].dresponse;for(m=0;m<S.stride;m++){r[5+m]=in[i].c[m];lrow(p,s)[5+m]=in[i].lastc[m];}markslot(k,s,1);}
-  p->d.count=count;p->d.orient=orient;p->d.head=count?i2s[0]:NONE;p->d.tail=count?i2s[count-1]:NONE;p->d.epoch++;markdesc(k);return MSX_RESIDENT_OK;
+  p->d.count=count;p->d.orient=orient;p->d.head=count?0:NONE;p->d.tail=count?i2s[count-1]:NONE;p->d.epoch++;markdesc(k);return MSX_RESIDENT_OK;
 }
 MSXResidentStatus MSXresident_getSlotPayload(uint32_t k,uint32_t s,uint32_t g,MSXResidentPayload*x){Pipe*p;MSXResidentStatus z;if(!x)return MSX_RESIDENT_ERR_ARGUMENT;z=pipeok(k,&p);if(z)return z;if(s>=p->d.capacity||!p->used[s]||p->gen[s]!=g){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}getpayload(p,s,x);return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow*r,const MSXResidentPayload*x,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if((!r||!x)&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].globalRow!=S.base[r[i].linkIndex]+r[i].slot||r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].descriptorEpoch||p->id[r[i].slot]!=r[i].parcelId||!x[i].c||!x[i].lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=x[i].volume;q[1]=x[i].hstep;q[2]=x[i].hresponse;q[3]=x[i].uresponse;q[4]=x[i].dresponse;for(m=0;m<S.stride;m++){q[5+m]=x[i].c[m];lrow(p,r[i].slot)[5+m]=x[i].lastc[m];}}}return MSX_RESIDENT_OK;}
 uint64_t MSXresident_testAllocationCount(void){return ResidentAllocationCount;}
 void MSXresident_testResetAllocationCount(void){ResidentAllocationCount=0;}
 void MSXresident_testFailAllocationAfter(int64_t allocationIndex){ResidentAllocationFailAfter=allocationIndex;}

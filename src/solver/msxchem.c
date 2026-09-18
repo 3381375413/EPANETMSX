@@ -297,6 +297,7 @@ int MSXchem_react(double dt)
     if (MSXresidentRuntime_isResident())
     {
         int residentErr = 0;
+        double boundaryStart = MSXgpu_wallTimeMs();
         /* CPU owns only boundary Psegs.  Core rows have no CPU chemistry
            writeback path in RESIDENT mode. */
 #pragma omp parallel
@@ -322,6 +323,7 @@ int MSXchem_react(double dt)
                 }
             }
         }
+        MSX.GpuTimingRecord.resident_boundary_cpu_ms += MSXgpu_wallTimeMs() - boundaryStart;
         if (!residentErr) residentErr = MSXresidentRuntime_reactCore(dt);
         errcode = residentErr;
     }

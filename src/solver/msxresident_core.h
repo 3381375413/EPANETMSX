@@ -42,6 +42,10 @@ MSXResidentStatus MSXresident_validateFeatures(int,int); MSXResidentStatus MSXre
 MSXResidentStatus MSXresident_validateConfig(const MSXResidentConfig *config);
 MSXResidentStatus MSXresident_observePipe(uint32_t,const uint64_t*,const MSXResidentPayload*,uint32_t,int32_t);
 MSXResidentStatus MSXresident_getSlotPayload(uint32_t,uint32_t,uint32_t,MSXResidentPayload*);
+/* Updates only payload rows which still match the supplied active snapshot;
+   it never changes descriptor topology or emits patches. */
+MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow *,
+                                                 const MSXResidentPayload *,uint32_t);
 MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*); void MSXresident_clearPatches(void);
 MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *);
 /* Enumerates exactly the used rows in published descriptor order.  ``rows``

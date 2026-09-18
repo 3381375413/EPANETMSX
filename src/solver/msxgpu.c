@@ -25,6 +25,9 @@
 
 #include "msxgpu.h"
 
+typedef char MSXresidentHydStrideAbiAssert[
+    (MSX_RESIDENT_HYD_STRIDE == MAX_HYD_VARS) ? 1 : -1];
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -1910,7 +1913,7 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
     GpuErrorHost gpuErr;
     MSXResidentGpuDeviceView view;
     MSXResidentGpuReactResult finished;
-    double tstep, areaUcf, lperFt3, odeMs = 0.0, equilMs = 0.0, formulaMs = 0.0;
+    double tstep, areaUcf, lperFt3, transferTimer, odeMs = 0.0, equilMs = 0.0, formulaMs = 0.0;
 
     if (result) memset(result, 0, sizeof(*result));
     if (!resident || !batch || (!batch->item && batch->itemCount)) return ERR_GPU_UNSUPPORTED_FEATURE;
@@ -1932,7 +1935,9 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
     MSX.GpuTimingRecord.equil_gpu = (MSX.GpuEquil != 0);
     MSX.GpuTimingRecord.formula_gpu = (MSX.GpuFormula != 0);
     {
+        transferTimer = MSXgpu_wallTimeMs();
         MSXResidentStatus residentStatus = MSXresidentGpu_prepareActive(resident, batch, &view, NULL);
+        MSX.GpuTimingRecord.resident_active_h2d_ms += MSXgpu_wallTimeMs() - transferTimer;
         if (residentStatus != MSX_RESIDENT_OK)
         {
             err = mapResidentStatus(residentStatus);
@@ -1996,7 +2001,10 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
         if(gpuErr.code){setGpuError(gpuErr.code,gpuErr.stage,gpuErr.sid,gpuErr.pipe,gpuErr.species,gpuErr.expr,gpuErr.iter,gpuErr.value);err=gpuErr.code;goto cleanup;}
     }
     memset(&finished,0,sizeof(finished));
-    { MSXResidentStatus residentStatus = MSXresidentGpu_finishActive(resident,&finished); if(residentStatus!=MSX_RESIDENT_OK){err=mapResidentStatus(residentStatus);finishNeeded=0;setGpuError(err,GPU_STAGE_NONE,-1,-1,-1,-1,-1,(double)residentStatus);goto cleanup;} } finishNeeded=0;
+    { MSXResidentStatus residentStatus; transferTimer=MSXgpu_wallTimeMs();
+      residentStatus=MSXresidentGpu_finishActive(resident,&finished);
+      MSX.GpuTimingRecord.resident_diag_d2h_hstep_ms+=MSXgpu_wallTimeMs()-transferTimer;
+      if(residentStatus!=MSX_RESIDENT_OK){err=mapResidentStatus(residentStatus);finishNeeded=0;setGpuError(err,GPU_STAGE_NONE,-1,-1,-1,-1,-1,(double)residentStatus);goto cleanup;} } finishNeeded=0;
     finished.ros2Ms=odeMs; finished.equilMs=equilMs; finished.formulaMs=formulaMs;
     if(result)*result=finished;
     MSX.GpuTimingRecord.react_ode_ms+=odeMs; MSX.GpuTimingRecord.react_equil_ms+=equilMs; MSX.GpuTimingRecord.react_formula_ms+=formulaMs;

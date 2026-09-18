@@ -38,6 +38,11 @@ int  MSXsegStorage_isHybridCoreIdentity(int k, uint64_t hybridId);
    Resident row slot, not an assumed dense-Core slot. */
 int  MSXsegStorage_isHybridCoreSlotIdentity(int k, int slot,
                                             uint64_t hybridId);
+/* Writes a Resident-computed payload into the matching dense Core view.
+   It is identity checked and allocation-free. */
+int  MSXsegStorage_hybridApplyResidentPayload(int k, int residentSlot,
+                                              uint64_t hybridId,
+                                              const MSXResidentPayload *payload);
 void MSXsegStorage_hybridAssignIdentity(int k, Pseg seg);
 MSXResidentStatus MSXsegStorage_residentLastStatus(void);
 int  MSXsegStorage_hybridizeAll(void);

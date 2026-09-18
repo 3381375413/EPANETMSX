@@ -178,7 +178,17 @@ static MSXResidentStatus hybridResidentObserve(int k)
     p = &Hybrid.pipe[k];
     if (p->count <= 0)
     {
-        return MSXresident_observePipe((uint32_t)k, NULL, NULL, 0, p->orient);
+        HybridResidentStatus = MSXresident_observePipe((uint32_t)k, NULL,
+                                                       NULL, 0, p->orient);
+        if (HybridResidentStatus == MSX_RESIDENT_OK)
+        {
+            for (slot = 0; slot < p->cap; ++slot)
+            {
+                p->residentSlot[slot] = -1;
+                p->coreSlotForResident[slot] = -1;
+            }
+        }
+        return HybridResidentStatus;
     }
     if (p->count > p->cap || !p->observerPayload || !p->observerId ||
         !hybridRefreshResidentSlots(p))
@@ -202,6 +212,26 @@ static MSXResidentStatus hybridResidentObserve(int k)
     }
     HybridResidentStatus = MSXresident_observePipe((uint32_t)k, id, payload,
                                                     (uint32_t)p->count, p->orient);
+    /* The Resident descriptor is published as a deterministic contiguous
+       cyclic span (head 0).  Commit the matching CPU Core<->Resident inverse
+       map only after that publication succeeds, so active-row filtering and
+       payload writeback address the same identities as the GPU image. */
+    if (HybridResidentStatus == MSX_RESIDENT_OK)
+    {
+        for (slot = 0; slot < p->cap; ++slot)
+        {
+            p->residentSlot[slot] = -1;
+            p->coreSlotForResident[slot] = -1;
+        }
+        slot = p->head;
+        for (pos = 0; pos < p->count; ++pos)
+        {
+            int resident = (int)(((int64_t)p->orient * pos + p->cap) % p->cap);
+            p->residentSlot[slot] = resident;
+            p->coreSlotForResident[resident] = slot;
+            slot = hybridNextSlot(p, slot);
+        }
+    }
     return HybridResidentStatus;
 }
 
@@ -1661,6 +1691,34 @@ int MSXsegStorage_isHybridCoreSlotIdentity(int k, int slot,
     seg = p->view[coreSlot];
     return seg && seg->inHybridCore && seg->ownerLink == k &&
            seg->hybridSlot == coreSlot && seg->hybridId == hybridId;
+}
+
+int MSXsegStorage_hybridApplyResidentPayload(int k, int residentSlot,
+                                              uint64_t hybridId,
+                                              const MSXResidentPayload *payload)
+{
+    HybridPipe *p;
+    Pseg seg;
+    int coreSlot, m;
+
+    if (!payload || !payload->c || !payload->lastc ||
+        !MSXsegStorage_isHybridCoreSlotIdentity(k, residentSlot, hybridId))
+        return 0;
+    p = &Hybrid.pipe[k];
+    coreSlot = p->coreSlotForResident[residentSlot];
+    seg = p->view[coreSlot];
+    if (!seg || !seg->c || !seg->lastc) return 0;
+    seg->v = payload->volume;
+    seg->hstep = payload->hstep;
+    seg->hresponse = payload->hresponse;
+    seg->uresponse = payload->uresponse;
+    seg->dresponse = payload->dresponse;
+    for (m = 0; m <= Hybrid.nSpecies; m++)
+    {
+        seg->c[m] = payload->c[m];
+        seg->lastc[m] = payload->lastc[m];
+    }
+    return 1;
 }
 
 void MSXsegStorage_hybridAssignIdentity(int k, Pseg seg)

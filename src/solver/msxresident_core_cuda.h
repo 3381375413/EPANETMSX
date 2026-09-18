@@ -4,6 +4,10 @@
 /* Deliberately C-only: Phase 3 owns all runtime/configuration wiring. */
 #include "msxresident_core.h"
 #include <stdint.h>
+
+/* C ABI row width for resident hydraulic values; MSX HydVar[0..9]. */
+#define MSX_RESIDENT_HYD_STRIDE 10
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,6 +22,12 @@ typedef struct { uint64_t activeCount,checksumXor,checksumSum,staleGeneration,ep
    fixed row in the published resident span, never a Pseg or ring index. */
 typedef struct { uint32_t linkIndex,globalRow,generation; uint64_t descriptorEpoch; double volume; const double *hyd; } MSXResidentActiveItem;
 typedef struct { const MSXResidentActiveItem *item; uint32_t itemCount; } MSXResidentActiveBatch;
+/* Non-destructive GPU-to-CPU mirror refresh for the just-completed active
+   batch.  This never materializes a handoff or changes descriptor topology. */
+typedef struct { uint32_t linkIndex,globalRow,generation; uint64_t descriptorEpoch;
+    double hstep,hresponse,uresponse,dresponse; } MSXResidentGpuActiveSyncRow;
+typedef struct { MSXResidentGpuActiveSyncRow *row; double *cOut,*lastcOut;
+    uint32_t stride; } MSXResidentGpuActiveSyncOutput;
 /* All addresses are plain integer values so this ABI is usable by C callers
    without importing CUDA headers.  They belong to the primary CUDA context. */
 typedef struct { uint64_t segPipe,segRow,segVol,hstep,c,lastc,hyd,reacted,ros2Nfcn,ros2Njac,ros2Naccept,ros2Nreject,ros2LastHstep,ros2Err; uint32_t itemCount,speciesStride,hydStride; } MSXResidentGpuDeviceView;
@@ -40,6 +50,9 @@ MSXResidentStatus MSXresidentGpu_reduce(MSXResidentGpu *, double *massBySpecies,
 MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu *, const MSXResidentActiveBatch *, MSXResidentGpuDeviceView *, MSXResidentGpuReactResult *);
 MSXResidentStatus MSXresidentGpu_getDeviceView(MSXResidentGpu *, MSXResidentGpuDeviceView *);
 MSXResidentStatus MSXresidentGpu_finishActive(MSXResidentGpu *, MSXResidentGpuReactResult *);
+MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu *,
+                                             MSXResidentGpuActiveSyncOutput *,
+                                             uint32_t);
 /* Abort poisons the mirror and releases an in-flight active batch.  It is
    intentionally fail-closed: callers must reopen before another dispatch. */
 MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu *);
