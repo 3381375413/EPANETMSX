@@ -549,6 +549,140 @@ typedef struct                         // Per-quality-substep timing record
     int error_code;
 } MSXGpuTiming;
 
+/* Process-scoped quality lifecycle accounting.  Step records remain useful
+   for per-substep diagnostics, but these fields are deliberately cumulative
+   and are never cleared by MSXgpu_beginStep().  The phase names describe
+   mutually exclusive outer scopes; nested detail fields are reported
+   separately and must not be added to the parent totals. */
+typedef struct
+{
+    double quality_api_ms;
+    double hyd_read_ms;
+    double hyd_eval_ms;
+    double flow_reorient_ms;
+    double node_sort_ms;
+    double segment_init_ms;
+    double transport_call_ms;
+    double outer_patch_ms;
+    double report_ms;
+    double final_mass_ms;
+    double outer_other_ms;
+
+    double transport_pre_step_sync_ms;
+    double transport_handoff_plan_ms;
+    double transport_handoff_gpu_fetch_ms;
+    double transport_handoff_cpu_prepare_ms;
+    double transport_react_ms;
+    double transport_handoff_complete_ms;
+    double transport_scalar_sync_ms;
+    double transport_advect_ms;
+    double transport_topological_ms;
+    double transport_rebalance_ms;
+    double transport_resident_observe_ms;
+    double transport_post_step_ms;
+    double transport_other_ms;
+
+    double react_cpu_boundary_ms;
+    double react_cpu_tank_ms;
+    double react_flush_ms;
+    double react_enumerate_ms;
+    double react_identity_filter_ms;
+    double react_prepare_ms;
+    double react_gpu_submit_ms;
+    double react_gpu_wait_ms;
+    double react_gpu_finish_ms;
+    double react_full_sync_gather_ms;
+    double react_sync_validate_ms;
+    double react_payload_apply_ms;
+    double react_dense_apply_ms;
+    double react_reacted_merge_ms;
+
+    uint64_t quality_api_calls;
+    uint64_t hyd_event_count;
+    uint64_t quality_substep_count;
+    uint64_t report_count;
+    uint64_t transport_call_count;
+    uint64_t transfer_h2d_bytes;
+    uint64_t transfer_h2d_calls;
+    uint64_t transfer_d2h_bytes;
+    uint64_t transfer_d2h_calls;
+    double transfer_h2d_api_ms;
+    double transfer_d2h_api_ms;
+    uint64_t patch_h2d_bytes;
+    uint64_t patch_h2d_calls;
+    uint64_t patch_descriptor_h2d_bytes;
+    uint64_t patch_descriptor_h2d_calls;
+    uint64_t patch_stage_h2d_bytes;
+    uint64_t patch_stage_h2d_calls;
+    uint64_t patch_payload_h2d_bytes;
+    uint64_t patch_payload_h2d_calls;
+    uint64_t handoff_h2d_bytes;
+    uint64_t handoff_h2d_calls;
+    uint64_t handoff_d2h_bytes;
+    uint64_t handoff_d2h_calls;
+    uint64_t hyd_h2d_bytes;
+    uint64_t hyd_h2d_calls;
+    uint64_t diagnostic_d2h_bytes;
+    uint64_t diagnostic_d2h_calls;
+    uint64_t reacted_d2h_bytes;
+    uint64_t reacted_d2h_calls;
+    uint64_t active_h2d_bytes;
+    uint64_t active_h2d_calls;
+    uint64_t full_sync_h2d_bytes;
+    uint64_t full_sync_h2d_calls;
+    uint64_t full_sync_d2h_bytes;
+    uint64_t full_sync_d2h_calls;
+    uint64_t aggregate_d2h_bytes;
+    uint64_t aggregate_d2h_calls;
+    uint64_t other_h2d_bytes;
+    uint64_t other_h2d_calls;
+    uint64_t other_d2h_bytes;
+    uint64_t other_d2h_calls;
+} MSXProfileRunTotals;
+
+typedef enum
+{
+    MSX_PROFILE_RUN_QUALITY_API = 0,
+    MSX_PROFILE_RUN_HYD_READ,
+    MSX_PROFILE_RUN_HYD_EVAL,
+    MSX_PROFILE_RUN_FLOW_REORIENT,
+    MSX_PROFILE_RUN_NODE_SORT,
+    MSX_PROFILE_RUN_SEGMENT_INIT,
+    MSX_PROFILE_RUN_TRANSPORT_CALL,
+    MSX_PROFILE_RUN_OUTER_PATCH,
+    MSX_PROFILE_RUN_REPORT,
+    MSX_PROFILE_RUN_FINAL_MASS,
+    MSX_PROFILE_RUN_OUTER_OTHER,
+    MSX_PROFILE_RUN_TRANSPORT_PRE_STEP_SYNC,
+    MSX_PROFILE_RUN_TRANSPORT_HANDOFF_PLAN,
+    MSX_PROFILE_RUN_TRANSPORT_HANDOFF_GPU_FETCH,
+    MSX_PROFILE_RUN_TRANSPORT_HANDOFF_CPU_PREPARE,
+    MSX_PROFILE_RUN_TRANSPORT_REACT,
+    MSX_PROFILE_RUN_TRANSPORT_HANDOFF_COMPLETE,
+    MSX_PROFILE_RUN_TRANSPORT_SCALAR_SYNC,
+    MSX_PROFILE_RUN_TRANSPORT_ADVECT,
+    MSX_PROFILE_RUN_TRANSPORT_TOPOLOGICAL,
+    MSX_PROFILE_RUN_TRANSPORT_REBALANCE,
+    MSX_PROFILE_RUN_TRANSPORT_RESIDENT_OBSERVE,
+    MSX_PROFILE_RUN_TRANSPORT_POST_STEP,
+    MSX_PROFILE_RUN_TRANSPORT_OTHER,
+    MSX_PROFILE_RUN_REACT_CPU_BOUNDARY,
+    MSX_PROFILE_RUN_REACT_CPU_TANK,
+    MSX_PROFILE_RUN_REACT_FLUSH,
+    MSX_PROFILE_RUN_REACT_ENUMERATE,
+    MSX_PROFILE_RUN_REACT_IDENTITY_FILTER,
+    MSX_PROFILE_RUN_REACT_PREPARE,
+    MSX_PROFILE_RUN_REACT_GPU_SUBMIT,
+    MSX_PROFILE_RUN_REACT_GPU_WAIT,
+    MSX_PROFILE_RUN_REACT_GPU_FINISH,
+    MSX_PROFILE_RUN_REACT_FULL_SYNC_GATHER,
+    MSX_PROFILE_RUN_REACT_SYNC_VALIDATE,
+    MSX_PROFILE_RUN_REACT_PAYLOAD_APPLY,
+    MSX_PROFILE_RUN_REACT_DENSE_APPLY,
+    MSX_PROFILE_RUN_REACT_REACTED_MERGE,
+    MSX_PROFILE_RUN_PHASE_COUNT
+} MSXProfileRunPhase;
+
 /* Resident/GPU profiling is deliberately process-scoped.  The mode is
    resolved once from MSX_PROFILE (or the legacy timing options) before the
    first quality step; it must not be queried from hot loops. */

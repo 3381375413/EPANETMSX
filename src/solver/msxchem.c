@@ -325,7 +325,12 @@ int MSXchem_react(double dt)
                 }
             }
         }
-        if (stageTiming) MSX.GpuTimingRecord.resident_boundary_cpu_ms += MSXgpu_wallTimeMs() - boundaryStart;
+        if (stageTiming)
+        {
+            double boundaryMs = MSXgpu_wallTimeMs() - boundaryStart;
+            MSX.GpuTimingRecord.resident_boundary_cpu_ms += boundaryMs;
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_CPU_BOUNDARY, boundaryMs);
+        }
         if (!residentErr) residentErr = MSXresidentRuntime_reactCore(dt);
         errcode = residentErr;
     }
@@ -437,6 +442,8 @@ int MSXchem_react(double dt)
 
 // --- examine each tank
 
+    {
+        double tankStart = MSXgpu_profileStageEnabled() ? MSXgpu_wallTimeMs() : 0.0;
     for (k=1; k<=MSX.Nobjects[TANK]; k++)
     {
     // --- skip reservoirs
@@ -446,7 +453,11 @@ int MSXchem_react(double dt)
     // --- compute tank reactions
 
         errcode = evalTankReactions(k, dt);
-        if ( errcode ) return errcode;
+        if ( errcode ) break;
+    }
+        if (MSXgpu_profileStageEnabled())
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_CPU_TANK,
+                                   MSXgpu_wallTimeMs() - tankStart);
     }
     return errcode;
 }

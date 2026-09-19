@@ -83,6 +83,7 @@ static long long StepIndex = 0;
 static int ReactActive = 0;
 static double StepStartMs = 0.0;
 static MSXGpuTiming TotalTiming;
+static MSXProfileRunTotals RunTotals;
 static MSXGpuTiming CpuTotalTiming;
 static double InitTiming[MSX_INIT_PHASE_COUNT];
 static double InitTimingTotal = 0.0;
@@ -98,10 +99,12 @@ typedef struct
 {
     uint64_t normalHandoffRows, normalHandoffBatches;
     uint64_t normalHandoffD2hBytes, normalHandoffD2hCalls;
-    double normalPlanMs, normalFetchMs, normalValidateMs, normalCommitMs;
+    double normalPlanMs, normalFetchMs, normalPrepareMs;
+    double normalValidateMs, normalCommitMs;
     uint64_t fallbackHandoffRows, fallbackHandoffBatches;
     uint64_t fallbackHandoffD2hBytes, fallbackHandoffD2hCalls;
-    double fallbackPlanMs, fallbackFetchMs, fallbackValidateMs, fallbackCommitMs;
+    double fallbackPlanMs, fallbackFetchMs, fallbackPrepareMs;
+    double fallbackValidateMs, fallbackCommitMs;
     uint64_t demoteRows, demoteLogicalEvents, demoteApiCalls;
     uint64_t promoteRows, promoteLogicalEvents, promoteApiCalls;
     double demoteMs, promoteMs;
@@ -305,6 +308,7 @@ int MSXgpu_openTiming(void)
     MSXgpu_closeTiming();
     StepIndex = 0;
     memset(&TotalTiming, 0, sizeof(TotalTiming));
+    memset(&RunTotals, 0, sizeof(RunTotals));
     memset(&ProfileCounters, 0, sizeof(ProfileCounters));
     memset(&InitTiming, 0, sizeof(InitTiming));
     InitTimingTotal = 0.0;
@@ -329,6 +333,229 @@ int MSXgpu_openTiming(void)
     fflush(TimingFile);
     return 0;
 }
+
+void MSXgpu_profileRunPhase(MSXProfileRunPhase phase, double ms)
+{
+    double *dst = NULL;
+    if (!MSXgpu_profileStageEnabled() || phase < 0 ||
+        phase >= MSX_PROFILE_RUN_PHASE_COUNT)
+        return;
+    if (ms < 0.0) ms = 0.0;
+    switch (phase)
+    {
+    case MSX_PROFILE_RUN_QUALITY_API: dst = &RunTotals.quality_api_ms; break;
+    case MSX_PROFILE_RUN_HYD_READ: dst = &RunTotals.hyd_read_ms; break;
+    case MSX_PROFILE_RUN_HYD_EVAL: dst = &RunTotals.hyd_eval_ms; break;
+    case MSX_PROFILE_RUN_FLOW_REORIENT: dst = &RunTotals.flow_reorient_ms; break;
+    case MSX_PROFILE_RUN_NODE_SORT: dst = &RunTotals.node_sort_ms; break;
+    case MSX_PROFILE_RUN_SEGMENT_INIT: dst = &RunTotals.segment_init_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_CALL: dst = &RunTotals.transport_call_ms; break;
+    case MSX_PROFILE_RUN_OUTER_PATCH: dst = &RunTotals.outer_patch_ms; break;
+    case MSX_PROFILE_RUN_REPORT: dst = &RunTotals.report_ms; break;
+    case MSX_PROFILE_RUN_FINAL_MASS: dst = &RunTotals.final_mass_ms; break;
+    case MSX_PROFILE_RUN_OUTER_OTHER: dst = &RunTotals.outer_other_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_PRE_STEP_SYNC: dst = &RunTotals.transport_pre_step_sync_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_HANDOFF_PLAN: dst = &RunTotals.transport_handoff_plan_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_HANDOFF_GPU_FETCH: dst = &RunTotals.transport_handoff_gpu_fetch_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_HANDOFF_CPU_PREPARE: dst = &RunTotals.transport_handoff_cpu_prepare_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_REACT: dst = &RunTotals.transport_react_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_HANDOFF_COMPLETE: dst = &RunTotals.transport_handoff_complete_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_SCALAR_SYNC: dst = &RunTotals.transport_scalar_sync_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_ADVECT: dst = &RunTotals.transport_advect_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_TOPOLOGICAL: dst = &RunTotals.transport_topological_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_REBALANCE: dst = &RunTotals.transport_rebalance_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_RESIDENT_OBSERVE: dst = &RunTotals.transport_resident_observe_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_POST_STEP: dst = &RunTotals.transport_post_step_ms; break;
+    case MSX_PROFILE_RUN_TRANSPORT_OTHER: dst = &RunTotals.transport_other_ms; break;
+    case MSX_PROFILE_RUN_REACT_CPU_BOUNDARY: dst = &RunTotals.react_cpu_boundary_ms; break;
+    case MSX_PROFILE_RUN_REACT_CPU_TANK: dst = &RunTotals.react_cpu_tank_ms; break;
+    case MSX_PROFILE_RUN_REACT_FLUSH: dst = &RunTotals.react_flush_ms; break;
+    case MSX_PROFILE_RUN_REACT_ENUMERATE: dst = &RunTotals.react_enumerate_ms; break;
+    case MSX_PROFILE_RUN_REACT_IDENTITY_FILTER: dst = &RunTotals.react_identity_filter_ms; break;
+    case MSX_PROFILE_RUN_REACT_PREPARE: dst = &RunTotals.react_prepare_ms; break;
+    case MSX_PROFILE_RUN_REACT_GPU_SUBMIT: dst = &RunTotals.react_gpu_submit_ms; break;
+    case MSX_PROFILE_RUN_REACT_GPU_WAIT: dst = &RunTotals.react_gpu_wait_ms; break;
+    case MSX_PROFILE_RUN_REACT_GPU_FINISH: dst = &RunTotals.react_gpu_finish_ms; break;
+    case MSX_PROFILE_RUN_REACT_FULL_SYNC_GATHER: dst = &RunTotals.react_full_sync_gather_ms; break;
+    case MSX_PROFILE_RUN_REACT_SYNC_VALIDATE: dst = &RunTotals.react_sync_validate_ms; break;
+    case MSX_PROFILE_RUN_REACT_PAYLOAD_APPLY: dst = &RunTotals.react_payload_apply_ms; break;
+    case MSX_PROFILE_RUN_REACT_DENSE_APPLY: dst = &RunTotals.react_dense_apply_ms; break;
+    case MSX_PROFILE_RUN_REACT_REACTED_MERGE: dst = &RunTotals.react_reacted_merge_ms; break;
+    default: break;
+    }
+    if (dst) *dst += ms;
+}
+
+void MSXgpu_profileRunCount(MSXProfileRunPhase phase, uint64_t count)
+{
+    if (!MSXgpu_profileStageEnabled()) return;
+    switch (phase)
+    {
+    case MSX_PROFILE_RUN_QUALITY_API: RunTotals.quality_api_calls += count; break;
+    case MSX_PROFILE_RUN_HYD_READ: RunTotals.hyd_event_count += count; break;
+    case MSX_PROFILE_RUN_TRANSPORT_CALL: RunTotals.transport_call_count += count; break;
+    case MSX_PROFILE_RUN_TRANSPORT_PRE_STEP_SYNC: RunTotals.quality_substep_count += count; break;
+    case MSX_PROFILE_RUN_REPORT: RunTotals.report_count += count; break;
+    default: break;
+    }
+}
+
+const MSXProfileRunTotals *MSXgpu_getProfileRunTotals(void)
+{
+    return &RunTotals;
+}
+
+void MSXgpu_profileRecordTransfer(int direction, int scope, uint64_t bytes,
+                                  double apiMs)
+{
+    int collect = 0;
+    if (!MSXgpu_profileDetailEnabled()) return;
+    if (scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH ||
+        scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_DESCRIPTOR ||
+        scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_STAGE ||
+        scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD ||
+        scope == MSX_PROFILE_TRANSFER_SCOPE_HANDOFF)
+        collect = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF) ||
+                  MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
+    else if (scope == MSX_PROFILE_TRANSFER_SCOPE_HYD ||
+             scope == MSX_PROFILE_TRANSFER_SCOPE_DIAGNOSTIC ||
+             scope == MSX_PROFILE_TRANSFER_SCOPE_REACTED)
+        collect = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC);
+    else if (scope == MSX_PROFILE_TRANSFER_SCOPE_AGGREGATE)
+        collect = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_AGGREGATE);
+    else if (scope == MSX_PROFILE_TRANSFER_SCOPE_ACTIVE ||
+             scope == MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC)
+        collect = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM);
+    else collect = 1;
+    if (!collect) return;
+    if (apiMs < 0.0) apiMs = 0.0;
+    if (direction == MSX_PROFILE_TRANSFER_H2D)
+    {
+        RunTotals.transfer_h2d_bytes += bytes;
+        RunTotals.transfer_h2d_calls++;
+        RunTotals.transfer_h2d_api_ms += apiMs;
+        if (scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH ||
+            scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_DESCRIPTOR ||
+            scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_STAGE ||
+            scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD)
+        {
+            RunTotals.patch_h2d_bytes += bytes;
+            RunTotals.patch_h2d_calls++;
+            ProfileCounters.patchH2dBytes += bytes;
+            ProfileCounters.patchH2dCalls++;
+            if (scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_DESCRIPTOR)
+            {
+                RunTotals.patch_descriptor_h2d_bytes += bytes;
+                RunTotals.patch_descriptor_h2d_calls++;
+            }
+            else if (scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_STAGE)
+            {
+                RunTotals.patch_stage_h2d_bytes += bytes;
+                RunTotals.patch_stage_h2d_calls++;
+            }
+            else if (scope == MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD)
+            {
+                RunTotals.patch_payload_h2d_bytes += bytes;
+                RunTotals.patch_payload_h2d_calls++;
+            }
+        }
+        else if (scope == MSX_PROFILE_TRANSFER_SCOPE_HANDOFF)
+        {
+            RunTotals.handoff_h2d_bytes += bytes;
+            RunTotals.handoff_h2d_calls++;
+        }
+        else if (scope == MSX_PROFILE_TRANSFER_SCOPE_HYD)
+        {
+            RunTotals.hyd_h2d_bytes += bytes;
+            RunTotals.hyd_h2d_calls++;
+            ProfileCounters.hydH2dBytes += bytes;
+            ProfileCounters.hydH2dCalls++;
+        }
+        else if (scope == MSX_PROFILE_TRANSFER_SCOPE_ACTIVE)
+        {
+            RunTotals.active_h2d_bytes += bytes;
+            RunTotals.active_h2d_calls++;
+        }
+        else if (scope == MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC)
+        {
+            RunTotals.full_sync_h2d_bytes += bytes;
+            RunTotals.full_sync_h2d_calls++;
+        }
+        else
+        {
+            RunTotals.other_h2d_bytes += bytes;
+            RunTotals.other_h2d_calls++;
+        }
+    }
+    else if (direction == MSX_PROFILE_TRANSFER_D2H)
+    {
+        RunTotals.transfer_d2h_bytes += bytes;
+        RunTotals.transfer_d2h_calls++;
+        RunTotals.transfer_d2h_api_ms += apiMs;
+        if (scope == MSX_PROFILE_TRANSFER_SCOPE_HANDOFF)
+        {
+            RunTotals.handoff_d2h_bytes += bytes;
+            RunTotals.handoff_d2h_calls++;
+        }
+        else if (scope == MSX_PROFILE_TRANSFER_SCOPE_DIAGNOSTIC)
+        {
+            RunTotals.diagnostic_d2h_bytes += bytes;
+            RunTotals.diagnostic_d2h_calls++;
+            ProfileCounters.diagnosticD2hBytes += bytes;
+            ProfileCounters.diagnosticD2hCalls++;
+        }
+        else if (scope == MSX_PROFILE_TRANSFER_SCOPE_REACTED)
+        {
+            RunTotals.reacted_d2h_bytes += bytes;
+            RunTotals.reacted_d2h_calls++;
+            ProfileCounters.reactedD2hBytes += bytes;
+            ProfileCounters.reactedD2hCalls++;
+        }
+        else if (scope == MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC)
+        {
+            RunTotals.full_sync_d2h_bytes += bytes;
+            RunTotals.full_sync_d2h_calls++;
+        }
+        else if (scope == MSX_PROFILE_TRANSFER_SCOPE_AGGREGATE)
+        {
+            RunTotals.aggregate_d2h_bytes += bytes;
+            RunTotals.aggregate_d2h_calls++;
+        }
+        else
+        {
+            RunTotals.other_d2h_bytes += bytes;
+            RunTotals.other_d2h_calls++;
+        }
+    }
+}
+
+#ifdef EPANETMSX_CUDA_ENABLED
+static CUresult profileCuMemcpyHtoD(CUdeviceptr dst, const void *src,
+                                    size_t bytes, int scope)
+{
+    int timed = MSXgpu_profileDetailEnabled();
+    double start = timed ? MSXgpu_wallTimeMs() : 0.0;
+    CUresult result = cuMemcpyHtoD(dst, src, bytes);
+    if (timed)
+        MSXgpu_profileRecordTransfer(MSX_PROFILE_TRANSFER_H2D, scope,
+                                     (uint64_t)bytes,
+                                     MSXgpu_wallTimeMs() - start);
+    return result;
+}
+
+static CUresult profileCuMemcpyDtoH(void *dst, CUdeviceptr src,
+                                    size_t bytes, int scope)
+{
+    int timed = MSXgpu_profileDetailEnabled();
+    double start = timed ? MSXgpu_wallTimeMs() : 0.0;
+    CUresult result = cuMemcpyDtoH(dst, src, bytes);
+    if (timed)
+        MSXgpu_profileRecordTransfer(MSX_PROFILE_TRANSFER_D2H, scope,
+                                     (uint64_t)bytes,
+                                     MSXgpu_wallTimeMs() - start);
+    return result;
+}
+#endif
 
 static int profileEquals(const char *value, const char *word)
 {
@@ -560,7 +787,8 @@ void MSXgpu_recordInitTime(MSXInitPhase phase, double ms)
 }
 
 void MSXgpu_profileRecordNormalHandoff(double planMs, double fetchMs,
-                                       double validateMs, double commitMs,
+                                       double prepareMs, double validateMs,
+                                       double commitMs,
                                        uint64_t rows, uint64_t d2hBytes,
                                        uint64_t d2hCalls)
 {
@@ -571,12 +799,14 @@ void MSXgpu_profileRecordNormalHandoff(double planMs, double fetchMs,
     ProfileCounters.normalHandoffD2hCalls += d2hCalls;
     ProfileCounters.normalPlanMs += planMs;
     ProfileCounters.normalFetchMs += fetchMs;
+    ProfileCounters.normalPrepareMs += prepareMs;
     ProfileCounters.normalValidateMs += validateMs;
     ProfileCounters.normalCommitMs += commitMs;
 }
 
 void MSXgpu_profileRecordFallbackHandoff(double planMs, double fetchMs,
-                                         double validateMs, double commitMs,
+                                         double prepareMs, double validateMs,
+                                         double commitMs,
                                          uint64_t rows, uint64_t d2hBytes,
                                          uint64_t d2hCalls)
 {
@@ -587,6 +817,7 @@ void MSXgpu_profileRecordFallbackHandoff(double planMs, double fetchMs,
     ProfileCounters.fallbackHandoffD2hCalls += d2hCalls;
     ProfileCounters.fallbackPlanMs += planMs;
     ProfileCounters.fallbackFetchMs += fetchMs;
+    ProfileCounters.fallbackPrepareMs += prepareMs;
     ProfileCounters.fallbackValidateMs += validateMs;
     ProfileCounters.fallbackCommitMs += commitMs;
 }
@@ -763,24 +994,97 @@ static void writeProfileSummary(void)
     fprintf(f, "  \"resident_patch_h2d_ms\": %.6f,\n", TotalTiming.resident_patch_h2d_ms);
     fprintf(f, "  \"resident_sync_ms\": %.6f,\n", TotalTiming.resident_sync_ms);
     fprintf(f, "  \"resident_active_rows\": %.0f,\n", TotalTiming.resident_active_rows);
+    {
+        const MSXProfileRunTotals *r = &RunTotals;
+        fprintf(f, "  \"run_totals\": {\n");
+        fprintf(f, "    \"quality_api_ms\": %.6f, \"hyd_read_ms\": %.6f, \"hyd_eval_ms\": %.6f, \"flow_reorient_ms\": %.6f, \"node_sort_ms\": %.6f, \"segment_init_ms\": %.6f,\n",
+                r->quality_api_ms, r->hyd_read_ms, r->hyd_eval_ms,
+                r->flow_reorient_ms, r->node_sort_ms, r->segment_init_ms);
+        fprintf(f, "    \"transport_call_ms\": %.6f, \"outer_patch_ms\": %.6f, \"report_ms\": %.6f, \"final_mass_ms\": %.6f, \"outer_other_ms\": %.6f,\n",
+                r->transport_call_ms, r->outer_patch_ms, r->report_ms,
+                r->final_mass_ms, r->outer_other_ms);
+        fprintf(f, "    \"quality_api_calls\": %llu, \"hyd_event_count\": %llu, \"quality_substep_count\": %llu, \"report_count\": %llu, \"transport_call_count\": %llu,\n",
+                (unsigned long long)r->quality_api_calls,
+                (unsigned long long)r->hyd_event_count,
+                (unsigned long long)r->quality_substep_count,
+                (unsigned long long)r->report_count,
+                (unsigned long long)r->transport_call_count);
+        fprintf(f, "    \"transport\": {\"pre_step_sync_ms\": %.6f, \"handoff_plan_ms\": %.6f, \"handoff_gpu_fetch_ms\": %.6f, \"handoff_cpu_prepare_ms\": %.6f, \"react_ms\": %.6f, \"handoff_complete_ms\": %.6f, \"scalar_sync_ms\": %.6f, \"advect_ms\": %.6f, \"topological_transport_ms\": %.6f, \"rebalance_ms\": %.6f, \"resident_observe_ms\": %.6f, \"post_step_ms\": %.6f, \"other_ms\": %.6f},\n",
+                r->transport_pre_step_sync_ms, r->transport_handoff_plan_ms,
+                r->transport_handoff_gpu_fetch_ms,
+                r->transport_handoff_cpu_prepare_ms,
+                r->transport_react_ms, r->transport_handoff_complete_ms,
+                r->transport_scalar_sync_ms, r->transport_advect_ms,
+                r->transport_topological_ms, r->transport_rebalance_ms,
+                r->transport_resident_observe_ms, r->transport_post_step_ms,
+                r->transport_other_ms);
+        fprintf(f, "    \"react\": {\"cpu_boundary_ms\": %.6f, \"cpu_tank_ms\": %.6f, \"flush_ms\": %.6f, \"enumerate_ms\": %.6f, \"identity_filter_ms\": %.6f, \"prepare_ms\": %.6f, \"gpu_submit_ms\": %.6f, \"gpu_wait_ms\": %.6f, \"gpu_finish_ms\": %.6f, \"full_sync_gather_ms\": %.6f, \"sync_validate_ms\": %.6f, \"payload_apply_ms\": %.6f, \"dense_apply_ms\": %.6f, \"reacted_merge_ms\": %.6f}\n",
+                r->react_cpu_boundary_ms, r->react_cpu_tank_ms,
+                r->react_flush_ms, r->react_enumerate_ms,
+                r->react_identity_filter_ms, r->react_prepare_ms,
+                r->react_gpu_submit_ms, r->react_gpu_wait_ms,
+                r->react_gpu_finish_ms, r->react_full_sync_gather_ms,
+                r->react_sync_validate_ms, r->react_payload_apply_ms,
+                r->react_dense_apply_ms, r->react_reacted_merge_ms);
+        fprintf(f, "  },\n");
+        fprintf(f, "  \"api_transfers\": {\"h2d_bytes\": %llu, \"h2d_calls\": %llu, \"h2d_api_ms\": %.6f, \"d2h_bytes\": %llu, \"d2h_calls\": %llu, \"d2h_api_ms\": %.6f, \"patch_h2d_bytes\": %llu, \"patch_h2d_calls\": %llu, \"patch_descriptor_h2d_bytes\": %llu, \"patch_descriptor_h2d_calls\": %llu, \"patch_stage_h2d_bytes\": %llu, \"patch_stage_h2d_calls\": %llu, \"patch_payload_h2d_bytes\": %llu, \"patch_payload_h2d_calls\": %llu, \"handoff_h2d_bytes\": %llu, \"handoff_h2d_calls\": %llu, \"handoff_d2h_bytes\": %llu, \"handoff_d2h_calls\": %llu, \"hyd_h2d_bytes\": %llu, \"hyd_h2d_calls\": %llu, \"diagnostic_d2h_bytes\": %llu, \"diagnostic_d2h_calls\": %llu, \"reacted_d2h_bytes\": %llu, \"reacted_d2h_calls\": %llu, \"active_h2d_bytes\": %llu, \"active_h2d_calls\": %llu, \"full_sync_h2d_bytes\": %llu, \"full_sync_h2d_calls\": %llu, \"full_sync_d2h_bytes\": %llu, \"full_sync_d2h_calls\": %llu, \"aggregate_d2h_bytes\": %llu, \"aggregate_d2h_calls\": %llu, \"other_h2d_bytes\": %llu, \"other_h2d_calls\": %llu, \"other_d2h_bytes\": %llu, \"other_d2h_calls\": %llu},\n",
+                (unsigned long long)r->transfer_h2d_bytes,
+                (unsigned long long)r->transfer_h2d_calls,
+                r->transfer_h2d_api_ms,
+                (unsigned long long)r->transfer_d2h_bytes,
+                (unsigned long long)r->transfer_d2h_calls,
+                r->transfer_d2h_api_ms,
+                (unsigned long long)r->patch_h2d_bytes,
+                (unsigned long long)r->patch_h2d_calls,
+                (unsigned long long)r->patch_descriptor_h2d_bytes,
+                (unsigned long long)r->patch_descriptor_h2d_calls,
+                (unsigned long long)r->patch_stage_h2d_bytes,
+                (unsigned long long)r->patch_stage_h2d_calls,
+                (unsigned long long)r->patch_payload_h2d_bytes,
+                (unsigned long long)r->patch_payload_h2d_calls,
+                (unsigned long long)r->handoff_h2d_bytes,
+                (unsigned long long)r->handoff_h2d_calls,
+                (unsigned long long)r->handoff_d2h_bytes,
+                (unsigned long long)r->handoff_d2h_calls,
+                (unsigned long long)r->hyd_h2d_bytes,
+                (unsigned long long)r->hyd_h2d_calls,
+                (unsigned long long)r->diagnostic_d2h_bytes,
+                (unsigned long long)r->diagnostic_d2h_calls,
+                (unsigned long long)r->reacted_d2h_bytes,
+                (unsigned long long)r->reacted_d2h_calls,
+                (unsigned long long)r->active_h2d_bytes,
+                (unsigned long long)r->active_h2d_calls,
+                (unsigned long long)r->full_sync_h2d_bytes,
+                (unsigned long long)r->full_sync_h2d_calls,
+                (unsigned long long)r->full_sync_d2h_bytes,
+                (unsigned long long)r->full_sync_d2h_calls,
+                (unsigned long long)r->aggregate_d2h_bytes,
+                (unsigned long long)r->aggregate_d2h_calls,
+                (unsigned long long)r->other_h2d_bytes,
+                (unsigned long long)r->other_h2d_calls,
+                (unsigned long long)r->other_d2h_bytes,
+                (unsigned long long)r->other_d2h_calls);
+    }
     fprintf(f, "  \"transfers\": {\n");
     if (handoffCollected)
-        fprintf(f, "    \"normal_handoff\": {\n      \"batches\": %llu, \"rows\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu,\n      \"plan_ms\": %.6f, \"fetch_ms\": %.6f, \"validate_ms\": %.6f, \"commit_ms\": %.6f\n    },\n",
+        fprintf(f, "    \"normal_handoff\": {\n      \"batches\": %llu, \"rows\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu,\n      \"plan_ms\": %.6f, \"fetch_ms\": %.6f, \"prepare_ms\": %.6f, \"validate_ms\": %.6f, \"commit_ms\": %.6f\n    },\n",
                 (unsigned long long)ProfileCounters.normalHandoffBatches,
                 (unsigned long long)ProfileCounters.normalHandoffRows,
                 (unsigned long long)ProfileCounters.normalHandoffD2hBytes,
                 (unsigned long long)ProfileCounters.normalHandoffD2hCalls,
                 ProfileCounters.normalPlanMs, ProfileCounters.normalFetchMs,
+                ProfileCounters.normalPrepareMs,
                 ProfileCounters.normalValidateMs, ProfileCounters.normalCommitMs);
     else
         fprintf(f, "    \"normal_handoff\": null,\n");
     if (handoffCollected)
-        fprintf(f, "    \"fallback_handoff\": {\n      \"batches\": %llu, \"rows\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu,\n      \"plan_ms\": %.6f, \"fetch_ms\": %.6f, \"validate_ms\": %.6f, \"commit_ms\": %.6f\n    },\n",
+        fprintf(f, "    \"fallback_handoff\": {\n      \"batches\": %llu, \"rows\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu,\n      \"plan_ms\": %.6f, \"fetch_ms\": %.6f, \"prepare_ms\": %.6f, \"validate_ms\": %.6f, \"commit_ms\": %.6f\n    },\n",
                 (unsigned long long)ProfileCounters.fallbackHandoffBatches,
                 (unsigned long long)ProfileCounters.fallbackHandoffRows,
                 (unsigned long long)ProfileCounters.fallbackHandoffD2hBytes,
                 (unsigned long long)ProfileCounters.fallbackHandoffD2hCalls,
                 ProfileCounters.fallbackPlanMs, ProfileCounters.fallbackFetchMs,
+                ProfileCounters.fallbackPrepareMs,
                 ProfileCounters.fallbackValidateMs, ProfileCounters.fallbackCommitMs);
     else
         fprintf(f, "    \"fallback_handoff\": null,\n");
@@ -823,10 +1127,12 @@ static void writeProfileSummary(void)
         fprintf(f, "    \"reacted\": null,\n");
     }
     if (aggregateCollected)
-        fprintf(f, "    \"aggregate\": {\"queries\": %llu, \"cache_hits\": %llu, \"rebuilds\": %llu}\n",
+        fprintf(f, "    \"aggregate\": {\"queries\": %llu, \"cache_hits\": %llu, \"rebuilds\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu}\n",
                 (unsigned long long)ProfileCounters.aggregateQueries,
                 (unsigned long long)ProfileCounters.aggregateCacheHits,
-                (unsigned long long)ProfileCounters.aggregateRebuilds);
+                (unsigned long long)ProfileCounters.aggregateRebuilds,
+                (unsigned long long)RunTotals.aggregate_d2h_bytes,
+                (unsigned long long)RunTotals.aggregate_d2h_calls);
     else
         fprintf(f, "    \"aggregate\": null\n");
     fprintf(f, "  }\n}\n");
@@ -2439,10 +2745,10 @@ int MSXgpu_openResidentPrograms(void)
     for(m=1;m<=nConsts;m++)ResidentProgram.consts[m]=MSX.Const[m].value;
     for(k=1;k<=nLinks;k++){ResidentProgram.linkDiam[k]=MSX.Link[k].diam;for(m=1;m<=nParams;m++)ResidentProgram.params[k*(nParams+1)+m]=MSX.Link[k].param[m];}
     err=buildPrograms(&ResidentProgram.instr,&nInstr,&ResidentProgram.speciesProg,&ResidentProgram.termProg); if(err)goto fail; ResidentProgram.nInstr=nInstr; memset(&zeroErr,0,sizeof(zeroErr));
-#define RP_ALLOC_COPY(x,h,n) do { err=checkCu(cuMemAlloc(&ResidentProgram.x,(n)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(cuMemcpyHtoD(ResidentProgram.x,(h),(n)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;} while(0)
+#define RP_ALLOC_COPY(x,h,n) do { err=checkCu(cuMemAlloc(&ResidentProgram.x,(n)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.x,(h),(n),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;} while(0)
     RP_ALLOC_COPY(d_rateAtol,ResidentProgram.rateAtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateRtol,ResidentProgram.rateRtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateSpecies,ResidentProgram.rateSpecies,(rateCount+1)*sizeof(int)); RP_ALLOC_COPY(d_eqSpecies,ResidentProgram.eqSpecies,(eqCount+1)*sizeof(int)); RP_ALLOC_COPY(d_formulaSpecies,ResidentProgram.formulaSpecies,(formulaCount+1)*sizeof(int)); RP_ALLOC_COPY(d_speciesType,ResidentProgram.speciesType,(nSpecies+1)*sizeof(int)); RP_ALLOC_COPY(d_params,ResidentProgram.params,(size_t)(nLinks+1)*(nParams+1)*sizeof(double)); RP_ALLOC_COPY(d_consts,ResidentProgram.consts,(nConsts+1)*sizeof(double)); RP_ALLOC_COPY(d_linkDiam,ResidentProgram.linkDiam,(nLinks+1)*sizeof(double)); RP_ALLOC_COPY(d_instr,ResidentProgram.instr,(nInstr?nInstr:1)*sizeof(GpuInstrHost)); RP_ALLOC_COPY(d_speciesProg,ResidentProgram.speciesProg,(nSpecies+1)*sizeof(GpuProgramHost)); RP_ALLOC_COPY(d_termProg,ResidentProgram.termProg,(MSX.Nobjects[TERM]+1)*sizeof(GpuProgramHost));
 #undef RP_ALLOC_COPY
-    err=checkCu(cuMemAlloc(&ResidentProgram.d_err,sizeof(zeroErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(cuMemcpyHtoD(ResidentProgram.d_err,&zeroErr,sizeof(zeroErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+    err=checkCu(cuMemAlloc(&ResidentProgram.d_err,sizeof(zeroErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.d_err,&zeroErr,sizeof(zeroErr),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
     /* Completion is provided by the stream/context synchronize below.  These
        events exist only for detail-mode device timing. */
     if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM))
@@ -2505,7 +2811,12 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
             MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC));
         if (stage) transferTimer = MSXgpu_wallTimeMs();
         MSXResidentStatus residentStatus = MSXresidentGpu_prepareActive(resident, batch, &view, NULL);
-        if (stage) MSX.GpuTimingRecord.resident_active_h2d_ms += MSXgpu_wallTimeMs() - transferTimer;
+        if (stage)
+        {
+            double prepareMs = MSXgpu_wallTimeMs() - transferTimer;
+            MSX.GpuTimingRecord.resident_active_h2d_ms += prepareMs;
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_PREPARE, prepareMs);
+        }
         if (residentStatus != MSX_RESIDENT_OK)
         {
             err = mapResidentStatus(residentStatus);
@@ -2513,8 +2824,9 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
             return err;
         }
         if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC))
-            MSXgpu_profileRecordHyd((uint64_t)batch->itemCount *
-                                    MSX_RESIDENT_HYD_STRIDE * sizeof(double), 1);
+            /* Actual H2D bytes/calls are emitted by resident_core_cuda.cu for
+               each cudaMemcpy call; do not estimate them from logical rows. */
+            MSXgpu_profileRecordHyd(0, 0);
     }
     finishNeeded = 1;
     if (view.speciesStride != (uint32_t)(nSpecies + 1) || view.hydStride != MAX_HYD_VARS)
@@ -2542,13 +2854,13 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
     for (k = 1; k <= nLinks; k++) { linkDiam[k] = MSX.Link[k].diam; for (m = 1; m <= nParams; m++) params[k * (nParams + 1) + m] = MSX.Link[k].param[m]; }
     err = buildPrograms(&instr, &nInstr, &speciesProg, &termProg); if (err) goto cleanup;
     memset(&gpuErr, 0, sizeof(gpuErr));
-#define RESIDENT_ALLOC_COPY(ptr, host, bytes) do { err = checkCu(cuMemAlloc(&(ptr), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; err = checkCu(cuMemcpyHtoD((ptr), (host), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; } while (0)
+#define RESIDENT_ALLOC_COPY(ptr, host, bytes) do { err = checkCu(cuMemAlloc(&(ptr), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; err = checkCu(profileCuMemcpyHtoD((ptr), (host), (bytes), MSX_PROFILE_TRANSFER_SCOPE_OTHER), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; } while (0)
     RESIDENT_ALLOC_COPY(d_rateAtol, rateAtol, (rateCount + 1) * sizeof(double)); RESIDENT_ALLOC_COPY(d_rateRtol, rateRtol, (rateCount + 1) * sizeof(double));
     RESIDENT_ALLOC_COPY(d_rateSpecies, rateSpecies, (rateCount + 1) * sizeof(int)); RESIDENT_ALLOC_COPY(d_eqSpecies, eqSpecies, (eqCount + 1) * sizeof(int)); RESIDENT_ALLOC_COPY(d_formulaSpecies, formulaSpecies, (formulaCount + 1) * sizeof(int)); RESIDENT_ALLOC_COPY(d_speciesType, speciesType, (nSpecies + 1) * sizeof(int));
     RESIDENT_ALLOC_COPY(d_params, params, (size_t)(nLinks + 1) * (nParams + 1) * sizeof(double)); RESIDENT_ALLOC_COPY(d_consts, consts, (nConsts + 1) * sizeof(double)); RESIDENT_ALLOC_COPY(d_linkDiam, linkDiam, (nLinks + 1) * sizeof(double));
     RESIDENT_ALLOC_COPY(d_instr, instr, (nInstr > 0 ? nInstr : 1) * sizeof(GpuInstrHost)); RESIDENT_ALLOC_COPY(d_speciesProg, speciesProg, (nSpecies + 1) * sizeof(GpuProgramHost)); RESIDENT_ALLOC_COPY(d_termProg, termProg, (MSX.Nobjects[TERM] + 1) * sizeof(GpuProgramHost));
     err = checkCu(cuMemAlloc(&d_err, sizeof(gpuErr)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup;
-    err = checkCu(cuMemcpyHtoD(d_err, &gpuErr, sizeof(gpuErr)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup;
+    err = checkCu(profileCuMemcpyHtoD(d_err, &gpuErr, sizeof(gpuErr), MSX_PROFILE_TRANSFER_SCOPE_OTHER), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup;
 #undef RESIDENT_ALLOC_COPY
     ResidentProgram.ready=1; ResidentProgram.rateCount=rateCount; ResidentProgram.eqCount=eqCount; ResidentProgram.formulaCount=formulaCount; ResidentProgram.nInstr=nInstr; ResidentProgram.rateSpecies=rateSpecies; ResidentProgram.eqSpecies=eqSpecies; ResidentProgram.formulaSpecies=formulaSpecies; ResidentProgram.speciesType=speciesType; ResidentProgram.rateAtol=rateAtol; ResidentProgram.rateRtol=rateRtol; ResidentProgram.params=params; ResidentProgram.consts=consts; ResidentProgram.linkDiam=linkDiam; ResidentProgram.instr=instr; ResidentProgram.speciesProg=speciesProg; ResidentProgram.termProg=termProg; ResidentProgram.d_rateAtol=d_rateAtol; ResidentProgram.d_rateRtol=d_rateRtol; ResidentProgram.d_rateSpecies=d_rateSpecies; ResidentProgram.d_eqSpecies=d_eqSpecies; ResidentProgram.d_formulaSpecies=d_formulaSpecies; ResidentProgram.d_speciesType=d_speciesType; ResidentProgram.d_params=d_params; ResidentProgram.d_consts=d_consts; ResidentProgram.d_linkDiam=d_linkDiam; ResidentProgram.d_instr=d_instr; ResidentProgram.d_speciesProg=d_speciesProg; ResidentProgram.d_termProg=d_termProg; ResidentProgram.d_err=d_err; ResidentProgram.allocCount++;
     }
@@ -2563,25 +2875,42 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
         void *ros2Args[]={&nSeg,&nSpecies,&rateCount,&tstep,&d_segPipe,&d_segRow,&d_segVol,&d_hstep,&d_rateAtol,&d_rateRtol,&d_rateSpecies,&d_speciesType,&d_linkDiam,&areaUcf,&lperFt3,&d_c,&d_cOde,&d_reacted,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_nf,&d_nj,&d_na,&d_nr,&d_lh,&d_re,&d_err};
         void *equilArgs[]={&nSeg,&nSpecies,&eqCount,&d_segPipe,&d_segRow,&d_eqSpecies,&d_c,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_err};
         void *formulaArgs[]={&nSeg,&nSpecies,&formulaCount,&d_segPipe,&d_segRow,&d_formulaSpecies,&d_c,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_err};
+        if (stage) transferTimer = MSXgpu_wallTimeMs();
         if (detail) cuEventRecord(ResidentProgram.evStart[0],0);
-        err=checkCu(cuLaunchKernel(GpuModule.ros2Kernel,grid,1,1,block,1,1,0,0,ros2Args,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED); if(err)goto cleanup;
+        err=checkCu(cuLaunchKernel(GpuModule.ros2Kernel,grid,1,1,block,1,1,0,0,ros2Args,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);
+        if(err){if(stage)MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_GPU_SUBMIT,MSXgpu_wallTimeMs()-transferTimer);goto cleanup;}
         if (detail) cuEventRecord(ResidentProgram.evStop[0],0);
-        if(eqCount){if (detail) cuEventRecord(ResidentProgram.evStart[1],0);err=checkCu(cuLaunchKernel(GpuModule.equilKernel,grid,1,1,block,1,1,0,0,equilArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err)goto cleanup;if (detail) cuEventRecord(ResidentProgram.evStop[1],0);}
-        if(formulaCount){if (detail) cuEventRecord(ResidentProgram.evStart[2],0);err=checkCu(cuLaunchKernel(GpuModule.formulaKernel,grid,1,1,block,1,1,0,0,formulaArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err)goto cleanup;if (detail) cuEventRecord(ResidentProgram.evStop[2],0);}
-        err=checkCu(cuCtxSynchronize(),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto cleanup;
+        if(eqCount){if (detail) cuEventRecord(ResidentProgram.evStart[1],0);err=checkCu(cuLaunchKernel(GpuModule.equilKernel,grid,1,1,block,1,1,0,0,equilArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err){if(stage)MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_GPU_SUBMIT,MSXgpu_wallTimeMs()-transferTimer);goto cleanup;}if (detail) cuEventRecord(ResidentProgram.evStop[1],0);}
+        if(formulaCount){if (detail) cuEventRecord(ResidentProgram.evStart[2],0);err=checkCu(cuLaunchKernel(GpuModule.formulaKernel,grid,1,1,block,1,1,0,0,formulaArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err){if(stage)MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_GPU_SUBMIT,MSXgpu_wallTimeMs()-transferTimer);goto cleanup;}if (detail) cuEventRecord(ResidentProgram.evStop[2],0);}
+        if (stage)
+        {
+            double submitMs = MSXgpu_wallTimeMs() - transferTimer;
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_GPU_SUBMIT, submitMs);
+            transferTimer = MSXgpu_wallTimeMs();
+        }
+        err=checkCu(cuCtxSynchronize(),ERR_GPU_KERNEL_RUNTIME_ERROR);
+        if (stage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_GPU_WAIT,
+                                   MSXgpu_wallTimeMs() - transferTimer);
+        if(err)goto cleanup;
         if (detail)
         {
             odeMs = eventReadElapsedMs(ResidentProgram.evStart[0], ResidentProgram.evStop[0]);
             if (eqCount) equilMs = eventReadElapsedMs(ResidentProgram.evStart[1], ResidentProgram.evStop[1]);
             if (formulaCount) formulaMs = eventReadElapsedMs(ResidentProgram.evStart[2], ResidentProgram.evStop[2]);
         }
-        err=checkCu(cuMemcpyDtoH(&gpuErr,d_err,sizeof(gpuErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto cleanup;
+        err=checkCu(profileCuMemcpyDtoH(&gpuErr,d_err,sizeof(gpuErr),MSX_PROFILE_TRANSFER_SCOPE_DIAGNOSTIC),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto cleanup;
         if(gpuErr.code){setGpuError(gpuErr.code,gpuErr.stage,gpuErr.sid,gpuErr.pipe,gpuErr.species,gpuErr.expr,gpuErr.iter,gpuErr.value);err=gpuErr.code;goto cleanup;}
     }
     memset(&finished,0,sizeof(finished));
     { MSXResidentStatus residentStatus; if(stage) transferTimer=MSXgpu_wallTimeMs();
       residentStatus=MSXresidentGpu_finishActive(resident,&finished);
-      if(stage) MSX.GpuTimingRecord.resident_diag_d2h_hstep_ms+=MSXgpu_wallTimeMs()-transferTimer;
+      if(stage)
+      {
+          double finishMs=MSXgpu_wallTimeMs()-transferTimer;
+          MSX.GpuTimingRecord.resident_diag_d2h_hstep_ms+=finishMs;
+          MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_GPU_FINISH, finishMs);
+      }
       if(residentStatus!=MSX_RESIDENT_OK){err=mapResidentStatus(residentStatus);finishNeeded=0;setGpuError(err,GPU_STAGE_NONE,-1,-1,-1,-1,-1,(double)residentStatus);goto cleanup;} } finishNeeded=0;
     finished.ros2Ms=odeMs; finished.equilMs=equilMs; finished.formulaMs=formulaMs;
     if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC))
@@ -2589,10 +2918,8 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
         /* finishActive currently returns the legacy per-active solver arrays
            plus the reacted quality payload.  Keep the two transfers distinct
            so S5c-1 can prove exactly which bytes it removes. */
-        MSXgpu_profileRecordDiagnostic((uint64_t)batch->itemCount *
-            (sizeof(double) + 4u * sizeof(uint32_t)) + sizeof(int), 6);
-        MSXgpu_profileRecordReacted((uint64_t)(MSX.Nobjects[LINK] + 1) *
-            (uint64_t)(MSX.Nobjects[SPECIES] + 1) * sizeof(double), 1);
+        MSXgpu_profileRecordDiagnostic(0, 0);
+        MSXgpu_profileRecordReacted(0, 0);
     }
     if(result)*result=finished;
     MSX.GpuTimingRecord.react_ode_ms+=odeMs; MSX.GpuTimingRecord.react_equil_ms+=equilMs; MSX.GpuTimingRecord.react_formula_ms+=formulaMs;
@@ -2871,7 +3198,7 @@ int MSXgpu_reactPipeSegments(double dt)
     d_err = (CUdeviceptr)transfer.d_err;
 
     if (timing) timer = MSXgpu_wallTimeMs();
-#define GPU_ALLOC_COPY(ptr, host, bytes) do { err = checkCu(cuMemAlloc(&(ptr), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; err = checkCu(cuMemcpyHtoD((ptr), (host), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; } while (0)
+#define GPU_ALLOC_COPY(ptr, host, bytes) do { err = checkCu(cuMemAlloc(&(ptr), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; err = checkCu(profileCuMemcpyHtoD((ptr), (host), (bytes), MSX_PROFILE_TRANSFER_SCOPE_OTHER), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; } while (0)
     GPU_ALLOC_COPY(d_rateAtol, rateAtol, (rateCount + 1) * sizeof(double));
     GPU_ALLOC_COPY(d_rateRtol, rateRtol, (rateCount + 1) * sizeof(double));
     GPU_ALLOC_COPY(d_rateSpecies, rateSpecies, (rateCount + 1) * sizeof(int));

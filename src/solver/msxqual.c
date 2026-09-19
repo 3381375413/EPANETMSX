@@ -111,6 +111,34 @@ static int selectnonstacknode(int numsorted, int* indegree);
 static void findstoredmass(double* mass);
 
 static void   evalHydVariables(int k);
+
+static void finishQualityApiProfile(int enabled, double startMs,
+                                    double exclusiveMs)
+{
+    double elapsed;
+    double other;
+    if (!enabled) return;
+    elapsed = MSXgpu_wallTimeMs() - startMs;
+    if (elapsed < 0.0) elapsed = 0.0;
+    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_QUALITY_API, elapsed);
+    other = elapsed - exclusiveMs;
+    if (other < 0.0) other = 0.0;
+    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_OUTER_OTHER, other);
+}
+
+static double transportDirectProfileTotal(void)
+{
+    const MSXProfileRunTotals *r = MSXgpu_getProfileRunTotals();
+    return r->transport_pre_step_sync_ms +
+           r->transport_handoff_plan_ms +
+           r->transport_react_ms +
+           r->transport_handoff_complete_ms +
+           r->transport_scalar_sync_ms +
+           r->transport_advect_ms +
+           r->transport_topological_ms +
+           r->transport_rebalance_ms +
+           r->transport_post_step_ms;
+}
 //=============================================================================
 
 int  MSXqual_open()
@@ -364,6 +392,11 @@ int MSXqual_step(double *t, double *tleft)
     int m;
     double smassin, smassout, sreacted;
     int64_t  hstep, tstep, dt;
+    int profileStage = MSXgpu_profileStageEnabled();
+    double qualityApiStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
+    double qualityApiExclusive = 0.0;
+
+    MSXgpu_profileRunCount(MSX_PROFILE_RUN_QUALITY_API, 1);
 
 // --- set the shared memory pool to the water quality pool
 //     and the overall time step to nominal WQ time step
@@ -389,23 +422,59 @@ int MSXqual_step(double *t, double *tleft)
             dt = hstep;
 
         // --- route WQ over this time step
-            if ( dt > 0 ) CALL(errcode, transport(dt));
+            if ( dt > 0 )
+            {
+                double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
+                double childStart = profileStage ? transportDirectProfileTotal() : 0.0;
+                CALL(errcode, transport(dt));
+                if (profileStage)
+                {
+                    double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                    double childMs = transportDirectProfileTotal() - childStart;
+                    double otherMs = phaseMs - childMs;
+                    if (otherMs < 0.0) otherMs = 0.0;
+                    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_CALL, phaseMs);
+                    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_OTHER, otherMs);
+                    qualityApiExclusive += phaseMs;
+                }
+                MSXgpu_profileRunCount(MSX_PROFILE_RUN_TRANSPORT_CALL, 1);
+            }
             MSX.Qtime += dt;
 
         // --- retrieve new hydraulic solution
             if (MSX.Qtime == MSX.Htime)
             {
+            {
+                double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
                 CALL(errcode, getHydVars());
-
-                for (int kl = 1; kl <= MSX.Nobjects[LINK]; kl++)
+                if (profileStage)
                 {
-                    // --- skip non-pipe links
+                    double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_HYD_READ, phaseMs);
+                    qualityApiExclusive += phaseMs;
+                }
+                MSXgpu_profileRunCount(MSX_PROFILE_RUN_HYD_READ, 1);
+            }
 
-                    if (MSX.Link[kl].len == 0.0) continue;
+                {
+                    double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
+                    for (int kl = 1; kl <= MSX.Nobjects[LINK]; kl++)
+                    {
+                        // --- skip non-pipe links
 
-                    // --- evaluate hydraulic variables
+                        if (MSX.Link[kl].len == 0.0) continue;
 
-                    evalHydVariables(kl);
+                        // --- evaluate hydraulic variables
+
+                        evalHydVariables(kl);
+                    }
+                    if (profileStage)
+                    {
+                        double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_HYD_EVAL, phaseMs);
+                        qualityApiExclusive += phaseMs;
+                    }
+                    MSXgpu_profileRunCount(MSX_PROFILE_RUN_HYD_EVAL, 1);
                 }
 
                 if (MSX.Qtime < MSX.Dur)
@@ -415,15 +484,45 @@ int MSXqual_step(double *t, double *tleft)
                     if (MSX.Qtime == 0)
                     {
                         flowchanged = 1;
-                        initSegs();
-                        if (MSX.ErrCode) return MSX.ErrCode;
+                        {
+                            double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
+                            initSegs();
+                            if (profileStage)
+                            {
+                                double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                                MSXgpu_profileRunPhase(MSX_PROFILE_RUN_SEGMENT_INIT, phaseMs);
+                                qualityApiExclusive += phaseMs;
+                            }
+                        }
+                        if (MSX.ErrCode)
+                        {
+                            finishQualityApiProfile(profileStage, qualityApiStart,
+                                                    qualityApiExclusive);
+                            return MSX.ErrCode;
+                        }
                     }
                     else 
+                    {
+                        double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
                         flowchanged = flowdirchanged();
+                        if (profileStage)
+                        {
+                            double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_FLOW_REORIENT, phaseMs);
+                            qualityApiExclusive += phaseMs;
+                        }
+                    }
 
                     if (flowchanged)
                     {
+                        double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
                         CALL(errcode, sortNodes());
+                        if (profileStage)
+                        {
+                            double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_NODE_SORT, phaseMs);
+                            qualityApiExclusive += phaseMs;
+                        }
                     }
                 }
             }
@@ -431,8 +530,16 @@ int MSXqual_step(double *t, double *tleft)
         // --- report results if its time to do so
             if (MSX.Saveflag && MSX.Qtime == MSX.Rtime)
             {
+                double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
                 MSXsegStorage_syncAllPsegMirrors();
                 CALL(errcode, MSXout_saveResults());
+                if (profileStage)
+                {
+                    double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT, phaseMs);
+                    qualityApiExclusive += phaseMs;
+                }
+                MSXgpu_profileRunCount(MSX_PROFILE_RUN_REPORT, 1);
                 MSX.Rtime += MSX.Rstep * 1000;
                 MSX.Nperiods++;
             }
@@ -442,9 +549,34 @@ int MSXqual_step(double *t, double *tleft)
 
         else
         {
-            CALL(errcode, transport(dt));
+            {
+                double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
+                double childStart = profileStage ? transportDirectProfileTotal() : 0.0;
+                CALL(errcode, transport(dt));
+                if (profileStage)
+                {
+                    double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                    double childMs = transportDirectProfileTotal() - childStart;
+                    double otherMs = phaseMs - childMs;
+                    if (otherMs < 0.0) otherMs = 0.0;
+                    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_CALL, phaseMs);
+                    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_OTHER, otherMs);
+                    qualityApiExclusive += phaseMs;
+                }
+                MSXgpu_profileRunCount(MSX_PROFILE_RUN_TRANSPORT_CALL, 1);
+            }
             MSX.Qtime += dt;
-            if (!errcode) CALL(errcode, MSXresidentRuntime_flushPatches());
+            if (!errcode)
+            {
+                double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
+                CALL(errcode, MSXresidentRuntime_flushPatches());
+                if (profileStage)
+                {
+                    double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                    MSXgpu_profileRunPhase(MSX_PROFILE_RUN_OUTER_PATCH, phaseMs);
+                    qualityApiExclusive += phaseMs;
+                }
+            }
         }
 
     // --- reduce overall time step by the size of the current time step
@@ -463,6 +595,7 @@ int MSXqual_step(double *t, double *tleft)
 
     if ( *tleft <= 0 && MSX.Saveflag )
     {
+        double finalMassStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         MSXsegStorage_syncAllPsegMirrors();
         findstoredmass(MSX.MassBalance.final);
         for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
@@ -486,8 +619,25 @@ int MSXqual_step(double *t, double *tleft)
             else
                 MSX.MassBalance.ratio[m] = smassout / smassin;
         }
-        CALL(errcode, MSXout_saveFinalResults());
+        if (profileStage)
+        {
+            double phaseMs = MSXgpu_wallTimeMs() - finalMassStart;
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_FINAL_MASS, phaseMs);
+            qualityApiExclusive += phaseMs;
+        }
+        {
+            double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
+            CALL(errcode, MSXout_saveFinalResults());
+            if (profileStage)
+            {
+                double phaseMs = MSXgpu_wallTimeMs() - phaseStart;
+                MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT, phaseMs);
+                qualityApiExclusive += phaseMs;
+            }
+            MSXgpu_profileRunCount(MSX_PROFILE_RUN_REPORT, 1);
+        }
     }
+    finishQualityApiProfile(profileStage, qualityApiStart, qualityApiExclusive);
     return errcode;
 }
 
@@ -735,6 +885,18 @@ int  getHydVars()
 
 //=============================================================================
 
+static void profileTransportPostStep(int profileStage, double simTime,
+                                     int errcode)
+{
+    double start = profileStage ? MSXgpu_wallTimeMs() : 0.0;
+    MSXsegProfile_endStep(simTime);
+    MSXsegStorage_hybridTimingStepEnd();
+    MSXgpu_endStep(errcode);
+    if (profileStage)
+        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_POST_STEP,
+                               MSXgpu_wallTimeMs() - start);
+}
+
 int  transport(int64_t tstep)
 /*
 **  Purpose:
@@ -752,6 +914,7 @@ int  transport(int64_t tstep)
     double dt;
     double timer;
     int  errcode = 0;
+    int profileStage = MSXgpu_profileStageEnabled();
 
 // --- repeat until time step is exhausted
 
@@ -764,52 +927,86 @@ int  transport(int64_t tstep)
         dt64 = MIN(MSX.Qstep, tstep-qtime); // get actual time step
         qtime += dt64;                      // update amount of input tstep taken
         dt = dt64 / 1000.;                  // time step as fractional seconds
-
+        timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         MSXgpu_beginStep((MSX.Qtime + qtime) / 1000.0);
         MSXsegStorage_hybridTimingStepBegin();
         MSXsegStorage_syncAllPsegMirrors();
         MSXsegProfile_beginStep((MSX.Qtime + qtime) / 1000.0);
+        if (profileStage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_PRE_STEP_SYNC,
+                                   MSXgpu_wallTimeMs() - timer);
+        MSXgpu_profileRunCount(MSX_PROFILE_RUN_TRANSPORT_PRE_STEP_SYNC, 1);
+        timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         errcode = MSXresidentRuntime_beginStep(dt);
+        if (profileStage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_HANDOFF_PLAN,
+                                   MSXgpu_wallTimeMs() - timer);
         if (errcode)
         {
-            MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
-            MSXgpu_endStep(errcode);
+            profileTransportPostStep(profileStage,
+                                     (MSX.Qtime + qtime) / 1000.0, errcode);
             return errcode;
         }
-        if (MSXgpu_profileStageEnabled()) timer = MSXgpu_wallTimeMs();
+        timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         MSXgpu_reactBegin();
         errcode = MSXchem_react(dt);        // react species in each pipe & tank
         MSXgpu_reactEnd();
-        if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.react_ms += MSXgpu_wallTimeMs() - timer;
+        if (profileStage)
+        {
+            double phaseMs = MSXgpu_wallTimeMs() - timer;
+            MSX.GpuTimingRecord.react_ms += phaseMs;
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_REACT, phaseMs);
+        }
         if ( errcode )
         {
-            MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
-            MSXgpu_endStep(errcode);
+            profileTransportPostStep(profileStage,
+                                     (MSX.Qtime + qtime) / 1000.0, errcode);
             return errcode;
         }
+        timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         errcode = MSXresidentRuntime_completeHandoffs();
+        if (profileStage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_HANDOFF_COMPLETE,
+                                   MSXgpu_wallTimeMs() - timer);
         if (errcode || (MSXresidentRuntime_isResident() && !MSXresidentRuntime_handoffReady()))
         {
             if (!errcode) errcode = ERR_GPU_KERNEL_RUNTIME_ERROR;
-            MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
-            MSXgpu_endStep(errcode);
+            profileTransportPostStep(profileStage,
+                                     (MSX.Qtime + qtime) / 1000.0, errcode);
             return errcode;
         }
+        timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         MSXsegStorage_syncAllScalarsFromPseg();
-        if (MSXgpu_profileStageEnabled()) timer = MSXgpu_wallTimeMs();
+        if (profileStage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_SCALAR_SYNC,
+                                   MSXgpu_wallTimeMs() - timer);
+        timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         advectSegs(dt);                     // advect segments in each pipe
-        if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.advect_ms += MSXgpu_wallTimeMs() - timer;
+        if (profileStage)
+        {
+            double phaseMs = MSXgpu_wallTimeMs() - timer;
+            MSX.GpuTimingRecord.advect_ms += phaseMs;
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_ADVECT, phaseMs);
+        }
         if (MSX.ErrCode)
         {
-            MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
-            MSXgpu_endStep(MSX.ErrCode);
+            profileTransportPostStep(profileStage,
+                                     (MSX.Qtime + qtime) / 1000.0, MSX.ErrCode);
             return MSX.ErrCode;
         }
 
+        timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         topological_transport(dt);          //replace accumulate, updateNodes, sourceInput and release
+        if (profileStage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_TOPOLOGICAL,
+                                   MSXgpu_wallTimeMs() - timer);
+        timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         MSXsegStorage_hybridRebalanceAll();
         MSXresidentRuntime_markRebalance();
         MSXsegStorage_syncAllPsegMirrors();
+        if (profileStage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_REBALANCE,
+                                   MSXgpu_wallTimeMs() - timer);
         if (MSX.ErrCode)
         {
             errcode = MSX.ErrCode;
@@ -820,9 +1017,8 @@ int  transport(int64_t tstep)
 			MSXerr_writeMathErrorMsg();
             errcode = ERR_ILLEGAL_MATH;
 		}
-        MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
-        MSXsegStorage_hybridTimingStepEnd();
-        MSXgpu_endStep(errcode);
+        profileTransportPostStep(profileStage,
+                                 (MSX.Qtime + qtime) / 1000.0, errcode);
    }
    return errcode;
 }
