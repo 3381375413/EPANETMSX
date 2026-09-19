@@ -10,6 +10,12 @@ MSXproject MSX; static int pass,fail;
 #define OK(x) do{if(x)pass++;else{fail++;fprintf(stderr,"FAIL:%s:%d: %s\n",__FILE__,__LINE__,#x);}}while(0)
 int ENgetlinkid(int i,char*id){sprintf(id,"L%d",i);return 0;} int ENwriteline(char*s){(void)s;return 0;}
 char *Alloc(long n){return(char*)calloc(1,(size_t)n);} double MSXgpu_wallTimeMs(void){return 0.0;}
+/* The standalone CPU harness does not link msxgpu.c.  Keep the stage gate
+   disabled here; production builds resolve it from the GPU timing module. */
+int MSXgpu_profileStageEnabled(void){return 0;}
+int MSXgpu_profileDetailGroupEnabled(MSXProfileDetailGroup group){(void)group;return 0;}
+void MSXgpu_profileRecordDemote(uint64_t rows,double ms){(void)rows;(void)ms;}
+void MSXgpu_profileRecordPromote(uint64_t rows,double ms){(void)rows;(void)ms;}
 Pseg MSXqual_getFreeSeg(double v,double*c){Pseg s=(Pseg)calloc(1,sizeof(*s));int n=MSX.Nobjects[SPECIES]+1;if(!s)return NULL;s->c=(double*)calloc(n,sizeof(double));s->lastc=(double*)calloc(n,sizeof(double));if(!s->c||!s->lastc){free(s->c);free(s->lastc);free(s);return NULL;}s->privateC=s->c;s->privateLastC=s->lastc;s->v=v;if(c)memcpy(s->c,c,n*sizeof(double));return s;}
 void MSXqual_removeSeg(Pseg s){if(!s)return;free(s->privateC);if(s->privateLastC!=s->privateC)free(s->privateLastC);free(s);}
 static void csv(const char*n,const char*b){FILE*f=fopen(n,"wb");if(f){fputs(b,f);fclose(f);}}

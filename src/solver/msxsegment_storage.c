@@ -958,7 +958,8 @@ static int hybridPromote(int k, Pseg boundary, int atHead)
     int slot, err;
     double timer = 0.0;
     int timing = MSXsegStorage_hybridTimingEnabled();
-    if (timing) timer = MSXgpu_wallTimeMs();
+    int detail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
+    if (timing || detail) timer = MSXgpu_wallTimeMs();
     if (!boundary || boundary->inHybridCore) return 0;
     /* Fixed resident capacity is checked before the first mutation. */
     if (p->fixedCap && p->count + 1 > p->cap) return ERR_PIPE_RING_CAPACITY;
@@ -988,6 +989,7 @@ static int hybridPromote(int k, Pseg boundary, int atHead)
     hybridReplaceInList(k, boundary, p->view[slot]);
     MSXqual_removeSeg(boundary);
     if (timing) MSXsegStorage_hybridTimingAddHandoff(MSXgpu_wallTimeMs() - timer);
+    if (detail) MSXgpu_profileRecordPromote(1, MSXgpu_wallTimeMs() - timer);
     return 0;
 }
 
@@ -998,7 +1000,8 @@ static int hybridDemote(int k, int atHead)
     int slot;
     double timer = 0.0;
     int timing = MSXsegStorage_hybridTimingEnabled();
-    if (timing) timer = MSXgpu_wallTimeMs();
+    int detail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
+    if (timing || detail) timer = MSXgpu_wallTimeMs();
     if (p->count <= 0) return 0;
     slot = atHead ? p->head : p->tail;
     core = p->view[slot];
@@ -1023,6 +1026,7 @@ static int hybridDemote(int k, int atHead)
         else p->tail = hybridPrevSlot(p, slot);
     }
     if (timing) MSXsegStorage_hybridTimingAddHandoff(MSXgpu_wallTimeMs() - timer);
+    if (detail) MSXgpu_profileRecordDemote(1, MSXgpu_wallTimeMs() - timer);
     return 0;
 }
 
@@ -1068,21 +1072,33 @@ static int hybridRebalanceLink(int k)
     {
         err = hybridDemote(k, TRUE);
         if (err) return err;
-        hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+        /* Demote mutates only the selected endpoint.  Carry the boundary
+           counts forward instead of rescanning the complete linked list for
+           every row.  This is the O(1) endpoint lookup used by S5b. */
+        count--;
+        down++;
     }
     while (count > 0 && up < guard)
     {
         err = hybridDemote(k, FALSE);
         if (err) return err;
-        hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+        count--;
+        up++;
     }
+    if (!count) return 0;
+    /* There has been at most one preflight scan for this link.  Refresh the
+       endpoints once after the batched demotes; subsequent promotions update
+       the endpoint directly from the ring head/tail. */
+    hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
     while (count > 0 && down > guard)
     {
         seg = firstCore->next;
         if (!seg || seg->inHybridCore) break;
         err = hybridPromote(k, seg, TRUE);
         if (err) return err;
-        hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+        firstCore = p->view[p->head];
+        count++;
+        down--;
     }
     while (count > 0 && up > guard)
     {
@@ -1090,7 +1106,9 @@ static int hybridRebalanceLink(int k)
         if (!seg || seg->inHybridCore) break;
         err = hybridPromote(k, seg, FALSE);
         if (err) return err;
-        hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+        lastCore = p->view[p->tail];
+        count++;
+        up--;
     }
     return 0;
 }
@@ -1401,12 +1419,13 @@ void MSXsegStorage_hybridCommitCore(int k)
 
 int MSXsegStorage_hybridTimingEnabled(void)
 {
-    return MSXsegStorage_isHybridEnabled() && Hybrid.timingEnabled;
+    return MSXsegStorage_isHybridEnabled() && Hybrid.timingEnabled &&
+           MSXgpu_profileStageEnabled();
 }
 
 static void hybridTimingAdd(double *dst, double ms)
 {
-    if (dst && Hybrid.timingEnabled)
+    if (dst && Hybrid.timingEnabled && MSXgpu_profileStageEnabled())
     {
         /* Core/boundary React regions run one link per OpenMP worker.  The
            transport/rebalance handoff calls remain sequential, but using the

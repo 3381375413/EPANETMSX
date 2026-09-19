@@ -118,6 +118,33 @@ static void finalize_cpu_timing_csv(const char *filename, double process_total_m
     fclose(f);
 }
 
+static void write_runner_timing_csv(
+    double startup_ms, double epanet_open_ms, double msx_open_ms,
+    double hydraulics_ms, double initialization_ms, double first_step_ms,
+    double after_first_step_ms, double quality_step_ms, long step_calls,
+    long after_first_calls, double report_ms, double binary_write_ms,
+    double cleanup_ms, double process_total_ms)
+{
+    FILE *f = fopen("msx_runner_timing.csv", "wt");
+    if (!f) return;
+    fprintf(f, "metric,value,unit\n");
+    fprintf(f, "startup,%.6f,ms\n", startup_ms);
+    fprintf(f, "epanet_open,%.6f,ms\n", epanet_open_ms);
+    fprintf(f, "msx_open,%.6f,ms\n", msx_open_ms);
+    fprintf(f, "hydraulics,%.6f,ms\n", hydraulics_ms);
+    fprintf(f, "initialization,%.6f,ms\n", initialization_ms);
+    fprintf(f, "msxstep_first,%.6f,ms\n", first_step_ms);
+    fprintf(f, "msxstep_after_first_total,%.6f,ms\n", after_first_step_ms);
+    fprintf(f, "msxstep_total,%.6f,ms\n", quality_step_ms);
+    fprintf(f, "msxstep_calls,%ld,count\n", step_calls);
+    fprintf(f, "msxstep_after_first_calls,%ld,count\n", after_first_calls);
+    fprintf(f, "report,%.6f,ms\n", report_ms);
+    fprintf(f, "binary_write,%.6f,ms\n", binary_write_ms);
+    fprintf(f, "cleanup,%.6f,ms\n", cleanup_ms);
+    fprintf(f, "runner_wall,%.6f,ms\n", process_total_ms);
+    fclose(f);
+}
+
 int main(int argc, char* argv[])
 /*
 **  Purpose:
@@ -148,8 +175,10 @@ int main(int argc, char* argv[])
     double stageStartMs;
     double startupMs = 0.0, epanetOpenMs = 0.0, msxOpenMs = 0.0;
     double hydraulicsMs = 0.0, initializationMs = 0.0, qualityStepMs = 0.0;
+    double firstStepMs = 0.0, afterFirstStepMs = 0.0;
     double reportMs = 0.0, binaryWriteMs = 0.0, cleanupMs = 0.0;
     double processTotalMs = 0.0;
+    long stepCalls = 0, afterFirstCalls = 0;
 
     // --- check command line arguments
 
@@ -242,7 +271,13 @@ int main(int argc, char* argv[])
             }
             stageStartMs = wall_time_ms();
             err = MSXstep(&t, &tleft);
-            qualityStepMs += wall_time_ms() - stageStartMs;
+            {
+                double callMs = wall_time_ms() - stageStartMs;
+                qualityStepMs += callMs;
+                if (stepCalls == 0) firstStepMs = callMs;
+                else { afterFirstStepMs += callMs; afterFirstCalls++; }
+                stepCalls++;
+            }
             newHour = (long)(t / 3600.);
 
         } while (!err && tleft > 0);
@@ -296,6 +331,10 @@ int main(int argc, char* argv[])
         hydraulicsMs, initializationMs, qualityStepMs, reportMs, binaryWriteMs,
         cleanupMs, processTotalMs);
     finalize_cpu_timing_csv("msx_cpu_timing.csv", processTotalMs);
+    write_runner_timing_csv(startupMs, epanetOpenMs, msxOpenMs, hydraulicsMs,
+        initializationMs, firstStepMs, afterFirstStepMs, qualityStepMs,
+        stepCalls, afterFirstCalls, reportMs, binaryWriteMs, cleanupMs,
+        processTotalMs);
     printf("\nTIMING,module=cleanup,seconds=%.6f", cleanupMs / 1000.0);
     printf("\nTIMING,module=total,seconds=%.6f", processTotalMs / 1000.0);
     if (!err) printf("\n\n... EPANET-MSX completed successfully.");

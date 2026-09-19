@@ -9,3 +9,25 @@ doc/Readme_Compiler.txt
 doc/Readme_Examples.txt
 include/epanet2_32bit.lib
 EPANET-MSX_2-0*
+
+# Local generated GPU modules and copied runtime inputs
+/gpu_cache/
+/Examples/example3.inp
+/Examples/example3.msx
+
+# Native test/build products
+*.obj
+*.o
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.iobj
+*.ipdb
+*.ilk
+*.tlog
+
+# Local timing output produced by resident harnesses
+/tests/resident_phase2a/msx_hybrid_timing.csv
+/tests/resident_phase2a/msx_hybrid_timing_mode.txt

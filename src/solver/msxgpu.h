@@ -5,6 +5,38 @@
 #include "msxresident_core_cuda.h"
 
 double MSXgpu_wallTimeMs(void);
+void MSXgpu_profileInit(void);
+MSXProfileMode MSXgpu_profileMode(void);
+int MSXgpu_profileStageEnabled(void);
+int MSXgpu_profileDetailEnabled(void);
+int MSXgpu_profileDetailGroupEnabled(MSXProfileDetailGroup group);
+int MSXgpu_cpuChemistryTimingEnabled(void);
+const char *MSXgpu_profileModeName(void);
+const char *MSXgpu_profileDetailName(void);
+void MSXgpu_recordInitTime(MSXInitPhase phase, double ms);
+
+/* Detail-only transfer counters.  They are intentionally opaque to the
+   solver; the process summary owns their representation and coverage. */
+void MSXgpu_profileRecordNormalHandoff(double planMs, double fetchMs,
+                                       double validateMs, double commitMs,
+                                       uint64_t rows, uint64_t d2hBytes,
+                                       uint64_t d2hCalls);
+void MSXgpu_profileRecordFallbackHandoff(double planMs, double fetchMs,
+                                         double validateMs, double commitMs,
+                                         uint64_t rows, uint64_t d2hBytes,
+                                         uint64_t d2hCalls);
+/* Records logical row transitions; JSON keeps these separate from the
+   underlying patch/API call count. */
+void MSXgpu_profileRecordDemote(uint64_t rows, double ms);
+void MSXgpu_profileRecordPromote(uint64_t rows, double ms);
+void MSXgpu_profileRecordPatch(uint64_t descriptors, uint64_t slots,
+                               uint64_t h2dBytes, uint64_t apiCalls,
+                               int demoteClass);
+void MSXgpu_profileRecordHyd(uint64_t bytes, uint64_t apiCalls);
+void MSXgpu_profileRecordDiagnostic(uint64_t bytes, uint64_t apiCalls);
+void MSXgpu_profileRecordReacted(uint64_t bytes, uint64_t apiCalls);
+void MSXgpu_profileRecordAggregate(uint64_t queries, uint64_t cacheHits,
+                                   uint64_t rebuilds);
 int MSXgpu_openTiming(void);
 void MSXgpu_closeTiming(void);
 int MSXcpu_openTiming(void);

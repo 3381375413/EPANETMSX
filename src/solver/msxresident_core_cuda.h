@@ -40,6 +40,10 @@ MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen *, MSXResidentGpu
 MSXResidentStatus MSXresidentGpu_initialUpload(MSXResidentGpu *, const MSXResidentPatchBatch *);
 MSXResidentStatus MSXresidentGpu_applyPatches(MSXResidentGpu *, const MSXResidentPatchBatch *);
 MSXResidentStatus MSXresidentGpu_fetchHandoffs(MSXResidentGpu *, const MSXResidentHandoffPlan *, MSXResidentGpuFetchOutput *, uint32_t);
+/* Fetch a flat set of handoff rows in one GPU gather and one D2H triplet.
+   Items may belong to different links and boundary plans; the caller keeps
+   the flat order when preparing per-link CPU transactions. */
+MSXResidentStatus MSXresidentGpu_fetchHandoffBatch(MSXResidentGpu *, const MSXResidentHandoffItem *, uint32_t, MSXResidentGpuFetchOutput *);
 /* massBySpecies has speciesStride entries (including index zero) supplied by caller. */
 MSXResidentStatus MSXresidentGpu_reduce(MSXResidentGpu *, double *massBySpecies, uint32_t massCount, MSXResidentGpuReduction *);
 /* Device 0 runtime primary context is established by open; Phase 3C calls
@@ -48,6 +52,9 @@ MSXResidentStatus MSXresidentGpu_reduce(MSXResidentGpu *, double *massBySpecies,
    returned pointers stay valid until finish/close and share msxgpu's primary
    CUDA context.  msxgpu owns the ROS2/EQUIL/FORMULA launches. */
 MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu *, const MSXResidentActiveBatch *, MSXResidentGpuDeviceView *, MSXResidentGpuReactResult *);
+/* Selects whether finishActive returns optional per-active solver counters.
+   Required hstep/error/quality state is retained in every mode. */
+void MSXresidentGpu_setDiagnosticMode(MSXResidentGpu *, int enabled);
 MSXResidentStatus MSXresidentGpu_getDeviceView(MSXResidentGpu *, MSXResidentGpuDeviceView *);
 MSXResidentStatus MSXresidentGpu_finishActive(MSXResidentGpu *, MSXResidentGpuReactResult *);
 MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu *,

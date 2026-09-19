@@ -549,6 +549,42 @@ typedef struct                         // Per-quality-substep timing record
     int error_code;
 } MSXGpuTiming;
 
+/* Resident/GPU profiling is deliberately process-scoped.  The mode is
+   resolved once from MSX_PROFILE (or the legacy timing options) before the
+   first quality step; it must not be queried from hot loops. */
+typedef enum
+{
+    MSX_PROFILE_OFF = 0,
+    MSX_PROFILE_STAGE = 1,
+    MSX_PROFILE_DETAIL = 2
+} MSXProfileMode;
+
+/* Detail groups are resolved once at profile startup.  Keeping the mask
+   separate from MSXProfileMode lets a detail run request only the expensive
+   diagnostic family it is meant to explain. */
+typedef enum
+{
+    MSX_PROFILE_DETAIL_CHEM = 1 << 0,
+    MSX_PROFILE_DETAIL_HANDOFF = 1 << 1,
+    MSX_PROFILE_DETAIL_DEMOTE = 1 << 2,
+    MSX_PROFILE_DETAIL_AGGREGATE = 1 << 3,
+    MSX_PROFILE_DETAIL_INIT = 1 << 4,
+    MSX_PROFILE_DETAIL_DIAGNOSTIC = 1 << 5,
+    MSX_PROFILE_DETAIL_ALL = (1 << 6) - 1
+} MSXProfileDetailGroup;
+
+typedef enum
+{
+    MSX_INIT_CONTEXT = 0,
+    MSX_INIT_COMPILE,
+    MSX_INIT_CACHE_READ,
+    MSX_INIT_MODULE,
+    MSX_INIT_ALLOC,
+    MSX_INIT_INITIAL_UPLOAD,
+    MSX_INIT_OTHER,
+    MSX_INIT_PHASE_COUNT
+} MSXInitPhase;
+
 
 
 struct Sadjlist           // Node Adjacency List Item
@@ -648,6 +684,9 @@ typedef struct                         // MSX PROJECT VARIABLES
           GpuTiming,                   // timing CSV enabled
           GpuTimingDetail,             // React detail timing enabled
           CpuTiming,                   // CPU timing CSV enabled
+          GpuTimingConfigured,         // legacy option was explicitly present
+          GpuTimingDetailConfigured,
+          CpuTimingConfigured,
           SegmentStorage,              // SEGMENT_STORAGE option
           PipeRingCap,                 // fixed slots per pipe for PIPE_RING
           GpuCoreMode,                 // OFF, SHADOW, or RESIDENT

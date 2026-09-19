@@ -297,7 +297,9 @@ int MSXchem_react(double dt)
     if (MSXresidentRuntime_isResident())
     {
         int residentErr = 0;
-        double boundaryStart = MSXgpu_wallTimeMs();
+        int stageTiming = MSXgpu_profileStageEnabled();
+        int detailTiming = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM);
+        double boundaryStart = stageTiming ? MSXgpu_wallTimeMs() : 0.0;
         /* CPU owns only boundary Psegs.  Core rows have no CPU chemistry
            writeback path in RESIDENT mode. */
 #pragma omp parallel
@@ -310,10 +312,10 @@ int MSXchem_react(double dt)
                 for (int hi = 1; hi < MAX_HYD_VARS; hi++) HydVar[hi] = MSX.Link[k].HydVar[hi];
                 if (MSXresidentRuntime_linkFallback(k))
                 {
-                    double fallbackStart = MSXgpu_wallTimeMs();
+                    double fallbackStart = detailTiming ? MSXgpu_wallTimeMs() : 0.0;
                     linkErr = evalPipeHybridReactions(k, dt);
 #pragma omp critical(msx_resident_fallback_timing)
-                    { MSX.GpuTimingRecord.resident_fallback_ms += MSXgpu_wallTimeMs() - fallbackStart; }
+                    { if (detailTiming) MSX.GpuTimingRecord.resident_fallback_ms += MSXgpu_wallTimeMs() - fallbackStart; }
                 }
                 else linkErr = evalPipeHybridBoundaryReactions(k, dt);
                 if (linkErr)
@@ -323,7 +325,7 @@ int MSXchem_react(double dt)
                 }
             }
         }
-        MSX.GpuTimingRecord.resident_boundary_cpu_ms += MSXgpu_wallTimeMs() - boundaryStart;
+        if (stageTiming) MSX.GpuTimingRecord.resident_boundary_cpu_ms += MSXgpu_wallTimeMs() - boundaryStart;
         if (!residentErr) residentErr = MSXresidentRuntime_reactCore(dt);
         errcode = residentErr;
     }
@@ -460,7 +462,8 @@ int MSXchem_equil(int zone, int k, double *c)
 */
 {
     int errcode = 0;
-    double timer;
+    double timer = 0.0;
+    int chemistryTiming = MSXgpu_cpuChemistryTimingEnabled();
     if ( zone == LINK )
     {
         TheLink = k;
@@ -468,13 +471,13 @@ int MSXchem_equil(int zone, int k, double *c)
             HydVar[vi] = MSX.Link[k].HydVar[vi];
         if ( NumPipeEquilSpecies > 0 )
         {
-            timer = MSXgpu_wallTimeMs();
+            if (chemistryTiming) timer = MSXgpu_wallTimeMs();
             errcode = evalPipeEquil(c);
-            MSXgpu_addEquilTime(MSXgpu_wallTimeMs() - timer);
+            if (chemistryTiming) MSXgpu_addEquilTime(MSXgpu_wallTimeMs() - timer);
         }
-        timer = MSXgpu_wallTimeMs();
+        if (chemistryTiming) timer = MSXgpu_wallTimeMs();
         evalPipeFormulas(c);
-        MSXgpu_addFormulaTime(MSXgpu_wallTimeMs() - timer);
+        if (chemistryTiming) MSXgpu_addFormulaTime(MSXgpu_wallTimeMs() - timer);
     }
     if ( zone == NODE )
     {
@@ -482,13 +485,13 @@ int MSXchem_equil(int zone, int k, double *c)
         TheNode = MSX.Tank[k].node;
         if ( NumTankEquilSpecies > 0 )
         {
-            timer = MSXgpu_wallTimeMs();
+            if (chemistryTiming) timer = MSXgpu_wallTimeMs();
             errcode = evalTankEquil(c);
-            MSXgpu_addEquilTime(MSXgpu_wallTimeMs() - timer);
+            if (chemistryTiming) MSXgpu_addEquilTime(MSXgpu_wallTimeMs() - timer);
         }
-        timer = MSXgpu_wallTimeMs();
+        if (chemistryTiming) timer = MSXgpu_wallTimeMs();
         evalTankFormulas(c);
-        MSXgpu_addFormulaTime(MSXgpu_wallTimeMs() - timer);
+        if (chemistryTiming) MSXgpu_addFormulaTime(MSXgpu_wallTimeMs() - timer);
     }
     return errcode;
 }
@@ -683,7 +686,7 @@ int evalPipeSegmentReaction(int k, double dt, Pseg seg)
 
     if ( dt > 0.0 )
     {
-        odeStartMs = MSXgpu_wallTimeMs();
+        odeStartMs = MSXgpu_cpuChemistryTimingEnabled() ? MSXgpu_wallTimeMs() : 0.0;
 
         // --- place current concentrations of species that react in vector Yrate
 
@@ -733,7 +736,7 @@ int evalPipeSegmentReaction(int k, double dt, Pseg seg)
             }
             TheSeg->hstep = dh;
         }
-        MSXgpu_addOdeTime(MSXgpu_wallTimeMs() - odeStartMs);
+        if (MSXgpu_cpuChemistryTimingEnabled()) MSXgpu_addOdeTime(MSXgpu_wallTimeMs() - odeStartMs);
         if ( ierr < 0 ) return 
             ERR_INTEGRATOR;
 
@@ -968,7 +971,7 @@ int evalTankReactions(int k, double dt)
 
         if ( dt > 0.0 )
         {
-            odeStartMs = MSXgpu_wallTimeMs();
+            odeStartMs = MSXgpu_cpuChemistryTimingEnabled() ? MSXgpu_wallTimeMs() : 0.0;
 
         // --- place current concentrations of species that react in vector Yrate
             for (i=1; i<=NumTankRateSpecies; i++)
@@ -1018,7 +1021,7 @@ int evalTankReactions(int k, double dt)
                 }
                 TheSeg->hstep = dh;
             }
-            MSXgpu_addOdeTime(MSXgpu_wallTimeMs() - odeStartMs);
+            if (MSXgpu_cpuChemistryTimingEnabled()) MSXgpu_addOdeTime(MSXgpu_wallTimeMs() - odeStartMs);
             if ( ierr < 0 ) return 
                 ERR_INTEGRATOR;
         }

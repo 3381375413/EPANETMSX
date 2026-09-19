@@ -776,11 +776,11 @@ int  transport(int64_t tstep)
             MSXgpu_endStep(errcode);
             return errcode;
         }
-        timer = MSXgpu_wallTimeMs();
+        if (MSXgpu_profileStageEnabled()) timer = MSXgpu_wallTimeMs();
         MSXgpu_reactBegin();
         errcode = MSXchem_react(dt);        // react species in each pipe & tank
         MSXgpu_reactEnd();
-        MSX.GpuTimingRecord.react_ms += MSXgpu_wallTimeMs() - timer;
+        if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.react_ms += MSXgpu_wallTimeMs() - timer;
         if ( errcode )
         {
             MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
@@ -796,9 +796,9 @@ int  transport(int64_t tstep)
             return errcode;
         }
         MSXsegStorage_syncAllScalarsFromPseg();
-        timer = MSXgpu_wallTimeMs();
+        if (MSXgpu_profileStageEnabled()) timer = MSXgpu_wallTimeMs();
         advectSegs(dt);                     // advect segments in each pipe
-        MSX.GpuTimingRecord.advect_ms += MSXgpu_wallTimeMs() - timer;
+        if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.advect_ms += MSXgpu_wallTimeMs() - timer;
         if (MSX.ErrCode)
         {
             MSXsegProfile_endStep((MSX.Qtime + qtime) / 1000.0);
@@ -808,6 +808,7 @@ int  transport(int64_t tstep)
 
         topological_transport(dt);          //replace accumulate, updateNodes, sourceInput and release
         MSXsegStorage_hybridRebalanceAll();
+        MSXresidentRuntime_markRebalance();
         MSXsegStorage_syncAllPsegMirrors();
         if (MSX.ErrCode)
         {
@@ -1599,9 +1600,9 @@ void topological_transport(double dt)
             if (MSX.FlowDir[k] < 0) m = MSX.Link[k].n1;
             if (m == n)
             {
-                timer = MSXgpu_wallTimeMs();
+                if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM)) timer = MSXgpu_wallTimeMs();
                 evalnodeinflow(k, dt, &volin, MSX.MassIn);
-                MSX.GpuTimingRecord.release_ms += MSXgpu_wallTimeMs() - timer;
+                if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM)) MSX.GpuTimingRecord.release_ms += MSXgpu_wallTimeMs() - timer;
             }
 
             // ... link has flow out of node - add it to node's outflow
@@ -1618,9 +1619,9 @@ void topological_transport(double dt)
         volout *= dt;
 
         // ... find the concentration of flow leaving the node
-        timer = MSXgpu_wallTimeMs();
+        if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM)) timer = MSXgpu_wallTimeMs();
         findnodequal(n, volin, MSX.MassIn, volout, dt);
-        MSX.GpuTimingRecord.mix_ms += MSXgpu_wallTimeMs() - timer;
+        if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM)) MSX.GpuTimingRecord.mix_ms += MSXgpu_wallTimeMs() - timer;
 
         // ... examine each link with flow out of the node
         for (alink = MSX.Adjlist[n]; alink != NULL; alink = alink->next)
@@ -1632,9 +1633,9 @@ void topological_transport(double dt)
             if (m == n)
             {
                 // ... send flow at new node concen. into link
-                timer = MSXgpu_wallTimeMs();
+                if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM)) timer = MSXgpu_wallTimeMs();
                 evalnodeoutflow(k, MSX.Node[n].c, dt);
-                MSX.GpuTimingRecord.release_ms += MSXgpu_wallTimeMs() - timer;
+                if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM)) MSX.GpuTimingRecord.release_ms += MSXgpu_wallTimeMs() - timer;
             }
         }
 
@@ -1644,7 +1645,7 @@ void topological_transport(double dt)
     //2. Compose the nodal equations
     //3. Solve the matrix to update nodal concentration
     //4. Update segment concentration
-    timer = MSXgpu_wallTimeMs();
+    if (MSXgpu_profileStageEnabled()) timer = MSXgpu_wallTimeMs();
     for (int m = 1; m <= MSX.Nobjects[SPECIES]; m++)
     {
         if (MSX.Dispersion.md[m] > 0 || MSX.Dispersion.ld[m] > 0)
@@ -1656,7 +1657,7 @@ void topological_transport(double dt)
     }
     if (MSXsegStorage_isHybridEnabled() && MSX.DispersionFlag)
         MSXsegStorage_hybridSyncAllScalars();
-    MSX.GpuTimingRecord.disperse_ms += MSXgpu_wallTimeMs() - timer;
+    if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.disperse_ms += MSXgpu_wallTimeMs() - timer;
 }
 
 
@@ -2208,6 +2209,29 @@ void findstoredmass(double * mass)
     Pseg   seg;
     double *c;
     double *v;
+    double *residentMass = NULL;
+    MSXResidentGpuReduction residentReduction;
+    int residentAggregate = FALSE;
+
+    /* Resident Core rows are no longer authoritative CPU-owned segment
+       storage.  Ask the runtime for one fixed-order GPU aggregate and only
+       scan the CPU Boundary rows below; if the query cannot be completed,
+       retain the legacy full CPU scan as the correctness fallback. */
+    if (MSXresidentRuntime_isResident())
+    {
+        residentMass = (double *)calloc((size_t)MSX.Nobjects[SPECIES] + 1,
+                                         sizeof(double));
+        if (residentMass &&
+            MSXresidentRuntime_reduce(residentMass,
+                                      (uint32_t)MSX.Nobjects[SPECIES] + 1,
+                                      &residentReduction) == MSX_RESIDENT_OK)
+            residentAggregate = TRUE;
+        else
+        {
+            free(residentMass);
+            residentMass = NULL;
+        }
+    }
 
     for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
     {
@@ -2241,6 +2265,11 @@ void findstoredmass(double * mass)
         seg = MSX.FirstSeg[k];
         while (seg != NULL)
         {
+            if (residentAggregate && seg->inHybridCore)
+            {
+                seg = seg->prev;
+                continue;
+            }
             for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
             {
                 if (MSX.Species[m].type == BULK)
@@ -2250,6 +2279,13 @@ void findstoredmass(double * mass)
             }
             seg = seg->prev;
         }
+    }
+
+    if (residentAggregate)
+    {
+        for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+            mass[m] += residentMass[m] * LperFT3;
+        free(residentMass);
     }
 
     // Mass residing in each tank

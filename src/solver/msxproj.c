@@ -361,8 +361,14 @@ void setDefaults()
     MSX.GpuSolver = EUL;
     MSX.GpuRk5Mode = GPU_RK5_CPU_ALIGN;
     MSX.GpuTiming = FALSE;
-    MSX.GpuTimingDetail = TRUE;
+    /* Legacy detail timing used to default on, which made every chemistry
+       segment pay for a clock even when no timing output was requested.
+       MSX_PROFILE (or explicit legacy timing options) now opts in. */
+    MSX.GpuTimingDetail = FALSE;
     MSX.CpuTiming = FALSE;
+    MSX.GpuTimingConfigured = FALSE;
+    MSX.GpuTimingDetailConfigured = FALSE;
+    MSX.CpuTimingConfigured = FALSE;
     MSX.SegmentStorage = SEG_STORAGE_PSEG;
     MSX.PipeRingCap = 5000;
     MSX.GpuCoreMode = 0;              // GPU_CORE_MODE OFF

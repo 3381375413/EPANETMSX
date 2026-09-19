@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -83,7 +84,35 @@ static int ReactActive = 0;
 static double StepStartMs = 0.0;
 static MSXGpuTiming TotalTiming;
 static MSXGpuTiming CpuTotalTiming;
+static double InitTiming[MSX_INIT_PHASE_COUNT];
+static double InitTimingTotal = 0.0;
+static MSXProfileMode ProfileMode = (MSXProfileMode)-1;
+static char ProfileDetail[128] = "all";
+static unsigned int ProfileDetailMask = MSX_PROFILE_DETAIL_ALL;
+static int ProfileAnnounced = 0;
+static int ProfileExplicit = 0;
+static int GpuTimingOutputEnabled = 0;
 static int Ros2RawErrorReason = 0;
+
+typedef struct
+{
+    uint64_t normalHandoffRows, normalHandoffBatches;
+    uint64_t normalHandoffD2hBytes, normalHandoffD2hCalls;
+    double normalPlanMs, normalFetchMs, normalValidateMs, normalCommitMs;
+    uint64_t fallbackHandoffRows, fallbackHandoffBatches;
+    uint64_t fallbackHandoffD2hBytes, fallbackHandoffD2hCalls;
+    double fallbackPlanMs, fallbackFetchMs, fallbackValidateMs, fallbackCommitMs;
+    uint64_t demoteRows, demoteLogicalEvents, demoteApiCalls;
+    uint64_t promoteRows, promoteLogicalEvents, promoteApiCalls;
+    double demoteMs, promoteMs;
+    uint64_t patchDescriptors, patchSlots, patchH2dBytes, patchH2dCalls;
+    uint64_t demotePatchDescriptors, demotePatchSlots;
+    uint64_t hydH2dBytes, hydH2dCalls;
+    uint64_t diagnosticD2hBytes, diagnosticD2hCalls;
+    uint64_t reactedD2hBytes, reactedD2hCalls;
+    uint64_t aggregateQueries, aggregateCacheHits, aggregateRebuilds;
+} MSXProfileCounters;
+static MSXProfileCounters ProfileCounters;
 static int Ros2RawErrorSid = -1;
 #ifdef EPANETMSX_CUDA_ENABLED
 static int ReactTransferReady = 0;
@@ -272,10 +301,16 @@ int MSXgpu_validateStrict(void)
 
 int MSXgpu_openTiming(void)
 {
+    MSXgpu_profileInit();
     MSXgpu_closeTiming();
     StepIndex = 0;
     memset(&TotalTiming, 0, sizeof(TotalTiming));
-    if (!MSX.GpuTiming) return 0;
+    memset(&ProfileCounters, 0, sizeof(ProfileCounters));
+    memset(&InitTiming, 0, sizeof(InitTiming));
+    InitTimingTotal = 0.0;
+    GpuTimingOutputEnabled = MSXgpu_profileStageEnabled() &&
+        (ProfileExplicit || MSX.GpuTiming);
+    if (!GpuTimingOutputEnabled) return 0;
     TimingFile = fopen("msx_gpu_timing.csv", "wt");
     if (!TimingFile) return ERR_IO_OUT_FILE;
     fprintf(TimingFile,
@@ -293,6 +328,333 @@ int MSXgpu_openTiming(void)
         "resident_initial_upload_ms,resident_handoff_ms,resident_fallback_ms,resident_active_rows\n");
     fflush(TimingFile);
     return 0;
+}
+
+static int profileEquals(const char *value, const char *word)
+{
+    unsigned char a, b;
+    if (!value || !word) return 0;
+    while (*value && *word)
+    {
+        a = (unsigned char)*value++;
+        b = (unsigned char)*word++;
+        if (tolower(a) != tolower(b)) return 0;
+    }
+    return *value == '\0' && *word == '\0';
+}
+
+static unsigned int profileDetailToken(const char *token)
+{
+    if (profileEquals(token, "all")) return MSX_PROFILE_DETAIL_ALL;
+    if (profileEquals(token, "chem")) return MSX_PROFILE_DETAIL_CHEM;
+    if (profileEquals(token, "handoff") || profileEquals(token, "normal_handoff"))
+        return MSX_PROFILE_DETAIL_HANDOFF;
+    if (profileEquals(token, "demote") || profileEquals(token, "rebalance"))
+        return MSX_PROFILE_DETAIL_DEMOTE;
+    if (profileEquals(token, "aggregate")) return MSX_PROFILE_DETAIL_AGGREGATE;
+    if (profileEquals(token, "init") || profileEquals(token, "startup"))
+        return MSX_PROFILE_DETAIL_INIT;
+    if (profileEquals(token, "diagnostic") || profileEquals(token, "diag"))
+        return MSX_PROFILE_DETAIL_DIAGNOSTIC;
+    return 0;
+}
+
+static void profileDetailNameFromMask(unsigned int mask)
+{
+    static const struct { unsigned int bit; const char *name; } groups[] = {
+        { MSX_PROFILE_DETAIL_CHEM, "chem" },
+        { MSX_PROFILE_DETAIL_HANDOFF, "handoff" },
+        { MSX_PROFILE_DETAIL_DEMOTE, "demote" },
+        { MSX_PROFILE_DETAIL_AGGREGATE, "aggregate" },
+        { MSX_PROFILE_DETAIL_INIT, "init" },
+        { MSX_PROFILE_DETAIL_DIAGNOSTIC, "diagnostic" }
+    };
+    size_t i;
+    size_t used = 0;
+    ProfileDetail[0] = '\0';
+    if (mask == MSX_PROFILE_DETAIL_ALL)
+    {
+        strcpy(ProfileDetail, "all");
+        return;
+    }
+    for (i = 0; i < sizeof(groups) / sizeof(groups[0]); i++)
+    {
+        if (mask & groups[i].bit)
+        {
+            int n = snprintf(ProfileDetail + used, sizeof(ProfileDetail) - used,
+                             "%s%s", used ? "|" : "", groups[i].name);
+            if (n < 0 || (size_t)n >= sizeof(ProfileDetail) - used) break;
+            used += (size_t)n;
+        }
+    }
+    if (!used) strcpy(ProfileDetail, "none");
+}
+
+static void resolveProfileDetail(const char *value)
+{
+    char token[32];
+    size_t n = 0;
+    unsigned int mask = 0;
+    int sawToken = 0;
+    const unsigned char *p = (const unsigned char *)value;
+
+    if (!value || !value[0])
+    {
+        ProfileDetailMask = MSX_PROFILE_DETAIL_ALL;
+        profileDetailNameFromMask(ProfileDetailMask);
+        return;
+    }
+    while (*p)
+    {
+        unsigned char c = *p++;
+        int separator = isspace(c) || c == '|' || c == ',' || c == '+' || c == ';';
+        if (!separator && n + 1 < sizeof(token))
+            token[n++] = (char)tolower(c);
+        if (separator && n)
+        {
+            unsigned int bit;
+            token[n] = '\0';
+            bit = profileDetailToken(token);
+            if (!bit)
+                fprintf(stderr, "WARNING: unknown MSX_PROFILE_DETAIL group '%s'.\n", token);
+            else if (bit == MSX_PROFILE_DETAIL_ALL)
+                mask = MSX_PROFILE_DETAIL_ALL;
+            else
+                mask |= bit;
+            sawToken = 1;
+            n = 0;
+        }
+    }
+    if (n)
+    {
+        unsigned int bit;
+        token[n] = '\0';
+        bit = profileDetailToken(token);
+        if (!bit)
+            fprintf(stderr, "WARNING: unknown MSX_PROFILE_DETAIL group '%s'.\n", token);
+        else if (bit == MSX_PROFILE_DETAIL_ALL)
+            mask = MSX_PROFILE_DETAIL_ALL;
+        else
+            mask |= bit;
+        sawToken = 1;
+    }
+    ProfileDetailMask = sawToken ? mask : MSX_PROFILE_DETAIL_ALL;
+    profileDetailNameFromMask(ProfileDetailMask);
+}
+
+static const char *profileModeName(MSXProfileMode mode)
+{
+    if (mode == MSX_PROFILE_STAGE) return "stage";
+    if (mode == MSX_PROFILE_DETAIL) return "detail";
+    return "off";
+}
+
+void MSXgpu_profileInit(void)
+{
+    const char *value;
+    const char *detail;
+    int explicitMode = 0;
+
+    if (ProfileMode >= MSX_PROFILE_OFF) return;
+    value = getenv("MSX_PROFILE");
+    detail = getenv("MSX_PROFILE_DETAIL");
+    resolveProfileDetail(detail);
+    if (value && value[0])
+    {
+        explicitMode = 1;
+        ProfileExplicit = 1;
+        if (profileEquals(value, "stage")) ProfileMode = MSX_PROFILE_STAGE;
+        else if (profileEquals(value, "detail")) ProfileMode = MSX_PROFILE_DETAIL;
+        else if (profileEquals(value, "off") || profileEquals(value, "0") ||
+                 profileEquals(value, "false") || profileEquals(value, "no"))
+            ProfileMode = MSX_PROFILE_OFF;
+        else
+        {
+            ProfileMode = MSX_PROFILE_OFF;
+            fprintf(stderr, "WARNING: invalid MSX_PROFILE='%s'; using off.\n", value);
+        }
+    }
+    else if (MSX.GpuTimingConfigured)
+    {
+        /* GPU_TIMING remains the legacy opt-in gate.  In particular,
+           GPU_TIMING NO must not become a detail profile merely because the
+           detail option was present or CPU timing was requested. */
+        if (!MSX.GpuTiming)
+            ProfileMode = (MSX.CpuTimingConfigured && MSX.CpuTiming)
+                        ? MSX_PROFILE_DETAIL : MSX_PROFILE_OFF;
+        else
+            /* Before MSX_PROFILE, GpuTimingDetail defaulted on.  Preserve
+               that behavior for an explicit legacy GPU_TIMING YES, while an
+               explicit DETAIL NO selects the cheaper stage profile. */
+            ProfileMode = (!MSX.GpuTimingDetailConfigured || MSX.GpuTimingDetail)
+                        ? MSX_PROFILE_DETAIL : MSX_PROFILE_STAGE;
+    }
+    else if (MSX.CpuTimingConfigured && MSX.CpuTiming)
+        /* Legacy CPU_TIMING enabled the detailed chemistry clocks even when
+           GPU_TIMING itself was not requested.  Retain that behavior without
+           opening a GPU timing CSV (handled separately in openTiming). */
+        ProfileMode = MSX_PROFILE_DETAIL;
+    else
+        ProfileMode = MSX_PROFILE_OFF;
+
+    /* An explicit new mode owns the precedence.  Do not let an old option
+       reopen detail timing after MSX_PROFILE=off. */
+    if (explicitMode && ProfileMode == MSX_PROFILE_OFF)
+    {
+        MSX.GpuTiming = FALSE;
+        MSX.GpuTimingDetail = FALSE;
+        MSX.CpuTiming = FALSE;
+    }
+    if (!ProfileAnnounced)
+    {
+        printf("\nTIMING,profile_mode=%s,profile_detail=%s\n",
+               profileModeName(ProfileMode), ProfileDetail);
+        ProfileAnnounced = 1;
+    }
+}
+
+MSXProfileMode MSXgpu_profileMode(void)
+{
+    MSXgpu_profileInit();
+    return ProfileMode;
+}
+
+int MSXgpu_profileStageEnabled(void)
+{
+    return MSXgpu_profileMode() >= MSX_PROFILE_STAGE;
+}
+
+int MSXgpu_profileDetailEnabled(void)
+{
+    return MSXgpu_profileMode() == MSX_PROFILE_DETAIL;
+}
+
+int MSXgpu_profileDetailGroupEnabled(MSXProfileDetailGroup group)
+{
+    MSXgpu_profileInit();
+    return ProfileMode == MSX_PROFILE_DETAIL &&
+           (ProfileDetailMask & (unsigned int)group) != 0;
+}
+
+const char *MSXgpu_profileModeName(void)
+{
+    return profileModeName(MSXgpu_profileMode());
+}
+
+const char *MSXgpu_profileDetailName(void)
+{
+    MSXgpu_profileInit();
+    return ProfileDetail;
+}
+
+void MSXgpu_recordInitTime(MSXInitPhase phase, double ms)
+{
+    if (!MSXgpu_profileStageEnabled() || phase < 0 || phase >= MSX_INIT_PHASE_COUNT)
+        return;
+    if (MSXgpu_profileDetailEnabled() &&
+        !MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_INIT))
+        return;
+    if (ms < 0.0) ms = 0.0;
+    InitTiming[phase] += ms;
+    InitTimingTotal += ms;
+}
+
+void MSXgpu_profileRecordNormalHandoff(double planMs, double fetchMs,
+                                       double validateMs, double commitMs,
+                                       uint64_t rows, uint64_t d2hBytes,
+                                       uint64_t d2hCalls)
+{
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF)) return;
+    ProfileCounters.normalHandoffBatches++;
+    ProfileCounters.normalHandoffRows += rows;
+    ProfileCounters.normalHandoffD2hBytes += d2hBytes;
+    ProfileCounters.normalHandoffD2hCalls += d2hCalls;
+    ProfileCounters.normalPlanMs += planMs;
+    ProfileCounters.normalFetchMs += fetchMs;
+    ProfileCounters.normalValidateMs += validateMs;
+    ProfileCounters.normalCommitMs += commitMs;
+}
+
+void MSXgpu_profileRecordFallbackHandoff(double planMs, double fetchMs,
+                                         double validateMs, double commitMs,
+                                         uint64_t rows, uint64_t d2hBytes,
+                                         uint64_t d2hCalls)
+{
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF)) return;
+    ProfileCounters.fallbackHandoffBatches++;
+    ProfileCounters.fallbackHandoffRows += rows;
+    ProfileCounters.fallbackHandoffD2hBytes += d2hBytes;
+    ProfileCounters.fallbackHandoffD2hCalls += d2hCalls;
+    ProfileCounters.fallbackPlanMs += planMs;
+    ProfileCounters.fallbackFetchMs += fetchMs;
+    ProfileCounters.fallbackValidateMs += validateMs;
+    ProfileCounters.fallbackCommitMs += commitMs;
+}
+
+void MSXgpu_profileRecordDemote(uint64_t rows, double ms)
+{
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE)) return;
+    ProfileCounters.demoteRows += rows;
+    /* This hook is emitted once per logical row transition.  It is not a
+       CUDA/API call counter; those belong to patch.api_calls below. */
+    ProfileCounters.demoteLogicalEvents++;
+    ProfileCounters.demoteMs += ms;
+}
+
+void MSXgpu_profileRecordPromote(uint64_t rows, double ms)
+{
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE)) return;
+    ProfileCounters.promoteRows += rows;
+    ProfileCounters.promoteLogicalEvents++;
+    ProfileCounters.promoteMs += ms;
+}
+
+void MSXgpu_profileRecordPatch(uint64_t descriptors, uint64_t slots,
+                               uint64_t h2dBytes, uint64_t apiCalls,
+                               int demoteClass)
+{
+    MSXProfileDetailGroup group = demoteClass ? MSX_PROFILE_DETAIL_DEMOTE :
+                                                MSX_PROFILE_DETAIL_HANDOFF;
+    if (!MSXgpu_profileDetailGroupEnabled(group)) return;
+    ProfileCounters.patchDescriptors += descriptors;
+    ProfileCounters.patchSlots += slots;
+    ProfileCounters.patchH2dBytes += h2dBytes;
+    ProfileCounters.patchH2dCalls += apiCalls;
+    if (demoteClass)
+    {
+        ProfileCounters.demotePatchDescriptors += descriptors;
+        ProfileCounters.demotePatchSlots += slots;
+    }
+}
+
+void MSXgpu_profileRecordHyd(uint64_t bytes, uint64_t apiCalls)
+{
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC)) return;
+    ProfileCounters.hydH2dBytes += bytes;
+    ProfileCounters.hydH2dCalls += apiCalls;
+}
+
+void MSXgpu_profileRecordDiagnostic(uint64_t bytes, uint64_t apiCalls)
+{
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC)) return;
+    ProfileCounters.diagnosticD2hBytes += bytes;
+    ProfileCounters.diagnosticD2hCalls += apiCalls;
+}
+
+void MSXgpu_profileRecordReacted(uint64_t bytes, uint64_t apiCalls)
+{
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC)) return;
+    ProfileCounters.reactedD2hBytes += bytes;
+    ProfileCounters.reactedD2hCalls += apiCalls;
+}
+
+void MSXgpu_profileRecordAggregate(uint64_t queries, uint64_t cacheHits,
+                                   uint64_t rebuilds)
+{
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_AGGREGATE)) return;
+    ProfileCounters.aggregateQueries += queries;
+    ProfileCounters.aggregateCacheHits += cacheHits;
+    ProfileCounters.aggregateRebuilds += rebuilds;
 }
 
 int MSXcpu_openTiming(void)
@@ -335,6 +697,140 @@ void MSXcpu_closeTiming(void)
         fclose(CpuTimingFile);
     }
     CpuTimingFile = NULL;
+}
+
+static void summaryUncollected(FILE *f, int *first, int collected,
+                               const char *name)
+{
+    if (collected) return;
+    fprintf(f, "%s\n    \"%s\"", *first ? "" : ",", name);
+    *first = 0;
+}
+
+static void summaryNumberOrNull(FILE *f, int collected, const char *name,
+                                double value, int last)
+{
+    if (collected)
+        fprintf(f, "  \"%s\": %.6f%s\n", name, value, last ? "" : ",");
+    else
+        fprintf(f, "  \"%s\": null%s\n", name, last ? "" : ",");
+}
+
+static void writeProfileSummary(void)
+{
+    FILE *f;
+    int detail = MSXgpu_profileDetailEnabled();
+    int initCollected = MSXgpu_profileStageEnabled() &&
+        (!detail || MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_INIT));
+    int chemCollected = detail && MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM);
+    int handoffCollected = detail && MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF);
+    int demoteCollected = detail && MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
+    int aggregateCollected = detail && MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_AGGREGATE);
+    int diagnosticCollected = detail && MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC);
+    int first = 1;
+    if (!GpuTimingOutputEnabled) return;
+    f = fopen("msx_profile_summary.json", "wt");
+    if (!f) return;
+    fprintf(f, "{\n");
+    fprintf(f, "  \"schema_version\": 2,\n");
+    fprintf(f, "  \"mode\": \"%s\",\n", MSXgpu_profileModeName());
+    fprintf(f, "  \"detail\": \"%s\",\n", MSXgpu_profileDetailName());
+    fprintf(f, "  \"coverage\": \"gpu_driver+resident_runtime+quality_stages+cpu_chemistry\",\n");
+    fprintf(f, "  \"collected\": {\"init\": %s, \"chem\": %s, \"handoff\": %s, \"demote\": %s, \"aggregate\": %s, \"diagnostic\": %s},\n",
+            initCollected ? "true" : "false", chemCollected ? "true" : "false",
+            handoffCollected ? "true" : "false", demoteCollected ? "true" : "false",
+            aggregateCollected ? "true" : "false", diagnosticCollected ? "true" : "false");
+    fprintf(f, "  \"uncollected\": [");
+    summaryUncollected(f, &first, initCollected, "init");
+    summaryUncollected(f, &first, chemCollected, "chem");
+    summaryUncollected(f, &first, handoffCollected, "handoff");
+    summaryUncollected(f, &first, demoteCollected, "demote");
+    summaryUncollected(f, &first, aggregateCollected, "aggregate");
+    summaryUncollected(f, &first, diagnosticCollected, "diagnostic");
+    fprintf(f, "\n  ],\n");
+    summaryNumberOrNull(f, initCollected, "init_total_ms", InitTimingTotal, 0);
+    summaryNumberOrNull(f, initCollected, "init_context_ms", InitTiming[MSX_INIT_CONTEXT], 0);
+    summaryNumberOrNull(f, initCollected, "init_compile_ms", InitTiming[MSX_INIT_COMPILE], 0);
+    summaryNumberOrNull(f, initCollected, "init_cache_read_ms", InitTiming[MSX_INIT_CACHE_READ], 0);
+    summaryNumberOrNull(f, initCollected, "init_module_ms", InitTiming[MSX_INIT_MODULE], 0);
+    summaryNumberOrNull(f, initCollected, "init_alloc_ms", InitTiming[MSX_INIT_ALLOC], 0);
+    summaryNumberOrNull(f, initCollected, "init_initial_upload_ms", InitTiming[MSX_INIT_INITIAL_UPLOAD], 0);
+    summaryNumberOrNull(f, initCollected, "init_other_ms", InitTiming[MSX_INIT_OTHER], 0);
+    fprintf(f, "  \"step_total_ms\": %.6f,\n", TotalTiming.total_ms);
+    fprintf(f, "  \"step_react_ms\": %.6f,\n", TotalTiming.react_ms);
+    fprintf(f, "  \"step_advect_ms\": %.6f,\n", TotalTiming.advect_ms);
+    fprintf(f, "  \"resident_handoff_ms\": %.6f,\n", TotalTiming.resident_handoff_ms);
+    fprintf(f, "  \"resident_patch_h2d_ms\": %.6f,\n", TotalTiming.resident_patch_h2d_ms);
+    fprintf(f, "  \"resident_sync_ms\": %.6f,\n", TotalTiming.resident_sync_ms);
+    fprintf(f, "  \"resident_active_rows\": %.0f,\n", TotalTiming.resident_active_rows);
+    fprintf(f, "  \"transfers\": {\n");
+    if (handoffCollected)
+        fprintf(f, "    \"normal_handoff\": {\n      \"batches\": %llu, \"rows\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu,\n      \"plan_ms\": %.6f, \"fetch_ms\": %.6f, \"validate_ms\": %.6f, \"commit_ms\": %.6f\n    },\n",
+                (unsigned long long)ProfileCounters.normalHandoffBatches,
+                (unsigned long long)ProfileCounters.normalHandoffRows,
+                (unsigned long long)ProfileCounters.normalHandoffD2hBytes,
+                (unsigned long long)ProfileCounters.normalHandoffD2hCalls,
+                ProfileCounters.normalPlanMs, ProfileCounters.normalFetchMs,
+                ProfileCounters.normalValidateMs, ProfileCounters.normalCommitMs);
+    else
+        fprintf(f, "    \"normal_handoff\": null,\n");
+    if (handoffCollected)
+        fprintf(f, "    \"fallback_handoff\": {\n      \"batches\": %llu, \"rows\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu,\n      \"plan_ms\": %.6f, \"fetch_ms\": %.6f, \"validate_ms\": %.6f, \"commit_ms\": %.6f\n    },\n",
+                (unsigned long long)ProfileCounters.fallbackHandoffBatches,
+                (unsigned long long)ProfileCounters.fallbackHandoffRows,
+                (unsigned long long)ProfileCounters.fallbackHandoffD2hBytes,
+                (unsigned long long)ProfileCounters.fallbackHandoffD2hCalls,
+                ProfileCounters.fallbackPlanMs, ProfileCounters.fallbackFetchMs,
+                ProfileCounters.fallbackValidateMs, ProfileCounters.fallbackCommitMs);
+    else
+        fprintf(f, "    \"fallback_handoff\": null,\n");
+    if (demoteCollected)
+        fprintf(f, "    \"demote\": {\n      \"rows\": %llu, \"logical_events\": %llu, \"api_calls\": %llu, \"ms\": %.6f,\n      \"promote_rows\": %llu, \"promote_logical_events\": %llu, \"promote_api_calls\": %llu, \"promote_ms\": %.6f\n    },\n",
+                (unsigned long long)ProfileCounters.demoteRows,
+                (unsigned long long)ProfileCounters.demoteLogicalEvents,
+                (unsigned long long)ProfileCounters.demoteApiCalls, ProfileCounters.demoteMs,
+                (unsigned long long)ProfileCounters.promoteRows,
+                (unsigned long long)ProfileCounters.promoteLogicalEvents,
+                (unsigned long long)ProfileCounters.promoteApiCalls, ProfileCounters.promoteMs);
+    else
+        fprintf(f, "    \"demote\": null,\n");
+    if (handoffCollected || demoteCollected)
+        fprintf(f, "    \"patch\": {\n      \"descriptors\": %llu, \"slots\": %llu, \"h2d_bytes\": %llu, \"api_calls\": %llu,\n      \"demote_descriptors\": %llu, \"demote_slots\": %llu\n    },\n",
+                (unsigned long long)ProfileCounters.patchDescriptors,
+                (unsigned long long)ProfileCounters.patchSlots,
+                (unsigned long long)ProfileCounters.patchH2dBytes,
+                (unsigned long long)ProfileCounters.patchH2dCalls,
+                (unsigned long long)ProfileCounters.demotePatchDescriptors,
+                (unsigned long long)ProfileCounters.demotePatchSlots);
+    else
+        fprintf(f, "    \"patch\": null,\n");
+    if (diagnosticCollected)
+    {
+        fprintf(f, "    \"hyd\": {\"h2d_bytes\": %llu, \"api_calls\": %llu},\n",
+                (unsigned long long)ProfileCounters.hydH2dBytes,
+                (unsigned long long)ProfileCounters.hydH2dCalls);
+        fprintf(f, "    \"diagnostic\": {\"d2h_bytes\": %llu, \"api_calls\": %llu},\n",
+                (unsigned long long)ProfileCounters.diagnosticD2hBytes,
+                (unsigned long long)ProfileCounters.diagnosticD2hCalls);
+        fprintf(f, "    \"reacted\": {\"d2h_bytes\": %llu, \"api_calls\": %llu},\n",
+                (unsigned long long)ProfileCounters.reactedD2hBytes,
+                (unsigned long long)ProfileCounters.reactedD2hCalls);
+    }
+    else
+    {
+        fprintf(f, "    \"hyd\": null,\n");
+        fprintf(f, "    \"diagnostic\": null,\n");
+        fprintf(f, "    \"reacted\": null,\n");
+    }
+    if (aggregateCollected)
+        fprintf(f, "    \"aggregate\": {\"queries\": %llu, \"cache_hits\": %llu, \"rebuilds\": %llu}\n",
+                (unsigned long long)ProfileCounters.aggregateQueries,
+                (unsigned long long)ProfileCounters.aggregateCacheHits,
+                (unsigned long long)ProfileCounters.aggregateRebuilds);
+    else
+        fprintf(f, "    \"aggregate\": null\n");
+    fprintf(f, "  }\n}\n");
+    fclose(f);
 }
 
 void MSXgpu_closeTiming(void)
@@ -380,6 +876,7 @@ void MSXgpu_closeTiming(void)
         fclose(TimingFile);
     }
     TimingFile = NULL;
+    writeProfileSummary();
 #ifdef EPANETMSX_CUDA_ENABLED
     if (ReactTransferReady)
     {
@@ -387,6 +884,7 @@ void MSXgpu_closeTiming(void)
         ReactTransferReady = 0;
     }
 #endif
+    GpuTimingOutputEnabled = 0;
 }
 
 void MSXgpu_beginStep(double simTimeSec)
@@ -401,12 +899,17 @@ void MSXgpu_beginStep(double simTimeSec)
     t->gpu_strict = MSX.GpuStrict;
     t->full_coupling = (MSX.Coupling == FULL_COUPLING);
     t->equil_time_embedded = t->full_coupling;
-    StepStartMs = MSXgpu_wallTimeMs();
+    StepStartMs = MSXgpu_profileStageEnabled() ? MSXgpu_wallTimeMs() : 0.0;
 }
 
 void MSXgpu_endStep(int errorCode)
 {
     MSXGpuTiming *t = &MSX.GpuTimingRecord;
+    if (!MSXgpu_profileStageEnabled())
+    {
+        t->error_code = errorCode;
+        return;
+    }
     t->total_ms = MSXgpu_wallTimeMs() - StepStartMs;
     t->error_code = errorCode;
     TotalTiming.step_index = StepIndex;
@@ -496,9 +999,26 @@ void MSXgpu_endStep(int errorCode)
 void MSXgpu_reactBegin(void) { ReactActive = 1; }
 void MSXgpu_reactEnd(void) { ReactActive = 0; }
 
+static int legacyCpuChemistryTimingEnabled(void)
+{
+    /* Preserve the old CPU_TIMING YES chemistry clocks when no new profile
+       mode overrides the legacy switches.  This matters for the combination
+       GPU_TIMING YES + GPU_TIMING_DETAIL NO + CPU_TIMING YES: GPU detail is
+       off, but the explicitly requested CPU timing must remain observable. */
+    return !ProfileExplicit && MSX.CpuTimingConfigured && MSX.CpuTiming;
+}
+
+int MSXgpu_cpuChemistryTimingEnabled(void)
+{
+    MSXgpu_profileInit();
+    return MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM) ||
+           legacyCpuChemistryTimingEnabled();
+}
+
 static void addTime(double *field, double ms)
 {
-    if (!ReactActive || (!MSX.GpuTimingDetail && !MSX.CpuTiming)) return;
+    if (!ReactActive) return;
+    if (!MSXgpu_cpuChemistryTimingEnabled()) return;
 #ifdef _OPENMP
     if (omp_in_parallel()) ms /= (double)omp_get_num_threads();
 #pragma omp atomic
@@ -693,7 +1213,7 @@ static CUcontext GpuContext = NULL;
 
 /* Immutable NH2CL chemistry/program tables.  Parameter changes after open
    are unsupported in this phase; Phase 3 uses a fixed compiled case. */
-typedef struct { int ready,nLinks,nSpecies,nParams,nConsts,rateCount,eqCount,formulaCount,nInstr; int *rateSpecies,*eqSpecies,*formulaSpecies,*speciesType; double *rateAtol,*rateRtol,*params,*consts,*linkDiam; GpuInstrHost *instr; GpuProgramHost *speciesProg,*termProg; CUdeviceptr d_rateAtol,d_rateRtol,d_rateSpecies,d_eqSpecies,d_formulaSpecies,d_speciesType,d_params,d_consts,d_linkDiam,d_instr,d_speciesProg,d_termProg,d_err; CUevent evStart,evStop; unsigned long long allocCount; } ResidentPrograms;
+typedef struct { int ready,nLinks,nSpecies,nParams,nConsts,rateCount,eqCount,formulaCount,nInstr; int *rateSpecies,*eqSpecies,*formulaSpecies,*speciesType; double *rateAtol,*rateRtol,*params,*consts,*linkDiam; GpuInstrHost *instr; GpuProgramHost *speciesProg,*termProg; CUdeviceptr d_rateAtol,d_rateRtol,d_rateSpecies,d_eqSpecies,d_formulaSpecies,d_speciesType,d_params,d_consts,d_linkDiam,d_instr,d_speciesProg,d_termProg,d_err; CUevent evStart[3],evStop[3]; unsigned long long allocCount; } ResidentPrograms;
 static ResidentPrograms ResidentProgram;
 
 static int checkCu(CUresult r, int code)
@@ -1619,7 +2139,8 @@ static int ensureModule(void)
     const char *modeMacro = NULL;
     char *ptx = NULL;
     size_t ptxSize = 0;
-    double startMs, timer;
+    double startMs = 0.0, timer = 0.0, phaseStartMs;
+    int timing = MSXgpu_profileStageEnabled();
 
     if (GpuModule.ready && GpuModule.solver == MSX.GpuSolver &&
         (MSX.GpuSolver != RK5 || GpuModule.rk5Mode == MSX.GpuRk5Mode)) return 0;
@@ -1629,7 +2150,7 @@ static int ensureModule(void)
         memset(&GpuModule, 0, sizeof(GpuModule));
     }
 
-    startMs = MSXgpu_wallTimeMs();
+    if (timing) startMs = MSXgpu_wallTimeMs();
     if (MSX.GpuSolver == RK5)
         solverName = (MSX.GpuRk5Mode == GPU_RK5_FAST_BUCKET) ? "rk5_fast_bucket" : "rk5_align";
     else if (MSX.GpuSolver == ROS2)
@@ -1652,6 +2173,8 @@ static int ensureModule(void)
     if (err) return err;
     err = checkCu(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev), ERR_GPU_NOT_ENABLED);
     if (err) return err;
+    if (timing)
+        MSXgpu_recordInitTime(MSX_INIT_CONTEXT, MSXgpu_wallTimeMs() - startMs);
 
     sprintf(arch, "--gpu-architecture=compute_%d%d", major, minor);
 
@@ -1673,17 +2196,22 @@ static int ensureModule(void)
                  cacheDir, solverName, major, minor, GPU_CACHE_VERSION);
     }
 
-    timer = MSXgpu_wallTimeMs();
+    if (timing) timer = MSXgpu_wallTimeMs();
     if (readFileBytes(cachePath, &ptx, &ptxSize))
     {
-        MSX.GpuTimingRecord.ptx_cache_read_ms += MSXgpu_wallTimeMs() - timer;
+        if (timing)
+        {
+            phaseStartMs = MSXgpu_wallTimeMs() - timer;
+            MSXgpu_recordInitTime(MSX_INIT_CACHE_READ, phaseStartMs);
+            MSX.GpuTimingRecord.ptx_cache_read_ms += phaseStartMs;
+        }
     }
     else
     {
         char *specializedSource = NULL;
         char *ros2Source = NULL;
         const char *compileSource = GpuReactCudaSource;
-        timer = MSXgpu_wallTimeMs();
+        if (timing) timer = MSXgpu_wallTimeMs();
         if (MSX.GpuCompiler)
         {
             err = buildSpecializedCudaSource(&specializedSource);
@@ -1707,17 +2235,27 @@ static int ensureModule(void)
         err = compileSourceToPtx(compileSource, arch, solverMacro, modeMacro, cachePath, &ptx, &ptxSize);
         free(ros2Source);
         free(specializedSource);
-        MSX.GpuTimingRecord.nvrtc_compile_ms += MSXgpu_wallTimeMs() - timer;
+        if (timing)
+        {
+            phaseStartMs = MSXgpu_wallTimeMs() - timer;
+            MSXgpu_recordInitTime(MSX_INIT_COMPILE, phaseStartMs);
+            MSX.GpuTimingRecord.nvrtc_compile_ms += phaseStartMs;
+        }
         if (err) return err;
     }
 
-    timer = MSXgpu_wallTimeMs();
+    if (timing) timer = MSXgpu_wallTimeMs();
     err = checkCu(cuModuleLoadData(&GpuModule.module, ptx), ERR_GPU_NVRTC_COMPILE_FAILED);
-    MSX.GpuTimingRecord.cu_module_load_ms += MSXgpu_wallTimeMs() - timer;
+    if (timing)
+    {
+        phaseStartMs = MSXgpu_wallTimeMs() - timer;
+        MSXgpu_recordInitTime(MSX_INIT_MODULE, phaseStartMs);
+        MSX.GpuTimingRecord.cu_module_load_ms += phaseStartMs;
+    }
     free(ptx);
     if (err) return err;
 
-    timer = MSXgpu_wallTimeMs();
+    if (timing) timer = MSXgpu_wallTimeMs();
     if (MSX.GpuSolver == RK5)
     {
         const char *rk5KernelName = "rk5_align_kernel";
@@ -1741,11 +2279,20 @@ static int ensureModule(void)
     if (err) return err;
     err = checkCu(cuModuleGetFunction(&GpuModule.formulaKernel, GpuModule.module, "formula_kernel"), ERR_GPU_KERNEL_LAUNCH_FAILED);
     if (err) return err;
-    MSX.GpuTimingRecord.kernel_lookup_ms += MSXgpu_wallTimeMs() - timer;
+    if (timing)
+    {
+        phaseStartMs = MSXgpu_wallTimeMs() - timer;
+        MSXgpu_recordInitTime(MSX_INIT_MODULE, phaseStartMs);
+        MSX.GpuTimingRecord.kernel_lookup_ms += phaseStartMs;
+    }
     GpuModule.ready = 1;
     GpuModule.solver = MSX.GpuSolver;
     GpuModule.rk5Mode = MSX.GpuRk5Mode;
-    MSX.GpuTimingRecord.jit_ms += MSXgpu_wallTimeMs() - startMs;
+    if (timing)
+    {
+        phaseStartMs = MSXgpu_wallTimeMs() - startMs;
+        MSX.GpuTimingRecord.jit_ms += phaseStartMs;
+    }
     return 0;
 }
 
@@ -1831,10 +2378,12 @@ static int buildPrograms(GpuInstrHost **instr, int *nInstr,
     return 0;
 }
 
-static double eventElapsedMs(CUevent start, CUevent stop)
+/* Read a completed event pair without introducing another wait.  Detail-mode
+   event pairs are consumed only after the dispatch's existing completion
+   synchronize, so timing cannot serialize the kernels it measures. */
+static double eventReadElapsedMs(CUevent start, CUevent stop)
 {
     float ms = 0.0f;
-    cuEventSynchronize(stop);
     cuEventElapsedTime(&ms, start, stop);
     return (double)ms;
 }
@@ -1857,8 +2406,14 @@ void MSXgpu_closeResidentPrograms(void)
     RP_FREE_D(d_params); RP_FREE_D(d_consts); RP_FREE_D(d_linkDiam); RP_FREE_D(d_instr);
     RP_FREE_D(d_speciesProg); RP_FREE_D(d_termProg); RP_FREE_D(d_err);
 #undef RP_FREE_D
-    if (ResidentProgram.evStart) cuEventDestroy(ResidentProgram.evStart);
-    if (ResidentProgram.evStop) cuEventDestroy(ResidentProgram.evStop);
+    {
+        int i;
+        for (i = 0; i < 3; i++)
+        {
+            if (ResidentProgram.evStart[i]) cuEventDestroy(ResidentProgram.evStart[i]);
+            if (ResidentProgram.evStop[i]) cuEventDestroy(ResidentProgram.evStop[i]);
+        }
+    }
     free(ResidentProgram.rateSpecies); free(ResidentProgram.eqSpecies);
     free(ResidentProgram.formulaSpecies); free(ResidentProgram.speciesType);
     free(ResidentProgram.rateAtol); free(ResidentProgram.rateRtol); free(ResidentProgram.params);
@@ -1888,7 +2443,17 @@ int MSXgpu_openResidentPrograms(void)
     RP_ALLOC_COPY(d_rateAtol,ResidentProgram.rateAtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateRtol,ResidentProgram.rateRtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateSpecies,ResidentProgram.rateSpecies,(rateCount+1)*sizeof(int)); RP_ALLOC_COPY(d_eqSpecies,ResidentProgram.eqSpecies,(eqCount+1)*sizeof(int)); RP_ALLOC_COPY(d_formulaSpecies,ResidentProgram.formulaSpecies,(formulaCount+1)*sizeof(int)); RP_ALLOC_COPY(d_speciesType,ResidentProgram.speciesType,(nSpecies+1)*sizeof(int)); RP_ALLOC_COPY(d_params,ResidentProgram.params,(size_t)(nLinks+1)*(nParams+1)*sizeof(double)); RP_ALLOC_COPY(d_consts,ResidentProgram.consts,(nConsts+1)*sizeof(double)); RP_ALLOC_COPY(d_linkDiam,ResidentProgram.linkDiam,(nLinks+1)*sizeof(double)); RP_ALLOC_COPY(d_instr,ResidentProgram.instr,(nInstr?nInstr:1)*sizeof(GpuInstrHost)); RP_ALLOC_COPY(d_speciesProg,ResidentProgram.speciesProg,(nSpecies+1)*sizeof(GpuProgramHost)); RP_ALLOC_COPY(d_termProg,ResidentProgram.termProg,(MSX.Nobjects[TERM]+1)*sizeof(GpuProgramHost));
 #undef RP_ALLOC_COPY
     err=checkCu(cuMemAlloc(&ResidentProgram.d_err,sizeof(zeroErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(cuMemcpyHtoD(ResidentProgram.d_err,&zeroErr,sizeof(zeroErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
-    err=checkCu(cuEventCreate(&ResidentProgram.evStart,CU_EVENT_DEFAULT),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(cuEventCreate(&ResidentProgram.evStop,CU_EVENT_DEFAULT),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+    /* Completion is provided by the stream/context synchronize below.  These
+       events exist only for detail-mode device timing. */
+    if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM))
+    {
+        int i;
+        for (i = 0; i < 3; i++)
+        {
+            err=checkCu(cuEventCreate(&ResidentProgram.evStart[i],CU_EVENT_DEFAULT),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+            err=checkCu(cuEventCreate(&ResidentProgram.evStop[i],CU_EVENT_DEFAULT),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+        }
+    }
     ResidentProgram.ready=1; ResidentProgram.allocCount++; return 0;
 fail: MSXgpu_closeResidentPrograms(); return err;
 }
@@ -1903,17 +2468,18 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
     int err = 0, finishNeeded = 0, nLinks = MSX.Nobjects[LINK];
     int nSpecies = MSX.Nobjects[SPECIES], nParams = MSX.Nobjects[PARAMETER];
     int nConsts = MSX.Nobjects[CONSTANT], rateCount = 0, eqCount = 0, formulaCount = 0;
-    int m, k, nInstr = 0, block = 128, grid, lastSpecies, lastTerm, lastParam, lastConst;
+    int m, nInstr = 0, block = 128, grid, lastSpecies, lastTerm, lastParam, lastConst;
     int *rateSpecies = NULL, *eqSpecies = NULL, *formulaSpecies = NULL, *speciesType = NULL;
     double *rateAtol = NULL, *rateRtol = NULL, *params = NULL, *consts = NULL, *linkDiam = NULL;
     GpuInstrHost *instr = NULL; GpuProgramHost *speciesProg = NULL, *termProg = NULL;
     CUdeviceptr d_rateAtol = 0, d_rateRtol = 0, d_rateSpecies = 0, d_eqSpecies = 0, d_formulaSpecies = 0, d_speciesType = 0;
     CUdeviceptr d_params = 0, d_consts = 0, d_linkDiam = 0, d_instr = 0, d_speciesProg = 0, d_termProg = 0, d_err = 0;
-    CUevent evStart = NULL, evStop = NULL;
     GpuErrorHost gpuErr;
     MSXResidentGpuDeviceView view;
     MSXResidentGpuReactResult finished;
-    double tstep, areaUcf, lperFt3, transferTimer, odeMs = 0.0, equilMs = 0.0, formulaMs = 0.0;
+    double tstep, areaUcf, lperFt3, transferTimer = 0.0, odeMs = 0.0, equilMs = 0.0, formulaMs = 0.0;
+    int stage = MSXgpu_profileStageEnabled();
+    int detail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM);
 
     if (result) memset(result, 0, sizeof(*result));
     if (!resident || !batch || (!batch->item && batch->itemCount)) return ERR_GPU_UNSUPPORTED_FEATURE;
@@ -1935,15 +2501,20 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
     MSX.GpuTimingRecord.equil_gpu = (MSX.GpuEquil != 0);
     MSX.GpuTimingRecord.formula_gpu = (MSX.GpuFormula != 0);
     {
-        transferTimer = MSXgpu_wallTimeMs();
+        MSXresidentGpu_setDiagnosticMode(resident,
+            MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC));
+        if (stage) transferTimer = MSXgpu_wallTimeMs();
         MSXResidentStatus residentStatus = MSXresidentGpu_prepareActive(resident, batch, &view, NULL);
-        MSX.GpuTimingRecord.resident_active_h2d_ms += MSXgpu_wallTimeMs() - transferTimer;
+        if (stage) MSX.GpuTimingRecord.resident_active_h2d_ms += MSXgpu_wallTimeMs() - transferTimer;
         if (residentStatus != MSX_RESIDENT_OK)
         {
             err = mapResidentStatus(residentStatus);
             setGpuError(err, GPU_STAGE_NONE, -1, -1, -1, -1, -1, (double)residentStatus);
             return err;
         }
+        if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC))
+            MSXgpu_profileRecordHyd((uint64_t)batch->itemCount *
+                                    MSX_RESIDENT_HYD_STRIDE * sizeof(double), 1);
     }
     finishNeeded = 1;
     if (view.speciesStride != (uint32_t)(nSpecies + 1) || view.hydStride != MAX_HYD_VARS)
@@ -1992,27 +2563,44 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBa
         void *ros2Args[]={&nSeg,&nSpecies,&rateCount,&tstep,&d_segPipe,&d_segRow,&d_segVol,&d_hstep,&d_rateAtol,&d_rateRtol,&d_rateSpecies,&d_speciesType,&d_linkDiam,&areaUcf,&lperFt3,&d_c,&d_cOde,&d_reacted,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_nf,&d_nj,&d_na,&d_nr,&d_lh,&d_re,&d_err};
         void *equilArgs[]={&nSeg,&nSpecies,&eqCount,&d_segPipe,&d_segRow,&d_eqSpecies,&d_c,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_err};
         void *formulaArgs[]={&nSeg,&nSpecies,&formulaCount,&d_segPipe,&d_segRow,&d_formulaSpecies,&d_c,&d_params,&paramStride,&d_consts,&d_hyd,&hStride,&d_speciesProg,&d_termProg,&d_instr,&lastSpecies,&lastTerm,&lastParam,&lastConst,&d_err};
-        evStart=ResidentProgram.evStart; evStop=ResidentProgram.evStop;
-        cuEventRecord(evStart,0); err=checkCu(cuLaunchKernel(GpuModule.ros2Kernel,grid,1,1,block,1,1,0,0,ros2Args,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED); if(err)goto cleanup; cuEventRecord(evStop,0); odeMs=eventElapsedMs(evStart,evStop);
-        if(eqCount){cuEventRecord(evStart,0);err=checkCu(cuLaunchKernel(GpuModule.equilKernel,grid,1,1,block,1,1,0,0,equilArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err)goto cleanup;cuEventRecord(evStop,0);equilMs=eventElapsedMs(evStart,evStop);}
-        if(formulaCount){cuEventRecord(evStart,0);err=checkCu(cuLaunchKernel(GpuModule.formulaKernel,grid,1,1,block,1,1,0,0,formulaArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err)goto cleanup;cuEventRecord(evStop,0);formulaMs=eventElapsedMs(evStart,evStop);}
+        if (detail) cuEventRecord(ResidentProgram.evStart[0],0);
+        err=checkCu(cuLaunchKernel(GpuModule.ros2Kernel,grid,1,1,block,1,1,0,0,ros2Args,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED); if(err)goto cleanup;
+        if (detail) cuEventRecord(ResidentProgram.evStop[0],0);
+        if(eqCount){if (detail) cuEventRecord(ResidentProgram.evStart[1],0);err=checkCu(cuLaunchKernel(GpuModule.equilKernel,grid,1,1,block,1,1,0,0,equilArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err)goto cleanup;if (detail) cuEventRecord(ResidentProgram.evStop[1],0);}
+        if(formulaCount){if (detail) cuEventRecord(ResidentProgram.evStart[2],0);err=checkCu(cuLaunchKernel(GpuModule.formulaKernel,grid,1,1,block,1,1,0,0,formulaArgs,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);if(err)goto cleanup;if (detail) cuEventRecord(ResidentProgram.evStop[2],0);}
         err=checkCu(cuCtxSynchronize(),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto cleanup;
+        if (detail)
+        {
+            odeMs = eventReadElapsedMs(ResidentProgram.evStart[0], ResidentProgram.evStop[0]);
+            if (eqCount) equilMs = eventReadElapsedMs(ResidentProgram.evStart[1], ResidentProgram.evStop[1]);
+            if (formulaCount) formulaMs = eventReadElapsedMs(ResidentProgram.evStart[2], ResidentProgram.evStop[2]);
+        }
         err=checkCu(cuMemcpyDtoH(&gpuErr,d_err,sizeof(gpuErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto cleanup;
         if(gpuErr.code){setGpuError(gpuErr.code,gpuErr.stage,gpuErr.sid,gpuErr.pipe,gpuErr.species,gpuErr.expr,gpuErr.iter,gpuErr.value);err=gpuErr.code;goto cleanup;}
     }
     memset(&finished,0,sizeof(finished));
-    { MSXResidentStatus residentStatus; transferTimer=MSXgpu_wallTimeMs();
+    { MSXResidentStatus residentStatus; if(stage) transferTimer=MSXgpu_wallTimeMs();
       residentStatus=MSXresidentGpu_finishActive(resident,&finished);
-      MSX.GpuTimingRecord.resident_diag_d2h_hstep_ms+=MSXgpu_wallTimeMs()-transferTimer;
+      if(stage) MSX.GpuTimingRecord.resident_diag_d2h_hstep_ms+=MSXgpu_wallTimeMs()-transferTimer;
       if(residentStatus!=MSX_RESIDENT_OK){err=mapResidentStatus(residentStatus);finishNeeded=0;setGpuError(err,GPU_STAGE_NONE,-1,-1,-1,-1,-1,(double)residentStatus);goto cleanup;} } finishNeeded=0;
     finished.ros2Ms=odeMs; finished.equilMs=equilMs; finished.formulaMs=formulaMs;
+    if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC))
+    {
+        /* finishActive currently returns the legacy per-active solver arrays
+           plus the reacted quality payload.  Keep the two transfers distinct
+           so S5c-1 can prove exactly which bytes it removes. */
+        MSXgpu_profileRecordDiagnostic((uint64_t)batch->itemCount *
+            (sizeof(double) + 4u * sizeof(uint32_t)) + sizeof(int), 6);
+        MSXgpu_profileRecordReacted((uint64_t)(MSX.Nobjects[LINK] + 1) *
+            (uint64_t)(MSX.Nobjects[SPECIES] + 1) * sizeof(double), 1);
+    }
     if(result)*result=finished;
     MSX.GpuTimingRecord.react_ode_ms+=odeMs; MSX.GpuTimingRecord.react_equil_ms+=equilMs; MSX.GpuTimingRecord.react_formula_ms+=formulaMs;
-    if (MSX.GpuTimingDetail) { MSX.GpuTimingRecord.ros2_nfcn += finished.ros2Nfcn; MSX.GpuTimingRecord.ros2_njac += finished.ros2Njac; MSX.GpuTimingRecord.ros2_naccept += finished.ros2Naccept; MSX.GpuTimingRecord.ros2_nreject += finished.ros2Nreject; if (finished.ros2LastHstep != 0.0) MSX.GpuTimingRecord.ros2_last_hstep = finished.ros2LastHstep; }
+    if (detail) { MSX.GpuTimingRecord.ros2_nfcn += finished.ros2Nfcn; MSX.GpuTimingRecord.ros2_njac += finished.ros2Njac; MSX.GpuTimingRecord.ros2_naccept += finished.ros2Naccept; MSX.GpuTimingRecord.ros2_nreject += finished.ros2Nreject; if (finished.ros2LastHstep != 0.0) MSX.GpuTimingRecord.ros2_last_hstep = finished.ros2LastHstep; }
     if (finished.ros2Error && !MSX.GpuTimingRecord.ros2_error_code) MSX.GpuTimingRecord.ros2_error_code = finished.ros2Error;
 cleanup:
     if(finishNeeded) MSXresidentGpu_abortActive(resident);
-    if(!ResidentProgram.ready) { if(evStart)cuEventDestroy(evStart);if(evStop)cuEventDestroy(evStop);if(d_rateAtol)cuMemFree(d_rateAtol);if(d_rateRtol)cuMemFree(d_rateRtol);if(d_rateSpecies)cuMemFree(d_rateSpecies);if(d_eqSpecies)cuMemFree(d_eqSpecies);if(d_formulaSpecies)cuMemFree(d_formulaSpecies);if(d_speciesType)cuMemFree(d_speciesType);if(d_params)cuMemFree(d_params);if(d_consts)cuMemFree(d_consts);if(d_linkDiam)cuMemFree(d_linkDiam);if(d_instr)cuMemFree(d_instr);if(d_speciesProg)cuMemFree(d_speciesProg);if(d_termProg)cuMemFree(d_termProg);if(d_err)cuMemFree(d_err);
+    if(!ResidentProgram.ready) { if(d_rateAtol)cuMemFree(d_rateAtol);if(d_rateRtol)cuMemFree(d_rateRtol);if(d_rateSpecies)cuMemFree(d_rateSpecies);if(d_eqSpecies)cuMemFree(d_eqSpecies);if(d_formulaSpecies)cuMemFree(d_formulaSpecies);if(d_speciesType)cuMemFree(d_speciesType);if(d_params)cuMemFree(d_params);if(d_consts)cuMemFree(d_consts);if(d_linkDiam)cuMemFree(d_linkDiam);if(d_instr)cuMemFree(d_instr);if(d_speciesProg)cuMemFree(d_speciesProg);if(d_termProg)cuMemFree(d_termProg);if(d_err)cuMemFree(d_err);
     free(params);free(consts);free(linkDiam);free(rateSpecies);free(rateAtol);free(rateRtol);free(eqSpecies);free(formulaSpecies);free(speciesType);free(instr);free(speciesProg);free(termProg); }
     if(err)setGpuError(err,GPU_STAGE_NONE,-1,-1,-1,-1,-1,0.0); return err;
 }
@@ -2150,15 +2738,17 @@ int MSXgpu_reactPipeSegments(double dt)
     GpuInstrHost *instr = NULL;
     GpuProgramHost *speciesProg = NULL, *termProg = NULL;
     int nInstr = 0;
-    double timer;
+    double timer = 0.0;
     int k, m;
+    int timing = MSXgpu_profileStageEnabled();
+    int detail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM);
     CUdeviceptr d_segPipe = 0, d_segRow = 0, d_segVol = 0, d_hstep = 0, d_rateAtol = 0, d_rateRtol = 0, d_rateSpecies = 0, d_eqSpecies = 0, d_formulaSpecies = 0, d_speciesType = 0;
     CUdeviceptr d_activeLink = 0, d_pipeSegOffset = 0, d_pipeSegCount = 0;
     CUdeviceptr d_c = 0, d_cOde = 0, d_hyd = 0, d_params = 0, d_consts = 0, d_linkDiam = 0, d_reacted = 0;
     CUdeviceptr d_instr = 0, d_speciesProg = 0, d_termProg = 0, d_err = 0;
     CUdeviceptr d_rk5Nfcn = 0, d_rk5Naccpt = 0, d_rk5Nrejct = 0, d_rk5LastHstep = 0, d_rk5Err = 0;
     CUdeviceptr d_ros2Nfcn = 0, d_ros2Njac = 0, d_ros2Naccept = 0, d_ros2Nreject = 0, d_ros2LastHstep = 0, d_ros2Err = 0;
-    CUevent evStart = NULL, evStop = NULL;
+    CUevent evStart[3] = { NULL, NULL, NULL }, evStop[3] = { NULL, NULL, NULL };
     GpuErrorHost gpuErr;
     MSXReactTransferView transfer;
 
@@ -2176,7 +2766,7 @@ int MSXgpu_reactPipeSegments(double dt)
     err = ensureReactTransfer();
     if (err) return err;
 
-    timer = MSXgpu_wallTimeMs();
+    if (timing) timer = MSXgpu_wallTimeMs();
     for (m = 1; m <= nSpecies; m++)
     {
         if (MSX.Species[m].pipeExprType == RATE) rateCount++;
@@ -2232,23 +2822,26 @@ int MSXgpu_reactPipeSegments(double dt)
     nSeg = transfer.nSeg;
     if (!transfer.ringResident && MSX.GpuSolver == RK5 && MSX.GpuRk5Mode == GPU_RK5_FAST_BUCKET)
     {
-        double reorderStart = MSXgpu_wallTimeMs();
+        double reorderStart = detail ? MSXgpu_wallTimeMs() : 0.0;
         err = reorderSegmentsForRk5Fast(nSeg, nSpecies, dt / MSX.Ucf[RATE_UNITS],
                                         transfer.segPipe, transfer.segVol, transfer.hstep, transfer.segPtrs,
                                         transfer.unpackOrder, transfer.c, transfer.cOde, transfer.hyd,
                                         rk5BucketOffset, rk5BucketCount, &rk5BucketMaxSize,
                                         &rk5DidReorder);
-        MSX.GpuTimingRecord.rk5_fast_mode = 1;
-        MSX.GpuTimingRecord.rk5_bucket_count += RK5_FAST_BUCKETS;
-        MSX.GpuTimingRecord.rk5_bucket_max_size =
-            (double)MAX((int)MSX.GpuTimingRecord.rk5_bucket_max_size, rk5BucketMaxSize);
-        if (rk5DidReorder)
+        if (detail)
+        {
+            MSX.GpuTimingRecord.rk5_fast_mode = 1;
+            MSX.GpuTimingRecord.rk5_bucket_count += RK5_FAST_BUCKETS;
+            MSX.GpuTimingRecord.rk5_bucket_max_size =
+                (double)MAX((int)MSX.GpuTimingRecord.rk5_bucket_max_size, rk5BucketMaxSize);
+        }
+        if (detail && rk5DidReorder)
             MSX.GpuTimingRecord.rk5_bucket_reorder_ms += MSXgpu_wallTimeMs() - reorderStart;
         if (err) goto cleanup;
     }
     err = buildPrograms(&instr, &nInstr, &speciesProg, &termProg);
     if (err) goto cleanup;
-    MSX.GpuTimingRecord.react_pack_ms += MSXgpu_wallTimeMs() - timer;
+    if (timing) MSX.GpuTimingRecord.react_pack_ms += MSXgpu_wallTimeMs() - timer;
 
     memset(&gpuErr, 0, sizeof(gpuErr));
     err = MSXreactTransfer_upload(&transfer, &gpuErr, sizeof(gpuErr));
@@ -2277,7 +2870,7 @@ int MSXgpu_reactPipeSegments(double dt)
     d_ros2LastHstep = (CUdeviceptr)transfer.d_ros2LastHstep;
     d_err = (CUdeviceptr)transfer.d_err;
 
-    timer = MSXgpu_wallTimeMs();
+    if (timing) timer = MSXgpu_wallTimeMs();
 #define GPU_ALLOC_COPY(ptr, host, bytes) do { err = checkCu(cuMemAlloc(&(ptr), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; err = checkCu(cuMemcpyHtoD((ptr), (host), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; } while (0)
     GPU_ALLOC_COPY(d_rateAtol, rateAtol, (rateCount + 1) * sizeof(double));
     GPU_ALLOC_COPY(d_rateRtol, rateRtol, (rateCount + 1) * sizeof(double));
@@ -2292,7 +2885,7 @@ int MSXgpu_reactPipeSegments(double dt)
     GPU_ALLOC_COPY(d_speciesProg, speciesProg, (nSpecies + 1) * sizeof(GpuProgramHost));
     GPU_ALLOC_COPY(d_termProg, termProg, (MSX.Nobjects[TERM] + 1) * sizeof(GpuProgramHost));
 #undef GPU_ALLOC_COPY
-    MSX.GpuTimingRecord.h2d_ms += MSXgpu_wallTimeMs() - timer;
+    if (timing) MSX.GpuTimingRecord.h2d_ms += MSXgpu_wallTimeMs() - timer;
 
     if (nSeg > 0)
     {
@@ -2341,9 +2934,16 @@ int MSXgpu_reactPipeSegments(double dt)
             &d_params, &paramStride, &d_consts, &d_hyd, &hStride, &d_speciesProg, &d_termProg,
             &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst, &d_err };
 
-        cuEventCreate(&evStart, CU_EVENT_DEFAULT);
-        cuEventCreate(&evStop, CU_EVENT_DEFAULT);
-        cuEventRecord(evStart, 0);
+        if (detail)
+        {
+            int i;
+            for (i = 0; i < 3; i++)
+            {
+                cuEventCreate(&evStart[i], CU_EVENT_DEFAULT);
+                cuEventCreate(&evStop[i], CU_EVENT_DEFAULT);
+            }
+            cuEventRecord(evStart[0], 0);
+        }
         if (!transfer.ringResident && MSX.GpuSolver == RK5 && MSX.GpuRk5Mode == GPU_RK5_FAST_BUCKET &&
             rk5BucketMaxSize < (int)(0.80 * (double)nSeg))
         {
@@ -2411,7 +3011,7 @@ int MSXgpu_reactPipeSegments(double dt)
                                              rk5BucketArgs, NULL),
                               ERR_GPU_KERNEL_LAUNCH_FAILED);
                 if (err) goto cleanup;
-                MSX.GpuTimingRecord.rk5_bucket_launches += 1.0;
+                if (detail) MSX.GpuTimingRecord.rk5_bucket_launches += 1.0;
             }
         }
         else if (usePipeWarp)
@@ -2437,38 +3037,52 @@ int MSXgpu_reactPipeSegments(double dt)
                           ERR_GPU_KERNEL_LAUNCH_FAILED);
             if (err) goto cleanup;
             if (MSX.GpuSolver == RK5 && MSX.GpuRk5Mode == GPU_RK5_FAST_BUCKET)
-                MSX.GpuTimingRecord.rk5_bucket_launches += 1.0;
+                if (detail) MSX.GpuTimingRecord.rk5_bucket_launches += 1.0;
         }
-        cuEventRecord(evStop, 0);
-        MSX.GpuTimingRecord.react_ode_ms += eventElapsedMs(evStart, evStop);
+        if (detail)
+        {
+            cuEventRecord(evStop[0], 0);
+        }
 
         if (eqCount > 0)
         {
-            cuEventRecord(evStart, 0);
+            if (detail) cuEventRecord(evStart[1], 0);
             err = checkCu(cuLaunchKernel(GpuModule.equilKernel, grid, 1, 1, block, 1, 1, 0, 0, equilArgs, NULL),
                           ERR_GPU_KERNEL_LAUNCH_FAILED);
             if (err) goto cleanup;
-            cuEventRecord(evStop, 0);
-            MSX.GpuTimingRecord.react_equil_ms += eventElapsedMs(evStart, evStop);
+            if (detail)
+            {
+                cuEventRecord(evStop[1], 0);
+            }
         }
 
         if (formulaCount > 0)
         {
-            cuEventRecord(evStart, 0);
+            if (detail) cuEventRecord(evStart[2], 0);
             err = checkCu(cuLaunchKernel(GpuModule.formulaKernel, grid, 1, 1, block, 1, 1, 0, 0, formulaArgs, NULL),
                           ERR_GPU_KERNEL_LAUNCH_FAILED);
             if (err) goto cleanup;
-            cuEventRecord(evStop, 0);
-            MSX.GpuTimingRecord.react_formula_ms += eventElapsedMs(evStart, evStop);
+            if (detail)
+            {
+                cuEventRecord(evStop[2], 0);
+            }
         }
         err = checkCu(cuCtxSynchronize(), ERR_GPU_KERNEL_RUNTIME_ERROR);
         if (err) goto cleanup;
+        if (detail)
+        {
+            MSX.GpuTimingRecord.react_ode_ms += eventReadElapsedMs(evStart[0], evStop[0]);
+            if (eqCount > 0)
+                MSX.GpuTimingRecord.react_equil_ms += eventReadElapsedMs(evStart[1], evStop[1]);
+            if (formulaCount > 0)
+                MSX.GpuTimingRecord.react_formula_ms += eventReadElapsedMs(evStart[2], evStop[2]);
+        }
     }
 
     err = MSXreactTransfer_download(&transfer, &gpuErr, sizeof(gpuErr));
     if (err) goto cleanup;
 
-    if (MSX.GpuSolver == RK5 && MSX.GpuTimingDetail)
+    if (MSX.GpuSolver == RK5 && detail)
     {
         for (sid = 0; sid < nSeg; sid++)
         {
@@ -2484,7 +3098,7 @@ int MSXgpu_reactPipeSegments(double dt)
     {
         for (sid = 0; sid < nSeg; sid++)
         {
-            if (MSX.GpuTimingDetail)
+            if (detail)
             {
                 MSX.GpuTimingRecord.ros2_nfcn += transfer.ros2Nfcn[sid];
                 MSX.GpuTimingRecord.ros2_njac += transfer.ros2Njac[sid];
@@ -2519,8 +3133,14 @@ int MSXgpu_reactPipeSegments(double dt)
     if (err) goto cleanup;
 
 cleanup:
-    if (evStart) cuEventDestroy(evStart);
-    if (evStop) cuEventDestroy(evStop);
+    {
+        int i;
+        for (i = 0; i < 3; i++)
+        {
+            if (evStart[i]) cuEventDestroy(evStart[i]);
+            if (evStop[i]) cuEventDestroy(evStop[i]);
+        }
+    }
     if (d_rateAtol) cuMemFree(d_rateAtol);
     if (d_rateRtol) cuMemFree(d_rateRtol);
     if (d_rateSpecies) cuMemFree(d_rateSpecies);

@@ -16,6 +16,7 @@
 #include <limits.h>
 
 #include "msxsegment_profile.h"
+#include "msxgpu.h"
 #include "msxtypes.h"
 #include "msxsegment_storage.h"
 #include "epanet2.h"
@@ -141,6 +142,16 @@ static ProfileState P = {0};
 static int profile_requested(void)
 {
     const char *value = getenv("MSX_SEGMENT_PROFILE");
+    /* Segment profiling is a detail-level diagnostic.  Keep the legacy
+       environment switch, but let the unified profile mode close it for
+       off/stage runs before any optional buffers or files are created. */
+    if (!MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM)) return 0;
+    if (!value || !value[0]) return 0;
+    if (strcmp(value, "0") == 0 || strcmp(value, "OFF") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "FALSE") == 0 ||
+        strcmp(value, "false") == 0 || strcmp(value, "NO") == 0 ||
+        strcmp(value, "no") == 0)
+        return 0;
     return value && (strcmp(value, "1") == 0 ||
                      strcmp(value, "YES") == 0 ||
                      strcmp(value, "yes") == 0 ||

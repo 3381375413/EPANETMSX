@@ -742,9 +742,9 @@ int parseOption()
           else if ( option == GPU_ODE_OPTION ) MSX.GpuOde = k;
           else if ( option == GPU_EQUIL_OPTION ) MSX.GpuEquil = k;
           else if ( option == GPU_FORMULA_OPTION ) MSX.GpuFormula = k;
-          else if ( option == GPU_TIMING_OPTION ) MSX.GpuTiming = k;
-          else if ( option == GPU_TIMING_DETAIL_OPTION ) MSX.GpuTimingDetail = k;
-          else MSX.CpuTiming = k;
+          else if ( option == GPU_TIMING_OPTION ) { MSX.GpuTiming = k; MSX.GpuTimingConfigured = TRUE; }
+          else if ( option == GPU_TIMING_DETAIL_OPTION ) { MSX.GpuTimingDetail = k; MSX.GpuTimingDetailConfigured = TRUE; }
+          else { MSX.CpuTiming = k; MSX.CpuTimingConfigured = TRUE; }
           break;
 
       case GPU_REACT_SCOPE_OPTION:

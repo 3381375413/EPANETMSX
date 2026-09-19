@@ -10,13 +10,14 @@
 
 extern MSXproject MSX;
 
-typedef struct { int opened, resident, dispatchReady, handoffReady; MSXResidentGpu *gpu;
+typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; MSXResidentGpu *gpu;
     uint64_t wouldDescriptors, wouldSlots, stale, fallbacks; MSXResidentStatus lastStatus;
     MSXResidentActiveRow *rows,*activeRows; MSXResidentActiveItem *active;
     MSXResidentGpuActiveSyncRow *sync; MSXResidentPayload *payload; uint32_t activeCap, stride;
     MSXResidentHandoffPlan *plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *out;
     double *c,*lastc; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
     uint32_t *offset; uint32_t itemCap, itemCount;
+    double handoffPlanMs;
     char status[96], resolvedCapacity[MAXFNAME]; } Runtime;
 static Runtime R;
 
@@ -138,7 +139,18 @@ int MSXresidentRuntime_preHybridInit(void)
     if(MSXgpu_prepareResidentContext()){MSXresidentRuntime_close();return fail(MSX_RESIDENT_ERR_GPU,"pre_context");}
     s=MSXresidentGpu_open(&o,&R.gpu);
     if(s==MSX_RESIDENT_OK && initialFault("initial_upload")) s=MSX_RESIDENT_ERR_TRANSFER;
-    if(s==MSX_RESIDENT_OK){double t=MSXgpu_wallTimeMs();s=MSXresidentGpu_initialUpload(R.gpu,&b);MSX.GpuTimingRecord.resident_initial_upload_ms+=MSXgpu_wallTimeMs()-t;}
+    if(s==MSX_RESIDENT_OK)
+    {
+        double t=0.0, elapsed=0.0;
+        if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
+        s=MSXresidentGpu_initialUpload(R.gpu,&b);
+        if (MSXgpu_profileStageEnabled())
+        {
+            elapsed=MSXgpu_wallTimeMs()-t;
+            MSXgpu_recordInitTime(MSX_INIT_INITIAL_UPLOAD,elapsed);
+            MSX.GpuTimingRecord.resident_initial_upload_ms+=elapsed;
+        }
+    }
     if(s!=MSX_RESIDENT_OK){MSXresidentRuntime_close();return fail(s,"pre_initial_upload");}
     /* This seam represents a failed post-upload initial-image apply/sync.
        No CPU topology is published on either side of this boundary. */
@@ -185,11 +197,37 @@ int MSXresidentRuntime_flushPatches(void)
     R.wouldDescriptors+=b.descriptorCount; R.wouldSlots+=b.slotCount;
     if (!b.descriptorCount && !b.slotCount) return 0;
     if (!R.resident) { MSXresident_clearPatches(); return 0; }
-    { double t=MSXgpu_wallTimeMs(); s=MSXresidentGpu_applyPatches(R.gpu,&b);
-      MSX.GpuTimingRecord.resident_patch_h2d_ms+=MSXgpu_wallTimeMs()-t; }
+    { double t=0.0; if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
+      s=MSXresidentGpu_applyPatches(R.gpu,&b);
+      if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.resident_patch_h2d_ms+=MSXgpu_wallTimeMs()-t; }
     if (s!=MSX_RESIDENT_OK) { R.stale++; return fail(s,"patch_apply"); }
+    MSXgpu_profileRecordPatch(b.descriptorCount, b.slotCount,
+                              (uint64_t)b.descriptorCount * sizeof(*b.descriptor) +
+                              (uint64_t)b.slotCount * sizeof(*b.slot), 1,
+                              R.patchClass);
     MSXresident_clearPatches(); return 0;
 }
+
+MSXResidentStatus MSXresidentRuntime_reduce(double *massBySpecies,
+                                            uint32_t massCount,
+                                            MSXResidentGpuReduction *reduction)
+{
+    MSXResidentStatus s;
+    if (!R.resident || !R.gpu) return MSX_RESIDENT_DISABLED;
+    if (!massBySpecies || !reduction || massCount < R.stride)
+        return MSX_RESIDENT_ERR_ARGUMENT;
+    /* A transport step may have published a new Core/boundary split without
+       reaching the outer flush point (notably the final quality step).  The
+       consumer must never read a pre-patch aggregate. */
+    if (MSXresidentRuntime_flushPatches()) return R.lastStatus;
+    s = MSXresidentGpu_reduce(R.gpu, massBySpecies, massCount, reduction);
+    if (s != MSX_RESIDENT_OK) {
+        fail(s, "aggregate_reduce");
+        return s;
+    }
+    return MSX_RESIDENT_OK;
+}
+
 void MSXresidentRuntime_close(void)
 {
     /* Same CUDA context: destroy dependent program objects before its mirror. */
@@ -206,6 +244,7 @@ int MSXresidentRuntime_isResident(void) { return R.resident; }
 int MSXresidentRuntime_reactReady(void) { return R.resident && R.dispatchReady; }
 int MSXresidentRuntime_handoffReady(void) { return R.resident && R.handoffReady; }
 int MSXresidentRuntime_linkFallback(int k) { return R.resident && k>0 && R.fallback && R.fallback[k]; }
+void MSXresidentRuntime_markRebalance(void) { R.patchClass = 1; }
 /* Keep Resident transport displacement identical to CPU Advect: one quality
    step can displace no more than a pipe's physical volume.  Compare before
    multiplying when possible so a pathological high flow cannot overflow
@@ -225,21 +264,151 @@ static double handoffDisplacement(int k, double q, double dt, int *wholePipe)
     return aq * dt;
 }
 static double boundaryVolume(int k){double v=0;Pseg s=MSX.FirstSeg[k];while(s&&!MSXsegStorage_isHybridCoreSegment(s)){v+=s->v;s=s->prev;}return v;}
-static int materializePlan(int k, MSXResidentHandoffPlan *p){MSXResidentGpuFetchOutput f;MSXResidentStatus z;uint32_t o=R.offset[k];double t=MSXgpu_wallTimeMs();memset(&f,0,sizeof(f));f.meta=R.out+o;f.cOut=R.c+(size_t)o*R.stride;f.lastcOut=R.lastc+(size_t)o*R.stride;f.stride=R.stride;z=MSXresidentGpu_fetchHandoffs(R.gpu,p,&f,p->itemCount);if(z!=MSX_RESIDENT_OK)return fail(z,"fallback_fetch");z=MSXresident_prepareHandoffTransaction(p,f.meta,p->itemCount,&R.tx[k]);if(z!=MSX_RESIDENT_OK)return fail(z,"fallback_prepare");z=MSXresident_validateHandoffTransactions(&R.tx[k],1);if(z!=MSX_RESIDENT_OK){MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"fallback_final_validate");}MSXresident_commitHandoffTransaction(&R.tx[k]);if(MSXresidentRuntime_flushPatches()){R.dispatchReady=0;return MSX.ErrCode;}MSX.GpuTimingRecord.resident_handoff_ms+=MSXgpu_wallTimeMs()-t;return 0;}
-int MSXresidentRuntime_beginStep(double dt){uint32_t k,off=0;MSXResidentStatus z;if(!R.resident)return 0;if(dt<0.0)return fail(MSX_RESIDENT_ERR_ARGUMENT,"handoff_plan");R.handoffReady=0;R.itemCount=0;memset(R.plan,0,((size_t)MSX.Nobjects[LINK]+1)*sizeof(*R.plan));memset(R.fallback,0,(size_t)MSX.Nobjects[LINK]+1);memset(R.tx,0,((size_t)MSX.Nobjects[LINK]+1)*sizeof(*R.tx));if(MSXresidentRuntime_flushPatches())return MSX.ErrCode;for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++){int wholePipe;double displacement=handoffDisplacement((int)k,MSX.Q[k],dt,&wholePipe);R.offset[k]=off;z=wholePipe?MSXresident_planAllHandoffInto(k,0,R.item+off,R.itemCap-off,&R.plan[k]):MSXresident_planHandoffInto(k,displacement,1.0,0,boundaryVolume(k),MSX.GpuStrict,R.item+off,R.itemCap-off,&R.plan[k]);/* A request can consume the complete resident Core before it reaches
-           LINKVOL because the two CPU boundary bands are not resident.  This
-           is a whole-Core handoff, not a capacity violation: plan every slot
-           once and retain strict failure only if that fixed range cannot fit. */if(z==MSX_RESIDENT_ERR_CAPACITY)z=MSXresident_planAllHandoffInto(k,0,R.item+off,R.itemCap-off,&R.plan[k]);if(z==MSX_RESIDENT_FALLBACK_WHOLE_LINK){z=MSXresident_planAllHandoffInto(k,0,R.item+off,R.itemCap-off,&R.plan[k]);if(z!=MSX_RESIDENT_OK)return fail(z,"fallback_plan_all");R.fallback[k]=1;if(materializePlan((int)k,&R.plan[k]))return MSX.ErrCode;R.fallbacks++;R.plan[k].itemCount=0;}else if(z!=MSX_RESIDENT_OK)return fail(z,"handoff_plan");off+=R.plan[k].itemCount;}R.itemCount=off;return 0;}
-int MSXresidentRuntime_completeHandoffs(void){uint32_t k;MSXResidentStatus z;double t;if(!R.resident)return 0;t=MSXgpu_wallTimeMs();for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)if(R.plan[k].itemCount){MSXResidentGpuFetchOutput f;uint32_t o=R.offset[k];memset(&f,0,sizeof(f));f.meta=R.out+o;f.cOut=R.c+(size_t)o*R.stride;f.lastcOut=R.lastc+(size_t)o*R.stride;f.stride=R.stride;z=MSXresidentGpu_fetchHandoffs(R.gpu,&R.plan[k],&f,R.plan[k].itemCount);if(z!=MSX_RESIDENT_OK){for(uint32_t j=1;j<=k;j++)MSXresident_abortHandoffTransaction(&R.tx[j]);return fail(z,"handoff_fetch");}z=MSXresident_prepareHandoffTransaction(&R.plan[k],f.meta,R.plan[k].itemCount,&R.tx[k]);if(z!=MSX_RESIDENT_OK){for(uint32_t j=1;j<=k;j++)MSXresident_abortHandoffTransaction(&R.tx[j]);return fail(z,"handoff_prepare");}}z=MSXresident_validateHandoffTransactions(R.tx,(uint32_t)MSX.Nobjects[LINK]+1);if(z!=MSX_RESIDENT_OK){for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"handoff_final_validate");}for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)if(R.tx[k].opaque)MSXresident_commitHandoffTransaction(&R.tx[k]);/* CPU transactions are committed atomically as a batch. A GPU flush failure is fail-stop; it never rolls CPU topology back. */if(MSXresidentRuntime_flushPatches()){R.dispatchReady=0;return MSX.ErrCode;}R.handoffReady=1;MSX.GpuTimingRecord.resident_handoff_ms+=MSXgpu_wallTimeMs()-t;return 0;}
+static int materializePlan(int k, MSXResidentHandoffPlan *p)
+{
+    MSXResidentGpuFetchOutput f;
+    MSXResidentStatus z;
+    uint32_t o=R.offset[k];
+    double t=0.0;
+    memset(&f,0,sizeof(f));
+    f.meta=R.out+o; f.cOut=R.c+(size_t)o*R.stride;
+    f.lastcOut=R.lastc+(size_t)o*R.stride; f.stride=R.stride;
+    if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
+    z=MSXresidentGpu_fetchHandoffs(R.gpu,p,&f,p->itemCount);
+    if(z!=MSX_RESIDENT_OK)return fail(z,"fallback_fetch");
+    z=MSXresident_prepareHandoffTransaction(p,f.meta,p->itemCount,&R.tx[k]);
+    if(z!=MSX_RESIDENT_OK)return fail(z,"fallback_prepare");
+    z=MSXresident_validateHandoffTransactions(&R.tx[k],1);
+    if(z!=MSX_RESIDENT_OK){MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"fallback_final_validate");}
+    MSXresident_commitHandoffTransaction(&R.tx[k]);
+    R.patchClass = 0;
+    if(MSXresidentRuntime_flushPatches()){R.dispatchReady=0;return MSX.ErrCode;}
+    if (MSXgpu_profileStageEnabled())
+        MSX.GpuTimingRecord.resident_handoff_ms+=MSXgpu_wallTimeMs()-t;
+    if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF))
+    {
+        double elapsed = MSXgpu_wallTimeMs() - t;
+        MSXgpu_profileRecordFallbackHandoff(0.0, elapsed, 0.0, 0.0,
+            p->itemCount,
+            (uint64_t)p->itemCount *
+                (sizeof(MSXResidentHandoffResult) + 2u * R.stride * sizeof(double)),
+            3);
+    }
+    return 0;
+}
+int MSXresidentRuntime_beginStep(double dt)
+{
+    uint32_t k, off = 0;
+    MSXResidentStatus z;
+    int handoffDetail;
+    double planTimer = 0.0;
+    if (!R.resident) return 0;
+    if (dt < 0.0) return fail(MSX_RESIDENT_ERR_ARGUMENT, "handoff_plan");
+    R.handoffReady = 0;
+    R.itemCount = 0;
+    R.handoffPlanMs = 0.0;
+    memset(R.plan, 0, ((size_t)MSX.Nobjects[LINK] + 1) * sizeof(*R.plan));
+    memset(R.fallback, 0, (size_t)MSX.Nobjects[LINK] + 1);
+    memset(R.tx, 0, ((size_t)MSX.Nobjects[LINK] + 1) * sizeof(*R.tx));
+    if (MSXresidentRuntime_flushPatches()) return MSX.ErrCode;
+    handoffDetail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF);
+    if (handoffDetail) planTimer = MSXgpu_wallTimeMs();
+    for (k = 1; k <= (uint32_t)MSX.Nobjects[LINK]; k++)
+    {
+        int wholePipe;
+        double displacement = handoffDisplacement((int)k, MSX.Q[k], dt, &wholePipe);
+        R.offset[k] = off;
+        z = wholePipe ?
+            MSXresident_planAllHandoffInto(k, 0, R.item + off, R.itemCap - off, &R.plan[k]) :
+            MSXresident_planHandoffInto(k, displacement, 1.0, 0,
+                                        boundaryVolume((int)k), MSX.GpuStrict,
+                                        R.item + off, R.itemCap - off, &R.plan[k]);
+        /* A request can consume the complete resident Core before it reaches
+           LINKVOL because the two CPU boundary bands are not resident. */
+        if (z == MSX_RESIDENT_ERR_CAPACITY)
+            z = MSXresident_planAllHandoffInto(k, 0, R.item + off,
+                                               R.itemCap - off, &R.plan[k]);
+        if (z == MSX_RESIDENT_FALLBACK_WHOLE_LINK)
+        {
+            z = MSXresident_planAllHandoffInto(k, 0, R.item + off,
+                                               R.itemCap - off, &R.plan[k]);
+            if (z != MSX_RESIDENT_OK) return fail(z, "fallback_plan_all");
+            R.fallback[k] = 1;
+            if (materializePlan((int)k, &R.plan[k])) return MSX.ErrCode;
+            R.fallbacks++;
+            R.plan[k].itemCount = 0;
+        }
+        else if (z != MSX_RESIDENT_OK)
+            return fail(z, "handoff_plan");
+        off += R.plan[k].itemCount;
+    }
+    R.itemCount = off;
+    if (handoffDetail) R.handoffPlanMs = MSXgpu_wallTimeMs() - planTimer;
+    return 0;
+}
+int MSXresidentRuntime_completeHandoffs(void)
+{
+    uint32_t k, fetchCalls = 0; MSXResidentStatus z;
+    double t = 0.0, fetchTimer = 0.0, validateTimer = 0.0, commitTimer = 0.0;
+    double fetchMs = 0.0, validateMs = 0.0, commitMs = 0.0;
+    uint64_t fetchBytes = 0;
+    int handoffDetail;
+    if(!R.resident)return 0;
+    handoffDetail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF);
+    if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
+    if (handoffDetail) fetchTimer = MSXgpu_wallTimeMs();
+    /* Normal plans are packed in R.item/R.out order. Fetch the whole flat
+       set once; CPU transaction preparation remains per-link but performs no
+       additional GPU or D2H operation. This makes d2h_calls describe the
+       three actual batch copies, rather than multiplying by link count. */
+    if (R.itemCount)
+    {
+        MSXResidentGpuFetchOutput f;
+        memset(&f,0,sizeof(f)); f.meta=R.out; f.cOut=R.c;
+        f.lastcOut=R.lastc; f.stride=R.stride;
+        z=MSXresidentGpu_fetchHandoffBatch(R.gpu,R.item,R.itemCount,&f);
+        if(z!=MSX_RESIDENT_OK){for(uint32_t j=1;j<=(uint32_t)MSX.Nobjects[LINK];j++)MSXresident_abortHandoffTransaction(&R.tx[j]);return fail(z,"handoff_fetch");}
+        fetchCalls=1;
+        fetchBytes=(uint64_t)R.itemCount *
+            (sizeof(MSXResidentHandoffResult) + 2u * R.stride * sizeof(double));
+    }
+    for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++) if(R.plan[k].itemCount)
+    {
+        uint32_t o=R.offset[k];
+        z=MSXresident_prepareHandoffTransaction(&R.plan[k],R.out+o,R.plan[k].itemCount,&R.tx[k]);
+        if(z!=MSX_RESIDENT_OK){for(uint32_t j=1;j<=(uint32_t)MSX.Nobjects[LINK];j++)MSXresident_abortHandoffTransaction(&R.tx[j]);return fail(z,"handoff_prepare");}
+    }
+    if (handoffDetail) fetchMs = MSXgpu_wallTimeMs() - fetchTimer;
+    if (handoffDetail) validateTimer = MSXgpu_wallTimeMs();
+    z=MSXresident_validateHandoffTransactions(R.tx,(uint32_t)MSX.Nobjects[LINK]+1);
+    if(z!=MSX_RESIDENT_OK){for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"handoff_final_validate");}
+    if (handoffDetail) validateMs = MSXgpu_wallTimeMs() - validateTimer;
+    if (handoffDetail) commitTimer = MSXgpu_wallTimeMs();
+    for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)if(R.tx[k].opaque)MSXresident_commitHandoffTransaction(&R.tx[k]);
+    if (handoffDetail) commitMs = MSXgpu_wallTimeMs() - commitTimer;
+    /* CPU transactions are committed atomically as a batch. A GPU flush
+       failure is fail-stop; it never claims CPU topology was rolled back. */
+    R.patchClass = 0;
+    if(MSXresidentRuntime_flushPatches()){R.dispatchReady=0;return MSX.ErrCode;}
+    R.handoffReady=1;
+    if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.resident_handoff_ms+=MSXgpu_wallTimeMs()-t;
+    if (handoffDetail && fetchCalls)
+        MSXgpu_profileRecordNormalHandoff(R.handoffPlanMs, fetchMs, validateMs,
+                                          commitMs, R.itemCount, fetchBytes,
+                                          fetchCalls * 3);
+    return 0;
+}
 int MSXresidentRuntime_reactCore(double dt)
 {
     MSXResidentStatus s; MSXResidentGpuReactResult out; MSXResidentGpuActiveSyncOutput sync;
     uint32_t n=0,i,active=0,m;
-    int err; double timer;
+    int err; double timer=0.0;
     if(!R.resident || !R.dispatchReady || !R.gpu) return fail(MSX_RESIDENT_ERR_POISONED,"react_not_ready");
     if((err=MSXresidentRuntime_flushPatches())) return err;
-    timer=MSXgpu_wallTimeMs(); s=MSXresident_enumerateActive(R.rows,R.activeCap,&n);
-    MSX.GpuTimingRecord.resident_enumerate_filter_ms += MSXgpu_wallTimeMs()-timer;
+    if (MSXgpu_profileStageEnabled()) timer=MSXgpu_wallTimeMs();
+    s=MSXresident_enumerateActive(R.rows,R.activeCap,&n);
+    if (MSXgpu_profileStageEnabled())
+        MSX.GpuTimingRecord.resident_enumerate_filter_ms += MSXgpu_wallTimeMs()-timer;
     if(s!=MSX_RESIDENT_OK) return fail(s,"active_enumerate");
     for(i=0;i<n;i++) if(MSXsegStorage_isHybridCoreSlotIdentity((int)R.rows[i].linkIndex,(int)R.rows[i].slot,R.rows[i].parcelId)){
         MSXResidentActiveItem *a=&R.active[active];
@@ -248,12 +417,14 @@ int MSXresidentRuntime_reactCore(double dt)
         active++;
     }
     memset(&out,0,sizeof(out));
-    MSX.GpuTimingRecord.resident_active_rows += active;
+    if (MSXgpu_profileStageEnabled())
+        MSX.GpuTimingRecord.resident_active_rows += active;
     { MSXResidentActiveBatch b; b.item=R.active; b.itemCount=active; err=MSXgpu_reactResidentCore(R.gpu,&b,dt,&out); }
     if(err){R.dispatchReady=0;R.lastStatus=MSX_RESIDENT_ERR_POISONED;return fail(MSX_RESIDENT_ERR_POISONED,"react_dispatch");}
     memset(&sync,0,sizeof(sync)); sync.row=R.sync; sync.cOut=R.c; sync.lastcOut=R.lastc; sync.stride=R.stride;
-    timer=MSXgpu_wallTimeMs(); s=MSXresidentGpu_syncActive(R.gpu,&sync,active);
-    MSX.GpuTimingRecord.resident_sync_ms+=MSXgpu_wallTimeMs()-timer;
+    if (MSXgpu_profileStageEnabled()) timer=MSXgpu_wallTimeMs();
+    s=MSXresidentGpu_syncActive(R.gpu,&sync,active);
+    if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.resident_sync_ms+=MSXgpu_wallTimeMs()-timer;
     if(s!=MSX_RESIDENT_OK){R.dispatchReady=0;return fail(s,"active_sync");}
     for(i=0;i<active;i++){
         MSXResidentGpuActiveSyncRow *q=&R.sync[i]; MSXResidentPayload *p=&R.payload[i];
