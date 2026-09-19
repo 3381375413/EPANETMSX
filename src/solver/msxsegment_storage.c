@@ -156,6 +156,100 @@ typedef struct HybridStorage
 
 static HybridStorage Hybrid = {0};
 static MSXResidentStatus HybridResidentStatus = MSX_RESIDENT_OK;
+
+enum {
+    HYBRID_REBALANCE_NONE = 0,
+    HYBRID_REBALANCE_SCAN,
+    HYBRID_REBALANCE_EMPTY_INIT,
+    HYBRID_REBALANCE_PLAN,
+    HYBRID_REBALANCE_VALIDATE_COMMIT,
+    HYBRID_REBALANCE_PROMOTE
+};
+static MSXRebalanceMetrics *HybridRebalanceMetrics = NULL;
+static int HybridRebalanceStage = HYBRID_REBALANCE_NONE;
+
+static void hybridRebalanceAddPhaseInternal(int phase, double ms)
+{
+    if (!HybridRebalanceMetrics || ms < 0.0) return;
+    switch (phase)
+    {
+    case MSX_REBALANCE_PHASE_PREFLUSH:
+        HybridRebalanceMetrics->rb_preflush_ms += ms; break;
+    case MSX_REBALANCE_PHASE_FETCH:
+        HybridRebalanceMetrics->rb_fetch_ms += ms; break;
+    default: break;
+    }
+}
+
+static int hybridRebalanceDetailActive(void)
+{
+    return HybridRebalanceMetrics != NULL;
+}
+
+int MSXsegStorage_hybridRebalanceProfileActive(void)
+{
+    return hybridRebalanceDetailActive();
+}
+
+void MSXsegStorage_hybridRebalanceAddPhase(int phase, double ms)
+{
+    hybridRebalanceAddPhaseInternal(phase, ms);
+}
+
+void MSXsegStorage_hybridRebalanceAddPatchCounts(uint64_t descriptors,
+                                                 uint64_t rows)
+{
+    if (!HybridRebalanceMetrics) return;
+    HybridRebalanceMetrics->patch_descriptors += descriptors;
+    HybridRebalanceMetrics->patch_rows += rows;
+}
+
+static int hybridCountSegmentsForRebalance(int k)
+{
+    Pseg seg;
+    int total = 0;
+    for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev)
+    {
+        ++total;
+        if (HybridRebalanceMetrics)
+        {
+            if (seg->inHybridCore) ++HybridRebalanceMetrics->core_visits;
+            else ++HybridRebalanceMetrics->boundary_visits;
+        }
+    }
+    if (HybridRebalanceMetrics) ++HybridRebalanceMetrics->scan_passes;
+    return total;
+}
+
+static void hybridRebalanceAddPlan(double ms)
+{
+    if (HybridRebalanceMetrics && ms >= 0.0)
+        HybridRebalanceMetrics->rb_plan_ms += ms;
+}
+
+static void hybridRebalanceAddValidateCommit(double ms)
+{
+    if (HybridRebalanceMetrics && ms >= 0.0)
+        HybridRebalanceMetrics->rb_validate_commit_ms += ms;
+}
+
+static void hybridRebalanceFinish(MSXRebalanceMetrics *metrics,
+                                  double parentStart)
+{
+    double children;
+    if (!metrics) return;
+    metrics->rb_parent_ms = MSXgpu_wallTimeMs() - parentStart;
+    children = metrics->rb_scan_ms + metrics->rb_empty_init_ms +
+               metrics->rb_plan_ms + metrics->rb_preflush_ms +
+               metrics->rb_fetch_ms + metrics->rb_validate_commit_ms +
+               metrics->rb_promote_ms;
+    metrics->rb_residual_ms = metrics->rb_parent_ms - children;
+    if (metrics->rb_parent_ms > 0.0 &&
+        metrics->rb_residual_ms < -0.01 * metrics->rb_parent_ms)
+        metrics->residual_negative_over_1pct = 1;
+    MSXgpu_profileRecordRebalance(metrics);
+}
+
 static int hybridPipeGuard(const HybridPipe *p)
 {
     return (p && p->fixedCap) ? p->guard : Hybrid.guard;
@@ -1251,6 +1345,105 @@ static void hybridFindCore(HybridPipe *p, int k, Pseg *firstCore,
     if (down) *down = nDown;
     if (up) *up = nUp;
     if (count) *count = nCore;
+    if (HybridRebalanceMetrics)
+    {
+        ++HybridRebalanceMetrics->scan_passes;
+        HybridRebalanceMetrics->core_visits += (uint64_t)nCore;
+        HybridRebalanceMetrics->boundary_visits +=
+            (uint64_t)nDown + (uint64_t)nUp;
+    }
+}
+
+int MSXsegStorage_hybridAuditSnapshot(int k,
+                                      MSXHybridAuditSnapshot *snapshot,
+                                      MSXHybridAuditRow *rows,
+                                      uint32_t row_capacity,
+                                      uint32_t *row_count)
+{
+    HybridPipe *p;
+    Pseg seg;
+    int total = 0, core = 0, down = 0, up = 0, seenCore = FALSE;
+    int firstCore = -1, lastCore = -1;
+    uint32_t pos = 0;
+
+    if (!snapshot || !row_count || k <= 0 || k > Hybrid.nLinks ||
+        !Hybrid.pipe || !MSX.FirstSeg)
+        return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[k];
+    if (!MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev)
+    {
+        ++total;
+        if (seg->inHybridCore)
+        {
+            if (!seenCore) seenCore = TRUE;
+            ++core;
+        }
+        else if (!seenCore) ++down;
+        else ++up;
+    }
+    if (total < 0 || (rows && (uint32_t)total > row_capacity) ||
+        p->cap < 0 || (p->count < 0 || p->count > p->cap))
+    {
+        *row_count = (uint32_t)(total < 0 ? 0 : total);
+        return ERR_PIPE_RING_CAPACITY;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->link_index = k;
+    snapshot->total = total;
+    snapshot->core_count = core;
+    snapshot->downstream_boundary = core ? down : total;
+    snapshot->upstream_boundary = core ? up : 0;
+    snapshot->orient = p->orient;
+    *row_count = (uint32_t)total;
+    seenCore = FALSE;
+    for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev)
+    {
+        MSXHybridAuditRow *row = rows ? &rows[pos] : NULL;
+        int coreSlot = -1, residentSlot = -1;
+        uint32_t generation = 0;
+        uint64_t epoch = 0;
+        if (seg->inHybridCore)
+        {
+            coreSlot = seg->hybridSlot;
+            if (coreSlot < 0 || coreSlot >= p->cap || !p->used ||
+                !p->view || !p->used[coreSlot] ||
+                p->view[coreSlot] != seg || seg->ownerLink != k)
+                return ERR_PIPE_RING_CAPACITY;
+            if (firstCore < 0) firstCore = coreSlot;
+            lastCore = coreSlot;
+            seenCore = TRUE;
+            if (MSXresident_isOpen())
+            {
+                uint64_t residentParcelId = 0;
+                if (!p->residentSlot || !p->coreSlotForResident)
+                    return ERR_PIPE_RING_CAPACITY;
+                residentSlot = p->residentSlot[coreSlot];
+                if (residentSlot < 0 || residentSlot >= p->cap ||
+                    p->coreSlotForResident[residentSlot] != coreSlot)
+                    return ERR_PIPE_RING_CAPACITY;
+                MSXResidentStatus z = MSXresident_getSlotIdentity(
+                    (uint32_t)k, (uint32_t)residentSlot, &generation,
+                    &residentParcelId, &epoch);
+                if (z != MSX_RESIDENT_OK || residentParcelId != seg->hybridId)
+                    return ERR_PIPE_RING_CAPACITY;
+            }
+        }
+        if (row)
+        {
+            row->parcel_id = seg->hybridId;
+            row->core = seg->inHybridCore ? 1 : 0;
+            row->core_slot = coreSlot;
+            row->resident_slot = residentSlot;
+            row->generation = generation;
+            row->pipe_epoch = epoch;
+            row->segment = seg;
+        }
+        ++pos;
+    }
+    snapshot->first_core_slot = firstCore;
+    snapshot->last_core_slot = lastCore;
+    return 0;
 }
 
 static int hybridPromote(int k, Pseg boundary, int atHead)
@@ -1291,6 +1484,13 @@ static int hybridPromote(int k, Pseg boundary, int atHead)
     else p->tail = slot;
     hybridReplaceInList(k, boundary, p->view[slot]);
     MSXqual_removeSeg(boundary);
+    if (HybridRebalanceMetrics)
+    {
+        if (HybridRebalanceStage == HYBRID_REBALANCE_EMPTY_INIT)
+            ++HybridRebalanceMetrics->init_promotes;
+        else if (HybridRebalanceStage == HYBRID_REBALANCE_PROMOTE)
+            ++HybridRebalanceMetrics->promote_rows;
+    }
     if (timing) MSXsegStorage_hybridTimingAddHandoff(MSXgpu_wallTimeMs() - timer);
     if (detail) MSXgpu_profileRecordPromote(1, MSXgpu_wallTimeMs() - timer);
     return 0;
@@ -1376,7 +1576,7 @@ static int hybridInitializeLink(int k)
     HybridPipe *p = &Hybrid.pipe[k];
     Pseg seg, firstCore, lastCore;
     int total = 0, i, err, down, up, count, guard = hybridPipeGuard(p);
-    for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev) total++;
+    total = hybridCountSegmentsForRebalance(k);
     if (total <= 2 * guard) return 0;
     firstCore = MSX.FirstSeg[k];
     for (i = 0; i < guard; i++) firstCore = firstCore->prev;
@@ -1565,7 +1765,11 @@ static int hybridDemoteResidentBatch(void)
     uint32_t count = 0, pos = 0, i, begin, end;
     int link;
     MSXResidentStatus status;
-    double timer = MSXgpu_wallTimeMs();
+    int detail = hybridRebalanceDetailActive();
+    int timing = MSXsegStorage_hybridTimingEnabled();
+    double timer = (timing || detail) ? MSXgpu_wallTimeMs() : 0.0;
+    double planTimer = detail ? timer : 0.0;
+    double validateTimer = 0.0;
 
     for (i = 1; i <= (uint32_t)Hybrid.nLinks; i++)
     {
@@ -1583,9 +1787,16 @@ static int hybridDemoteResidentBatch(void)
             { count++; remaining--; up++; }
         }
     }
-    if (!count) return 0;
+    if (!count)
+    {
+        if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
+        return 0;
+    }
     if (!request || !result || !item || !c || !lastc || count > capacity)
+    {
+        if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
         return ERR_MEMORY;
+    }
     /* Requests are reusable arena records.  Clear only this batch's range;
        cleanup below guarantees no boundary from an older batch remains live. */
     memset(request, 0, (size_t)count * sizeof(*request));
@@ -1605,52 +1816,72 @@ static int hybridDemoteResidentBatch(void)
         {
             HybridDemoteRequest *r = &request[pos++];
             r->linkIndex = (int)i; r->atHead = TRUE; r->coreSlot = head;
+            if (HybridRebalanceMetrics)
+            {
+                ++HybridRebalanceMetrics->demote_rows;
+                ++HybridRebalanceMetrics->head_rows;
+            }
             r->core = p->view[head];
             head = hybridNextSlot(p, head);
             remaining--; down++;
             if (!r->core || !p->residentSlot ||
                 p->residentSlot[r->coreSlot] < 0)
-            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+            { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
+              hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
             r->item.linkIndex = i;
             r->item.slot = (uint32_t)p->residentSlot[r->coreSlot];
             r->item.boundarySide = 0;
+            if (HybridRebalanceMetrics) ++HybridRebalanceMetrics->id_lookup_probes;
             if (MSXresident_getSlotIdentity(i, r->item.slot,
                                             &r->item.generation,
                                             &parcelId,
                                             &r->item.pipeEpoch) != MSX_RESIDENT_OK)
-            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+            { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
+              hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
             r->parcelId = parcelId;
             r->item.requestedVolume = 0.0;
             if (MSXsegStorage_hybridAcquireBoundary(&r->boundary) != 0)
-            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_MEMORY; }
+            { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
+              hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_MEMORY; }
         }
         while (remaining > 0 && up < guard)
         {
             HybridDemoteRequest *r = &request[pos++];
             r->linkIndex = (int)i; r->atHead = FALSE; r->coreSlot = tail;
+            if (HybridRebalanceMetrics)
+            {
+                ++HybridRebalanceMetrics->demote_rows;
+                ++HybridRebalanceMetrics->tail_rows;
+            }
             r->core = p->view[tail];
             tail = hybridPrevSlot(p, tail);
             remaining--; up++;
             if (!r->core || !p->residentSlot ||
                 p->residentSlot[r->coreSlot] < 0)
-            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+            { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
+              hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
             r->item.linkIndex = i;
             r->item.slot = (uint32_t)p->residentSlot[r->coreSlot];
             r->item.boundarySide = 1;
+            if (HybridRebalanceMetrics) ++HybridRebalanceMetrics->id_lookup_probes;
             if (MSXresident_getSlotIdentity(i, r->item.slot,
                                             &r->item.generation,
                                             &parcelId,
                                             &r->item.pipeEpoch) != MSX_RESIDENT_OK)
-            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+            { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
+              hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
             r->parcelId = parcelId;
             r->item.requestedVolume = 0.0;
             if (MSXsegStorage_hybridAcquireBoundary(&r->boundary) != 0)
-            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_MEMORY; }
+            { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
+              hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_MEMORY; }
         }
     }
     if (pos != count)
-    { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+    { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
+      hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
     for (i = 0; i < count; i++) item[i] = request[i].item;
+    if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
     status = MSXresidentRuntime_fetchBatch(item, count, c, lastc,
                                            (uint32_t)Hybrid.stride,
                                            result);
@@ -1659,11 +1890,17 @@ static int hybridDemoteResidentBatch(void)
         hybridFreeDemoteBatch(request, count, c, lastc, result, item);
         return ERR_GPU_KERNEL_RUNTIME_ERROR;
     }
+    /* Fetch has its own mutually-exclusive bucket.  Start validation only
+       after the runtime handoff returns so preflush/fetch is never counted
+       again in rb_validate_commit_ms. */
+    validateTimer = detail ? MSXgpu_wallTimeMs() : 0.0;
     for (i = 0; i < count; i++)
     {
         request[i].result = result[i];
         if (hybridValidateDemoteRequest(&request[i]))
         {
+            if (detail) hybridRebalanceAddValidateCommit(
+                MSXgpu_wallTimeMs() - validateTimer);
             hybridFreeDemoteBatch(request, count, c, lastc, result, item);
             return ERR_GPU_KERNEL_RUNTIME_ERROR;
         }
@@ -1677,11 +1914,16 @@ static int hybridDemoteResidentBatch(void)
         link = request[begin].linkIndex;
         end = begin + 1;
         while (end < count && request[end].linkIndex == link) ++end;
+        if (HybridRebalanceMetrics)
+            HybridRebalanceMetrics->validation_capacity_visits +=
+                (uint64_t)(end - begin);
         status = MSXresident_validateRemoveBatch((uint32_t)link,
                                                   item + begin,
                                                   end - begin);
         if (status != MSX_RESIDENT_OK)
         {
+            if (detail) hybridRebalanceAddValidateCommit(
+                MSXgpu_wallTimeMs() - validateTimer);
             hybridFreeDemoteBatch(request, count, c, lastc, result, item);
             return ERR_GPU_KERNEL_RUNTIME_ERROR;
         }
@@ -1701,6 +1943,8 @@ static int hybridDemoteResidentBatch(void)
         {
             MSXresident_poison();
             HybridResidentStatus = status;
+            if (detail) hybridRebalanceAddValidateCommit(
+                MSXgpu_wallTimeMs() - validateTimer);
             hybridFreeDemoteBatch(request, count, c, lastc, result, item);
             return ERR_GPU_KERNEL_RUNTIME_ERROR;
         }
@@ -1710,12 +1954,19 @@ static int hybridDemoteResidentBatch(void)
         {
             MSXresident_poison();
             HybridResidentStatus = MSX_RESIDENT_ERR_POISONED;
+            if (detail) hybridRebalanceAddValidateCommit(
+                MSXgpu_wallTimeMs() - validateTimer);
             hybridFreeDemoteBatch(request, count, c, lastc, result, item);
             return ERR_PIPE_RING_CAPACITY;
         }
         else
+        {
+            if (HybridRebalanceMetrics) ++HybridRebalanceMetrics->commit_rows;
             request[i].boundary = NULL;
+        }
     hybridFreeDemoteBatch(request, count, c, lastc, result, item);
+    if (detail) hybridRebalanceAddValidateCommit(
+        MSXgpu_wallTimeMs() - validateTimer);
     if (MSXsegStorage_hybridTimingEnabled())
         MSXsegStorage_hybridTimingAddHandoff(MSXgpu_wallTimeMs() - timer);
     if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE))
@@ -1842,11 +2093,21 @@ int MSXsegStorage_hybridRemoveHead(int k, Pseg seg)
 
 void MSXsegStorage_hybridRebalanceAll(void)
 {
-    int k, err;
+    int k, err, audit = 0, promoteStarted = 0;
+    MSXRebalanceMetrics metrics;
+    double parentStart = 0.0, phaseStart;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return;
 #if defined(EPANETMSX_CUDA_ENABLED)
     if (MSXresidentRuntime_isResident())
     {
+        audit = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
+        if (audit)
+        {
+            memset(&metrics, 0, sizeof(metrics));
+            HybridRebalanceMetrics = &metrics;
+            HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
+            parentStart = MSXgpu_wallTimeMs();
+        }
         /* Initialization contains only fallible promote commits.  Complete
            those first, then collect every post-transport demote before any
            CPU topology mutation or selected GPU fetch. */
@@ -1855,21 +2116,44 @@ void MSXsegStorage_hybridRebalanceAll(void)
             HybridPipe *p = &Hybrid.pipe[k];
             Pseg firstCore, lastCore;
             int down, up, count, total = 0, guard = hybridPipeGuard(p);
-            Pseg seg;
-            for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev) total++;
+            phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
+            if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
+            total = hybridCountSegmentsForRebalance(k);
             hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+            if (audit) metrics.rb_scan_ms += MSXgpu_wallTimeMs() - phaseStart;
             if (count == 0 && total > 2 * guard)
             {
+                phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
+                if (audit) HybridRebalanceStage = HYBRID_REBALANCE_EMPTY_INIT;
                 err = hybridInitializeLink(k);
-                if (err) { MSX.ErrCode = err; return; }
+                if (audit) metrics.rb_empty_init_ms +=
+                    MSXgpu_wallTimeMs() - phaseStart;
+                if (err) { MSX.ErrCode = err; goto resident_done; }
+                if (HybridRebalanceMetrics) ++HybridRebalanceMetrics->rebuilt_links;
             }
         }
+        if (audit) HybridRebalanceStage = HYBRID_REBALANCE_PLAN;
         err = hybridDemoteResidentBatch();
-        if (err) { MSX.ErrCode = err; return; }
+        if (err) { MSX.ErrCode = err; goto resident_done; }
+        phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
+        if (audit)
+        {
+            HybridRebalanceStage = HYBRID_REBALANCE_PROMOTE;
+            promoteStarted = 1;
+        }
         for (k = 1; k <= Hybrid.nLinks; k++)
         {
             err = hybridPromoteResidentExcess(k);
-            if (err) { MSX.ErrCode = err; return; }
+            if (err) { MSX.ErrCode = err; goto resident_done; }
+        }
+resident_done:
+        if (audit)
+        {
+            if (promoteStarted)
+                metrics.rb_promote_ms += MSXgpu_wallTimeMs() - phaseStart;
+            HybridRebalanceStage = HYBRID_REBALANCE_NONE;
+            hybridRebalanceFinish(&metrics, parentStart);
+            HybridRebalanceMetrics = NULL;
         }
         return;
     }

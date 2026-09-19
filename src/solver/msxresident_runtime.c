@@ -232,6 +232,8 @@ int MSXresidentRuntime_flushPatches(void)
     R.wouldDescriptors+=b.descriptorCount; R.wouldSlots+=b.slotCount;
     if (!b.descriptorCount && !b.slotCount) return 0;
     if (!R.resident) { MSXresident_clearPatches(); return 0; }
+    MSXsegStorage_hybridRebalanceAddPatchCounts(b.descriptorCount,
+                                                b.slotCount);
     { double t=0.0; if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
       s=MSXresidentGpu_applyPatches(R.gpu,&b);
       if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.resident_patch_h2d_ms+=MSXgpu_wallTimeMs()-t; }
@@ -339,18 +341,31 @@ MSXResidentStatus MSXresidentRuntime_fetchBatch(
 {
     MSXResidentStatus s;
     MSXResidentGpuFetchOutput f;
+    int rebalanceProfile = MSXsegStorage_hybridRebalanceProfileActive();
+    double preflushStart = rebalanceProfile ? MSXgpu_wallTimeMs() : 0.0;
+    double fetchStart;
 
     if (!R.resident || !R.gpu) return MSX_RESIDENT_DISABLED;
     if ((!items && count) || (!c && count) || (!lastc && count) ||
         (!results && count) || stride < R.stride || count > R.itemCap)
         return MSX_RESIDENT_ERR_ARGUMENT;
-    if (MSXresidentRuntime_flushPatches()) return R.lastStatus;
+    s = (MSXResidentStatus)MSXresidentRuntime_flushPatches();
+    if (rebalanceProfile)
+        MSXsegStorage_hybridRebalanceAddPhase(
+            MSX_REBALANCE_PHASE_PREFLUSH,
+            MSXgpu_wallTimeMs() - preflushStart);
+    if (s) return R.lastStatus;
     memset(&f, 0, sizeof(f));
     f.meta = results;
     f.cOut = c;
     f.lastcOut = lastc;
     f.stride = stride;
+    fetchStart = rebalanceProfile ? MSXgpu_wallTimeMs() : 0.0;
     s = MSXresidentGpu_fetchHandoffBatch(R.gpu, items, count, &f);
+    if (rebalanceProfile)
+        MSXsegStorage_hybridRebalanceAddPhase(
+            MSX_REBALANCE_PHASE_FETCH,
+            MSXgpu_wallTimeMs() - fetchStart);
     if (s != MSX_RESIDENT_OK)
     {
         fail(s, count > 1 ? "selected_fetch_batch" : "selected_fetch");

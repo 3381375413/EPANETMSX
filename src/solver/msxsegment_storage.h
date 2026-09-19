@@ -60,6 +60,45 @@ void MSXsegStorage_hybridAbortInitialImage(void);
 int  MSXsegStorage_hybridObserveAll(void);
 int  MSXsegStorage_hybridRemoveHead(int k, Pseg seg);
 void MSXsegStorage_hybridRebalanceAll(void);
+/* A0 Rebalance detail hooks.  They are inert unless the detail demote group
+   is active, so runtime fetch/flush callers need no profile-mode branches. */
+enum {
+    MSX_REBALANCE_PHASE_PREFLUSH = 0,
+    MSX_REBALANCE_PHASE_FETCH = 1
+};
+int MSXsegStorage_hybridRebalanceProfileActive(void);
+void MSXsegStorage_hybridRebalanceAddPhase(int phase, double ms);
+void MSXsegStorage_hybridRebalanceAddPatchCounts(uint64_t descriptors,
+                                                 uint64_t rows);
+/* Read-only audit seam for A1/A2.  ``rows`` are emitted in the authoritative
+   CPU linked-list order (FirstSeg -> prev), and no Resident, mapping, or
+   topology state is modified. */
+typedef struct
+{
+    uint64_t parcel_id;
+    int core;
+    int core_slot;
+    int resident_slot;
+    uint32_t generation;
+    uint64_t pipe_epoch;
+    Pseg segment;
+} MSXHybridAuditRow;
+typedef struct
+{
+    int link_index;
+    int total;
+    int core_count;
+    int downstream_boundary;
+    int upstream_boundary;
+    int first_core_slot;
+    int last_core_slot;
+    int orient;
+} MSXHybridAuditSnapshot;
+int MSXsegStorage_hybridAuditSnapshot(int k,
+                                      MSXHybridAuditSnapshot *snapshot,
+                                      MSXHybridAuditRow *rows,
+                                      uint32_t row_capacity,
+                                      uint32_t *row_count);
 /* Make the selected physical endpoint CPU-readable before transport.  This
    may stage a single Resident demotion and returns a mapped error before any
    endpoint consumer can observe a stale Core mirror. */

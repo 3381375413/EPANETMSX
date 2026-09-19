@@ -114,6 +114,7 @@ typedef struct
     uint64_t diagnosticD2hBytes, diagnosticD2hCalls;
     uint64_t reactedD2hBytes, reactedD2hCalls;
     uint64_t aggregateQueries, aggregateCacheHits, aggregateRebuilds;
+    MSXRebalanceMetrics rebalance;
 } MSXProfileCounters;
 static MSXProfileCounters ProfileCounters;
 static int Ros2RawErrorSid = -1;
@@ -907,6 +908,38 @@ void MSXgpu_profileRecordAggregate(uint64_t queries, uint64_t cacheHits,
     ProfileCounters.aggregateRebuilds += rebuilds;
 }
 
+void MSXgpu_profileRecordRebalance(const MSXRebalanceMetrics *m)
+{
+    MSXRebalanceMetrics *d;
+    if (!m || !MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE))
+        return;
+    d = &ProfileCounters.rebalance;
+    d->rb_parent_ms += m->rb_parent_ms;
+    d->rb_scan_ms += m->rb_scan_ms;
+    d->rb_empty_init_ms += m->rb_empty_init_ms;
+    d->rb_plan_ms += m->rb_plan_ms;
+    d->rb_preflush_ms += m->rb_preflush_ms;
+    d->rb_fetch_ms += m->rb_fetch_ms;
+    d->rb_validate_commit_ms += m->rb_validate_commit_ms;
+    d->rb_promote_ms += m->rb_promote_ms;
+    d->rb_residual_ms += m->rb_residual_ms;
+    d->scan_passes += m->scan_passes;
+    d->core_visits += m->core_visits;
+    d->boundary_visits += m->boundary_visits;
+    d->rebuilt_links += m->rebuilt_links;
+    d->init_promotes += m->init_promotes;
+    d->demote_rows += m->demote_rows;
+    d->head_rows += m->head_rows;
+    d->tail_rows += m->tail_rows;
+    d->promote_rows += m->promote_rows;
+    d->patch_descriptors += m->patch_descriptors;
+    d->patch_rows += m->patch_rows;
+    d->validation_capacity_visits += m->validation_capacity_visits;
+    d->commit_rows += m->commit_rows;
+    d->id_lookup_probes += m->id_lookup_probes;
+    d->residual_negative_over_1pct += m->residual_negative_over_1pct;
+}
+
 int MSXcpu_openTiming(void)
 {
     MSXcpu_closeTiming();
@@ -1149,14 +1182,46 @@ static void writeProfileSummary(void)
         fprintf(f, "    \"reacted\": null,\n");
     }
     if (aggregateCollected)
-        fprintf(f, "    \"aggregate\": {\"queries\": %llu, \"cache_hits\": %llu, \"rebuilds\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu}\n",
+        fprintf(f, "    \"aggregate\": {\"queries\": %llu, \"cache_hits\": %llu, \"rebuilds\": %llu, \"d2h_bytes\": %llu, \"d2h_calls\": %llu}%s\n",
                 (unsigned long long)ProfileCounters.aggregateQueries,
                 (unsigned long long)ProfileCounters.aggregateCacheHits,
                 (unsigned long long)ProfileCounters.aggregateRebuilds,
                 (unsigned long long)RunTotals.aggregate_d2h_bytes,
-                (unsigned long long)RunTotals.aggregate_d2h_calls);
+                (unsigned long long)RunTotals.aggregate_d2h_calls,
+                demoteCollected ? "," : "");
     else
-        fprintf(f, "    \"aggregate\": null\n");
+        fprintf(f, "    \"aggregate\": null%s\n", demoteCollected ? "," : "");
+    if (demoteCollected)
+    {
+        const MSXRebalanceMetrics *r = &ProfileCounters.rebalance;
+        fprintf(f, "    \"rebalance\": {\n"
+                   "      \"parent_ms\": %.6f, \"rb_scan_ms\": %.6f, \"rb_empty_init_ms\": %.6f, \"rb_plan_ms\": %.6f,\n"
+                   "      \"rb_preflush_ms\": %.6f, \"rb_fetch_ms\": %.6f, \"rb_validate_commit_ms\": %.6f, \"rb_promote_ms\": %.6f, \"rb_residual_ms\": %.6f,\n"
+                   "      \"scan_passes\": %llu, \"core_visits\": %llu, \"boundary_visits\": %llu,\n"
+                   "      \"rebuilt_links\": %llu, \"init_promotes\": %llu, \"demote_rows\": %llu, \"head_rows\": %llu, \"tail_rows\": %llu, \"promote_rows\": %llu,\n"
+                   "      \"patch_descriptors\": %llu, \"patch_rows\": %llu, \"validation_capacity_visits\": %llu, \"commit_rows\": %llu, \"id_lookup_probes\": %llu,\n"
+                   "      \"residual_negative_over_1pct\": %llu\n"
+                   "    }\n",
+                r->rb_parent_ms, r->rb_scan_ms, r->rb_empty_init_ms,
+                r->rb_plan_ms, r->rb_preflush_ms, r->rb_fetch_ms,
+                r->rb_validate_commit_ms, r->rb_promote_ms,
+                r->rb_residual_ms,
+                (unsigned long long)r->scan_passes,
+                (unsigned long long)r->core_visits,
+                (unsigned long long)r->boundary_visits,
+                (unsigned long long)r->rebuilt_links,
+                (unsigned long long)r->init_promotes,
+                (unsigned long long)r->demote_rows,
+                (unsigned long long)r->head_rows,
+                (unsigned long long)r->tail_rows,
+                (unsigned long long)r->promote_rows,
+                (unsigned long long)r->patch_descriptors,
+                (unsigned long long)r->patch_rows,
+                (unsigned long long)r->validation_capacity_visits,
+                (unsigned long long)r->commit_rows,
+                (unsigned long long)r->id_lookup_probes,
+                (unsigned long long)r->residual_negative_over_1pct);
+    }
     fprintf(f, "  }\n}\n");
     fclose(f);
 }

@@ -39,6 +39,37 @@ void MSXgpu_profileRecordDiagnostic(uint64_t bytes, uint64_t apiCalls);
 void MSXgpu_profileRecordReacted(uint64_t bytes, uint64_t apiCalls);
 void MSXgpu_profileRecordAggregate(uint64_t queries, uint64_t cacheHits,
                                    uint64_t rebuilds);
+/* Resident Rebalance A0 accounting.  The record is emitted only when the
+   detail demote group is selected; callers may therefore keep the same
+   instrumentation seam in normal/off runs without taking diagnostic clocks. */
+typedef struct
+{
+    double rb_parent_ms;
+    double rb_scan_ms;
+    double rb_empty_init_ms;
+    double rb_plan_ms;
+    double rb_preflush_ms;
+    double rb_fetch_ms;
+    double rb_validate_commit_ms;
+    double rb_promote_ms;
+    double rb_residual_ms;
+    uint64_t scan_passes;
+    uint64_t core_visits;
+    uint64_t boundary_visits;
+    uint64_t rebuilt_links;
+    uint64_t init_promotes;
+    uint64_t demote_rows;
+    uint64_t head_rows;
+    uint64_t tail_rows;
+    uint64_t promote_rows;
+    uint64_t patch_descriptors;
+    uint64_t patch_rows;
+    uint64_t validation_capacity_visits;
+    uint64_t commit_rows;
+    uint64_t id_lookup_probes;
+    uint64_t residual_negative_over_1pct;
+} MSXRebalanceMetrics;
+void MSXgpu_profileRecordRebalance(const MSXRebalanceMetrics *metrics);
 /* Runtime/driver phase accounting.  These helpers are no-ops in profile
    off mode and never introduce a CUDA synchronization. */
 void MSXgpu_profileRunPhase(MSXProfileRunPhase phase, double ms);

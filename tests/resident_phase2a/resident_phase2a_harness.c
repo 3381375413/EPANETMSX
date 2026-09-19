@@ -6,6 +6,7 @@
 #include "msxresident_core.h"
 #include "msxresident_hash.h"
 #include "msxsegment_storage.h"
+#include "msxgpu.h"
 #include "msxtypes.h"
 MSXproject MSX; static int pass,fail; static int segmentAllocFail; static uint64_t segmentAllocCalls;
 #define OK(x) do{if(x)pass++;else{fail++;fprintf(stderr,"FAIL:%s:%d: %s\n",__FILE__,__LINE__,#x);}}while(0)
@@ -17,6 +18,7 @@ int MSXgpu_profileStageEnabled(void){return 0;}
 int MSXgpu_profileDetailGroupEnabled(MSXProfileDetailGroup group){(void)group;return 0;}
 void MSXgpu_profileRecordDemote(uint64_t rows,double ms){(void)rows;(void)ms;}
 void MSXgpu_profileRecordPromote(uint64_t rows,double ms){(void)rows;(void)ms;}
+void MSXgpu_profileRecordRebalance(const MSXRebalanceMetrics *metrics){(void)metrics;}
 Pseg MSXqual_getFreeSeg(double v,double*c){Pseg s;int n=MSX.Nobjects[SPECIES]+1;segmentAllocCalls++;if(segmentAllocFail)return NULL;s=(Pseg)calloc(1,sizeof(*s));if(!s)return NULL;s->c=(double*)calloc(n,sizeof(double));s->lastc=(double*)calloc(n,sizeof(double));if(!s->c||!s->lastc){free(s->c);free(s->lastc);free(s);return NULL;}s->privateC=s->c;s->privateLastC=s->lastc;s->v=v;if(c)memcpy(s->c,c,n*sizeof(double));return s;}
 void MSXqual_removeSeg(Pseg s){if(!s)return;if(MSXsegStorage_hybridReleaseBoundary(s))return;free(s->privateC);if(s->privateLastC!=s->privateC)free(s->privateLastC);free(s);}
 static void csv(const char*n,const char*b){FILE*f=fopen(n,"wb");if(f){fputs(b,f);fclose(f);}}
@@ -73,6 +75,9 @@ static void t22(void){char b[768];double c[2]={0,1},l[2]={0,2};uint64_t a=101,z=
 /* 23: explicit audit poisoning reaches both CPU Resident rows and dense
    Hybrid Core views without changing volume or parcel identity. */
 static void t23(void){Pseg core;MSXResidentPayload q;uint32_t slot,generation;uint64_t parcel;double volume; if(!fixture()){OK(0);return;}core=MSXsegStorage_hybridCoreSegFromHead(1,0);OK(core!=NULL&&MSXresident_getSlotIdentity(1,0,&generation,&parcel,NULL)==0);slot=0;volume=core?core->v:0.0;OK(MSXresident_auditPoisonCpuMirrors()==MSX_RESIDENT_OK);OK(MSXsegStorage_hybridAuditPoisonCoreMirrors()==0);OK(MSXresident_getSlotPayload(1,slot,generation,&q)==MSX_RESIDENT_OK&&isnan(q.c[1])&&isnan(q.lastc[1]));OK(core!=NULL&&isnan(core->c[1])&&isnan(core->lastc[1])&&core->hybridId==parcel&&core->v==volume);}
+/* 24: A0 audit snapshots preserve CPU topology and expose complete row order
+   plus the Core/Resident identity mapping without publishing any state. */
+static void t24(void){MSXHybridAuditSnapshot s;MSXHybridAuditRow rows[8];uint32_t n=0;Pseg first,last;int count; if(!fixture()){OK(0);return;}first=MSX.FirstSeg[1];last=MSX.LastSeg[1];count=MSX.Link[1].nsegs;OK(MSXsegStorage_hybridAuditSnapshot(1,&s,rows,8,&n)==0);OK(n==5&&s.total==5&&s.core_count==1&&s.downstream_boundary==2&&s.upstream_boundary==2);OK(rows[0].core==0&&rows[1].core==0&&rows[2].core==1&&rows[3].core==0&&rows[4].core==0);OK(rows[2].resident_slot>=0&&rows[2].parcel_id==rows[2].segment->hybridId&&rows[2].generation>0);OK(MSXsegStorage_hybridAuditSnapshot(1,&s,NULL,0,&n)==0&&n==5);OK(MSX.FirstSeg[1]==first&&MSX.LastSeg[1]==last&&MSX.Link[1].nsegs==count);}
 static Pseg fseg(double v,uint64_t id){double c[2]={0,1},l[2]={0,2};Pseg s=MSXqual_getFreeSeg(v,c);if(s){s->hybridId=id;memcpy(s->lastc,l,sizeof(l));}return s;}
 static int fixture(void){Pseg prev=NULL;MSXResidentLayout l;int i,z;char b[512];setup(1,1);MSX.SegmentStorage=SEG_STORAGE_HYBRID;onecsv(b,sizeof(b),UP,16);csv("resident_phase2a.csv",b);z=MSXresident_open("resident_phase2a.csv");if(z){fprintf(stderr,"fixture: resident_open=%d\n",z);return 0;}MSXresident_setMode(MSX_RESIDENT_RESIDENT,1);z=MSXsegStorage_open();if(z){fprintf(stderr,"fixture: storage_open=%d\n",z);return 0;}z=MSXresident_getLayout(&l);if(z){fprintf(stderr,"fixture: get_layout=%d\n",z);return 0;}z=MSXsegStorage_hybridReserve(&l);if(z){fprintf(stderr,"fixture: hybrid_reserve=%d\n",z);return 0;}for(i=0;i<5;i++){Pseg s=fseg(i+1,100+i);if(!s){fprintf(stderr,"fixture: fseg[%d]\n",i);return 0;}s->next=prev;if(prev)prev->prev=s;else MSX.FirstSeg[1]=s;prev=s;MSX.LastSeg[1]=s;MSX.Link[1].nsegs++;}z=MSXsegStorage_hybridizeAll();if(z){fprintf(stderr,"fixture: hybridize_all=%d\n",z);return 0;}if(MSXsegStorage_hybridCoreCount(1)!=1){fprintf(stderr,"fixture: core_count=%d\n",MSXsegStorage_hybridCoreCount(1));return 0;}return 1;}
 /* 18: active-row identity filtering is slot-exact and fail-closed. */
@@ -140,4 +145,4 @@ static void t17(void){char b[768];MSXResidentLayout l;MSXResidentPatchBatch x;in
  OK(MSXresident_getInitialBatch(&x)==0&&x.descriptorCount==2&&x.descriptor[0].linkIndex==1&&x.descriptor[0].descriptor.count==5&&x.descriptor[1].linkIndex==2&&x.descriptor[1].descriptor.count==1);
  OK(MSXsegStorage_hybridCommitInitialImage()==0&&MSXresident_commitInitialImage()==0&&MSXsegStorage_hybridCoreCount(1)==5&&MSXsegStorage_hybridCoreCount(2)==1);
 }
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
