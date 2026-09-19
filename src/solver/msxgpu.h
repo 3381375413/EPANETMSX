@@ -73,6 +73,32 @@ int MSXgpu_reactPipeSegments(double dt);
 int MSXgpu_prepareResidentContext(void);
 int MSXgpu_openResidentPrograms(void);
 void MSXgpu_closeResidentPrograms(void);
+typedef struct {
+    int code;
+    int stage;
+    int sid;
+    int pipe;
+    int species;
+    int expr;
+    int iter;
+    double value;
+} MSXgpuResidentError;
+typedef struct {
+    uint64_t magic;
+    uint64_t batchId;
+    uint32_t itemCount;
+    int inFlight;
+    MSXResidentGpu *gpu;
+    MSXResidentGpuDeviceView view;
+    uint64_t topologyVersion;
+    MSXgpuResidentError gpuError;
+    double submitMs;
+} MSXgpuResidentCoreToken;
+int MSXgpu_submitResidentCore(MSXResidentGpu *, const MSXResidentActiveBatch *,
+                              double dt, MSXgpuResidentCoreToken *);
+int MSXgpu_finishResidentCore(MSXResidentGpu *, MSXgpuResidentCoreToken *,
+                              MSXResidentGpuReactResult *);
+int MSXgpu_abortResidentCore(MSXResidentGpu *, MSXgpuResidentCoreToken *);
 int MSXgpu_reactResidentCore(MSXResidentGpu *, const MSXResidentActiveBatch *,
                              double dt, MSXResidentGpuReactResult *);
 void MSXgpu_addOdeTime(double ms);

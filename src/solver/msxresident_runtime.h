@@ -3,6 +3,7 @@
 
 #include "msxresident_core.h"
 #include "msxresident_core_cuda.h"
+#include "msxgpu.h"
 
 /* Phase 3C-1 lifecycle boundary.  These hooks never alter segment topology. */
 int MSXresidentRuntime_preHybridInit(void);
@@ -14,6 +15,18 @@ int MSXresidentRuntime_isResident(void);
 int MSXresidentRuntime_reactReady(void);
 int MSXresidentRuntime_handoffReady(void);
 int MSXresidentRuntime_reactCore(double dt);
+typedef struct {
+    uint64_t magic;
+    uint64_t stepId;
+    uint64_t topologyVersion;
+    uint64_t stateVersion;
+    uint32_t batchCount;
+    int inFlight;
+    MSXgpuResidentCoreToken gpu;
+} MSXResidentRuntimeToken;
+int MSXresidentRuntime_submitCore(double dt, MSXResidentRuntimeToken *);
+int MSXresidentRuntime_finishCore(MSXResidentRuntimeToken *);
+int MSXresidentRuntime_abortCore(MSXResidentRuntimeToken *);
 int MSXresidentRuntime_beginStep(double dt);
 int MSXresidentRuntime_completeHandoffs(void);
 /* Flush pending topology/slot patches, then return the cached or rebuilt

@@ -18,9 +18,13 @@ typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; 
     double *c,*lastc; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
     uint32_t *offset; uint32_t itemCap, itemCount;
     double handoffPlanMs;
-    int auditPoisonCpuMirrors, auditAggregateFail;
+    int auditPoisonCpuMirrors, auditAggregateFail, inFlight;
+    uint64_t sequence, topologyVersion, stateVersion;
+    MSXResidentRuntimeToken flight;
     char status[96], resolvedCapacity[MAXFNAME]; } Runtime;
 static Runtime R;
+
+#define MSX_RESIDENT_RUNTIME_TOKEN_MAGIC UINT64_C(0x52544f4b454e5033)
 
 static int map(MSXResidentStatus s)
 {
@@ -223,6 +227,7 @@ int MSXresidentRuntime_flushPatches(void)
 {
     MSXResidentPatchBatch b; MSXResidentStatus s;
     if (!R.opened) return 0;
+    if (R.inFlight) return fail(MSX_RESIDENT_ERR_POISONED,"patch_inflight");
     if ((s=MSXresident_getPatches(&b))!=MSX_RESIDENT_OK) return fail(s,"patch_read");
     R.wouldDescriptors+=b.descriptorCount; R.wouldSlots+=b.slotCount;
     if (!b.descriptorCount && !b.slotCount) return 0;
@@ -237,7 +242,7 @@ int MSXresidentRuntime_flushPatches(void)
        double count the real transfer. */
     MSXgpu_profileRecordPatch(b.descriptorCount, b.slotCount, 0, 0,
                               R.patchClass);
-    MSXresident_clearPatches(); return 0;
+    MSXresident_clearPatches(); R.topologyVersion++; R.stateVersion++; return 0;
 }
 
 MSXResidentStatus MSXresidentRuntime_reduce(double *massBySpecies,
@@ -356,6 +361,13 @@ MSXResidentStatus MSXresidentRuntime_fetchBatch(
 
 void MSXresidentRuntime_close(void)
 {
+    if (R.inFlight)
+    {
+        /* Close is a lifecycle boundary: never release the CUDA/core buffers
+           while a token still owns an active stream submission. */
+        (void)MSXgpu_abortResidentCore(R.gpu,&R.flight.gpu);
+        R.inFlight=0; R.dispatchReady=0; R.flight.inFlight=0;
+    }
     /* Same CUDA context: destroy dependent program objects before its mirror. */
     MSXgpu_closeResidentPrograms();
     if (R.gpu) { MSXresidentGpu_close(R.gpu); R.gpu=0; }
@@ -608,64 +620,143 @@ int MSXresidentRuntime_completeHandoffs(void)
                                           fetchCalls);
     return 0;
 }
-int MSXresidentRuntime_reactCore(double dt)
+static MSXResidentStatus runtimeBuildActive(uint32_t *activeOut)
 {
-    MSXResidentStatus s; MSXResidentGpuReactResult out;
-    uint32_t n=0,i,active=0,m;
-    int err; double timer=0.0, phaseStart=0.0;
-    int stage = MSXgpu_profileStageEnabled();
-    if(!R.resident || !R.dispatchReady || !R.gpu) return fail(MSX_RESIDENT_ERR_POISONED,"react_not_ready");
-    phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
-    if((err=MSXresidentRuntime_flushPatches())) return err;
-    if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_FLUSH,
-                                      MSXgpu_wallTimeMs()-phaseStart);
+    MSXResidentStatus s; uint32_t n=0,i,active=0;
+    double timer=0.0, phaseStart=0.0;
+    int stage=MSXgpu_profileStageEnabled();
+    if (!activeOut) return MSX_RESIDENT_ERR_ARGUMENT;
     if (stage) timer=MSXgpu_wallTimeMs();
     s=MSXresident_enumerateActive(R.rows,R.activeCap,&n);
     if (stage)
     {
-        double enumerateMs = MSXgpu_wallTimeMs()-timer;
-        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_ENUMERATE, enumerateMs);
-        MSX.GpuTimingRecord.resident_enumerate_filter_ms += enumerateMs;
+        double elapsed=MSXgpu_wallTimeMs()-timer;
+        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_ENUMERATE,elapsed);
+        MSX.GpuTimingRecord.resident_enumerate_filter_ms+=elapsed;
     }
-    if(s!=MSX_RESIDENT_OK) return fail(s,"active_enumerate");
-    phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
-    for(i=0;i<n;i++) if(MSXsegStorage_isHybridCoreSlotIdentity((int)R.rows[i].linkIndex,(int)R.rows[i].slot,R.rows[i].parcelId)){
-        MSXResidentActiveItem *a=&R.active[active];
-        a->linkIndex=R.rows[i].linkIndex; a->globalRow=R.rows[i].globalRow; a->generation=R.rows[i].generation; a->descriptorEpoch=R.rows[i].descriptorEpoch; a->volume=R.rows[i].volume; a->hyd=MSX.Link[a->linkIndex].HydVar;
-        active++;
-    }
-    if (stage)
+    if(s!=MSX_RESIDENT_OK)return s;
+    if(stage)phaseStart=MSXgpu_wallTimeMs();
+    for(i=0;i<n;i++)
+        if(MSXsegStorage_isHybridCoreSlotIdentity((int)R.rows[i].linkIndex,
+                                                   (int)R.rows[i].slot,
+                                                   R.rows[i].parcelId))
+        {
+            MSXResidentActiveItem *a=&R.active[active];
+            a->linkIndex=R.rows[i].linkIndex; a->globalRow=R.rows[i].globalRow;
+            a->generation=R.rows[i].generation; a->descriptorEpoch=R.rows[i].descriptorEpoch;
+            a->volume=R.rows[i].volume; a->hyd=MSX.Link[a->linkIndex].HydVar;
+            active++;
+        }
+    if(stage)
     {
-        double filterMs = MSXgpu_wallTimeMs()-phaseStart;
-        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_IDENTITY_FILTER, filterMs);
-        MSX.GpuTimingRecord.resident_enumerate_filter_ms += filterMs;
+        double elapsed=MSXgpu_wallTimeMs()-phaseStart;
+        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_IDENTITY_FILTER,elapsed);
+        MSX.GpuTimingRecord.resident_enumerate_filter_ms+=elapsed;
     }
-    /* Resident enumeration is the complete published active image.  In a
-       Hybrid resident step every enumerated row must map to its exact dense
-       Core slot; silently dropping an identity would make that parcel skip
-       GPU reaction and violate the one-reaction-per-row invariant. */
-    if (active != n)
+    if(active!=n)return MSX_RESIDENT_ERR_GENERATION;
+    if(stage)MSX.GpuTimingRecord.resident_active_rows+=active;
+    *activeOut=active; return MSX_RESIDENT_OK;
+}
+
+/* A stale caller token must never leave the device submission live: its
+   buffers are still owned by the runtime, and continuing would make the next
+   step reuse those buffers concurrently.  Drain the authoritative flight
+   copy, then fail closed. */
+static void runtimeDrainFlight(void)
+{
+    if (R.inFlight && R.gpu && R.flight.gpu.inFlight)
+        (void)MSXgpu_abortResidentCore(R.gpu, &R.flight.gpu);
+    R.inFlight = 0;
+    R.flight.inFlight = 0;
+    R.flight.magic = 0;
+    R.dispatchReady = 0;
+}
+
+int MSXresidentRuntime_submitCore(double dt, MSXResidentRuntimeToken *token)
+{
+    MSXResidentStatus s; MSXResidentActiveBatch batch; uint32_t active=0; int err;
+    double flushStart=0.0; int stage=MSXgpu_profileStageEnabled();
+    if (!token || token->magic || token->inFlight) return fail(MSX_RESIDENT_ERR_ARGUMENT,"submit_token");
+    if (!R.resident || !R.dispatchReady || !R.gpu) return fail(MSX_RESIDENT_ERR_POISONED,"submit_not_ready");
+    if (R.inFlight) return fail(MSX_RESIDENT_ERR_POISONED,"submit_inflight");
+    if (dt < 0.0) return fail(MSX_RESIDENT_ERR_ARGUMENT,"submit_dt");
+    if(stage)flushStart=MSXgpu_wallTimeMs();
+    err=MSXresidentRuntime_flushPatches();
+    if(stage)MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_FLUSH,
+                                    MSXgpu_wallTimeMs()-flushStart);
+    if(err)return MSX.ErrCode;
+    s=runtimeBuildActive(&active);
+    if(s!=MSX_RESIDENT_OK){R.dispatchReady=0;return fail(s,"active_identity_filter");}
+    memset(token,0,sizeof(*token));
+    batch.item=R.active; batch.itemCount=active;
+    err=MSXgpu_submitResidentCore(R.gpu,&batch,dt,&token->gpu);
+    if(err){R.dispatchReady=0;(void)fail(MSX_RESIDENT_ERR_GPU,"submit_gpu");return err;}
+    R.sequence++; if(!R.sequence)R.sequence++;
+    R.inFlight=1; R.stateVersion++;
+    token->magic=MSX_RESIDENT_RUNTIME_TOKEN_MAGIC; token->stepId=R.sequence;
+    token->topologyVersion=R.topologyVersion; token->stateVersion=R.stateVersion;
+    token->gpu.batchId=R.sequence;
+    token->batchCount=active; token->inFlight=1; R.flight=*token;
+    return 0;
+}
+
+int MSXresidentRuntime_finishCore(MSXResidentRuntimeToken *token)
+{
+    MSXResidentGpuReactResult out; int err, i, m;
+    double phaseStart=0.0; int stage=MSXgpu_profileStageEnabled();
+    if(!token || token->magic!=MSX_RESIDENT_RUNTIME_TOKEN_MAGIC || !token->inFlight ||
+       !R.inFlight || token->stepId!=R.flight.stepId ||
+       token->gpu.batchId!=R.flight.gpu.batchId ||
+       token->topologyVersion!=R.topologyVersion || token->stateVersion!=R.flight.stateVersion)
     {
-        R.dispatchReady = 0;
-        return fail(MSX_RESIDENT_ERR_GENERATION, "active_identity_filter");
+        runtimeDrainFlight();
+        if(token)memset(token,0,sizeof(*token));
+        return fail(MSX_RESIDENT_ERR_POISONED,"finish_stale_token");
     }
-    memset(&out,0,sizeof(out));
-    if (stage)
-        MSX.GpuTimingRecord.resident_active_rows += active;
-    { MSXResidentActiveBatch b; b.item=R.active; b.itemCount=active; err=MSXgpu_reactResidentCore(R.gpu,&b,dt,&out); }
-    if(err){R.dispatchReady=0;R.lastStatus=MSX_RESIDENT_ERR_POISONED;return fail(MSX_RESIDENT_ERR_POISONED,"react_dispatch");}
-    /* finishActive has already committed hstep and concentrations in the
-       device-owned Core image.  Normal Resident execution deliberately does
-       not gather full Core rows or write them back into CPU Pseg mirrors;
-       selected handoff fetches remain the only normal concentration export. */
+    memset(&out,0,sizeof(out)); if(stage)phaseStart=MSXgpu_wallTimeMs();
+    err=MSXgpu_finishResidentCore(R.gpu,&token->gpu,&out);
+    if(err)
+    {
+        R.inFlight=0; R.dispatchReady=0; token->inFlight=0; token->magic=0;
+        R.flight.inFlight=0; R.flight.magic=0;
+        return fail(MSX_RESIDENT_ERR_GPU,"finish_gpu");
+    }
+    R.inFlight=0; token->inFlight=0; token->magic=0; R.flight.inFlight=0;
+    R.stateVersion++;
+    if(!out.reacted || out.reactedStride<(uint32_t)MSX.Nobjects[SPECIES]+1 ||
+       out.reactedLinkCount<(uint32_t)MSX.Nobjects[LINK]+1)
+    { R.dispatchReady=0; return fail(MSX_RESIDENT_ERR_TRANSFER,"finish_reacted"); }
+    if(stage)phaseStart=MSXgpu_wallTimeMs();
+    for(i=1;i<=MSX.Nobjects[LINK];i++)
+        for(m=1;m<=MSX.Nobjects[SPECIES];m++)
+            MSX.Link[i].reacted[m]+=out.reacted[(size_t)i*out.reactedStride+m];
+    if(stage)MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_REACTED_MERGE,
+                                    MSXgpu_wallTimeMs()-phaseStart);
     if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_after_react"))
         return MSX.ErrCode;
-    if(!out.reacted || out.reactedStride<(uint32_t)MSX.Nobjects[SPECIES]+1 || out.reactedLinkCount<(uint32_t)MSX.Nobjects[LINK]+1){R.dispatchReady=0;return fail(MSX_RESIDENT_ERR_TRANSFER,"react_result");}
-    phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
-    for(i=1;i<=MSX.Nobjects[LINK];i++) for(m=1;m<=MSX.Nobjects[SPECIES];m++) MSX.Link[i].reacted[m]+=out.reacted[(size_t)i*out.reactedStride+m];
-    if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_REACTED_MERGE,
-                                      MSXgpu_wallTimeMs()-phaseStart);
     return 0;
+}
+
+int MSXresidentRuntime_abortCore(MSXResidentRuntimeToken *token)
+{
+    int err;
+    if(!token || token->magic!=MSX_RESIDENT_RUNTIME_TOKEN_MAGIC || !token->inFlight ||
+       !R.inFlight || token->stepId!=R.flight.stepId ||
+       token->gpu.batchId!=R.flight.gpu.batchId)
+    { runtimeDrainFlight(); if(token)memset(token,0,sizeof(*token));
+      return fail(MSX_RESIDENT_ERR_POISONED,"abort_stale_token"); }
+    err=MSXgpu_abortResidentCore(R.gpu,&token->gpu);
+    R.inFlight=0; R.dispatchReady=0; token->inFlight=0; token->magic=0; R.flight.inFlight=0;
+    if(err) return fail(MSX_RESIDENT_ERR_GPU,"abort_gpu");
+    R.lastStatus=MSX_RESIDENT_ERR_POISONED; strcpy(R.status,"resident-aborted");
+    return 0;
+}
+
+int MSXresidentRuntime_reactCore(double dt)
+{
+    MSXResidentRuntimeToken token; int err;
+    memset(&token,0,sizeof(token)); err=MSXresidentRuntime_submitCore(dt,&token);
+    if(err)return err; return MSXresidentRuntime_finishCore(&token);
 }
 const char *MSXresidentRuntime_status(void) { return R.status; }
 MSXResidentStatus MSXresidentRuntime_lastStatus(void) { return R.lastStatus; }

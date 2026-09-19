@@ -282,6 +282,9 @@ int MSXchem_react(double dt)
     double kernelBefore = 0.0;
     double d2hBefore = 0.0;
     double unpackBefore = 0.0;
+    MSXResidentRuntimeToken residentToken;
+    int residentSubmitted = 0;
+    memset(&residentToken, 0, sizeof(residentToken));
 
 // --- save tolerances of pipe rate species
 
@@ -299,6 +302,8 @@ int MSXchem_react(double dt)
         int residentErr = 0;
         int stageTiming = MSXgpu_profileStageEnabled();
         int detailTiming = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM);
+        residentErr = MSXresidentRuntime_submitCore(dt, &residentToken);
+        if (!residentErr) residentSubmitted = 1;
         double boundaryStart = stageTiming ? MSXgpu_wallTimeMs() : 0.0;
         /* CPU owns only boundary Psegs.  Core rows have no CPU chemistry
            writeback path in RESIDENT mode. */
@@ -331,7 +336,11 @@ int MSXchem_react(double dt)
             MSX.GpuTimingRecord.resident_boundary_cpu_ms += boundaryMs;
             MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_CPU_BOUNDARY, boundaryMs);
         }
-        if (!residentErr) residentErr = MSXresidentRuntime_reactCore(dt);
+        if (residentErr && residentSubmitted)
+        {
+            (void)MSXresidentRuntime_abortCore(&residentToken);
+            residentSubmitted = 0;
+        }
         errcode = residentErr;
     }
     else if (MSX.GpuReact && MSX.GpuReactScope == GPU_PIPE_SEGMENT)
@@ -429,7 +438,15 @@ int MSXchem_react(double dt)
 }
         errcode = psegErr;
     }
-    if (errcode) return errcode;
+    if (errcode)
+    {
+        if (residentSubmitted)
+        {
+            (void)MSXresidentRuntime_abortCore(&residentToken);
+            residentSubmitted = 0;
+        }
+        return errcode;
+    }
 
 // --- save tolerances of tank rate species
 
@@ -458,6 +475,19 @@ int MSXchem_react(double dt)
         if (MSXgpu_profileStageEnabled())
             MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_CPU_TANK,
                                    MSXgpu_wallTimeMs() - tankStart);
+    }
+    if (residentSubmitted)
+    {
+        if (errcode)
+        {
+            (void)MSXresidentRuntime_abortCore(&residentToken);
+            residentSubmitted = 0;
+        }
+        else
+        {
+            errcode = MSXresidentRuntime_finishCore(&residentToken);
+            residentSubmitted = 0;
+        }
     }
     return errcode;
 }

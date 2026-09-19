@@ -35,7 +35,7 @@ typedef struct { MSXResidentGpuActiveSyncRow *row; double *cOut,*lastcOut;
     uint32_t stride; } MSXResidentGpuActiveSyncOutput;
 /* All addresses are plain integer values so this ABI is usable by C callers
    without importing CUDA headers.  They belong to the primary CUDA context. */
-typedef struct { uint64_t segPipe,segRow,segVol,hstep,c,lastc,hyd,reacted,ros2Nfcn,ros2Njac,ros2Naccept,ros2Nreject,ros2LastHstep,ros2Err; uint32_t itemCount,speciesStride,hydStride; } MSXResidentGpuDeviceView;
+typedef struct { uint64_t segPipe,segRow,segVol,hstep,c,lastc,hyd,reacted,ros2Nfcn,ros2Njac,ros2Naccept,ros2Nreject,ros2LastHstep,ros2Err,streamHandle; uint32_t itemCount,speciesStride,hydStride; } MSXResidentGpuDeviceView;
 /* reacted points at resident-owned host memory after finishActive succeeds.
    It has reactedLinkCount rows of reactedStride doubles and stays valid until
    the next prepareActive/close.  Phase 3C owns applying it to MSX.Link[]. */
@@ -69,7 +69,14 @@ MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu *, const MSXReside
    Required hstep/error/quality state is retained in every mode. */
 void MSXresidentGpu_setDiagnosticMode(MSXResidentGpu *, int enabled);
 MSXResidentStatus MSXresidentGpu_getDeviceView(MSXResidentGpu *, MSXResidentGpuDeviceView *);
+/* Enqueue the compact error reduction and hstep scatter on the same resident
+   stream as prepareActive and the chemistry kernels.  It does not wait; the
+   single completion boundary is finishActive. */
+MSXResidentStatus MSXresidentGpu_enqueueActiveCompletion(MSXResidentGpu *);
 MSXResidentStatus MSXresidentGpu_finishActive(MSXResidentGpu *, MSXResidentGpuReactResult *);
+/* Driver-side finish has already waited on the ready CUevent.  This entry
+   point consumes the same completion state without a second stream wait. */
+MSXResidentStatus MSXresidentGpu_finishActiveAfterWait(MSXResidentGpu *, MSXResidentGpuReactResult *);
 /* Explicit debug snapshot only: normal Resident reaction consumes device-owned
    Core state and uses selected handoff fetches instead of this full gather. */
 MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu *,
@@ -78,6 +85,9 @@ MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu *,
 /* Abort poisons the mirror and releases an in-flight active batch.  It is
    intentionally fail-closed: callers must reopen before another dispatch. */
 MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu *);
+/* Mark the device mirror unusable after a completed Driver program reports a
+   chemistry error.  All later read/query/dispatch operations fail closed. */
+MSXResidentStatus MSXresidentGpu_poison(MSXResidentGpu *);
 void MSXresidentGpu_close(MSXResidentGpu *);
 int MSXresidentGpu_isEnabled(void);
 
