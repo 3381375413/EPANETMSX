@@ -60,7 +60,7 @@ void MSXsegStorage_hybridAbortInitialImage(void);
 int  MSXsegStorage_hybridObserveAll(void);
 int  MSXsegStorage_hybridRemoveHead(int k, Pseg seg);
 void MSXsegStorage_hybridRebalanceAll(void);
-void MSXsegStorage_hybridAfterListReorder(int k);
+int MSXsegStorage_hybridAfterListReorder(int k);
 void MSXsegStorage_hybridClear(int k);
 int  MSXsegStorage_hybridCoreCount(int k);
 int  MSXsegStorage_hybridCoreCapacity(int k);

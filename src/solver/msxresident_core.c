@@ -47,8 +47,20 @@ static double*crow(Pipe*p,uint32_t s){return p->row+(size_t)s*2*S.rowWidth;}
 static double*lrow(Pipe*p,uint32_t s){return crow(p,s)+S.rowWidth;}
 static void getpayload(Pipe*p,uint32_t s,MSXResidentPayload*x){double*r=crow(p,s);x->volume=r[0];x->hstep=r[1];x->hresponse=r[2];x->uresponse=r[3];x->dresponse=r[4];x->parcelId=p->id[s];x->generation=p->gen[s];x->c=r+5;x->lastc=lrow(p,s)+5;}
 static int find(Pipe*p,uint64_t id){uint32_t s;for(s=0;s<p->d.capacity;s++)if(p->used[s]&&p->id[s]==id)return(int)s;return-1;}
+static uint32_t nextslot(const Pipe *p,uint32_t slot,int dir)
+{ int64_t q=(int64_t)slot+(dir<0?-1:1); if(q<0)q+=p->d.capacity; if(q>=(int64_t)p->d.capacity)q-=p->d.capacity; return(uint32_t)q; }
+static uint32_t prevslot(const Pipe *p,uint32_t slot,int dir)
+{ return nextslot(p,slot,-dir); }
+static MSXResidentPatchKind defaultKind(uint32_t used)
+{ return used?MSX_RESIDENT_PATCH_IMPORT:MSX_RESIDENT_PATCH_INVALIDATE; }
 static void markdesc(uint32_t k){uint32_t n=S.dirty[k];if(n==NONE){n=S.ndesc++;S.dirty[k]=n;S.desc[n].linkIndex=k;}S.desc[n].descriptor=S.p[k].d;S.stat.descriptorPatches++;}
-static void markslot(uint32_t k,uint32_t s,uint32_t used){Pipe*p=&S.p[k];uint32_t n=p->patch[s];MSXResidentSlotPatch*q;if(n==NONE){n=S.nslot++;p->patch[s]=n;}q=&S.slot[n];q->linkIndex=k;q->slot=s;q->generation=p->gen[s];q->used=used;getpayload(p,s,&q->payload);if(used)S.stat.slotUploads++;else S.stat.slotInvalidates++;}
+static void markslot(uint32_t k,uint32_t s,uint32_t used,MSXResidentPatchKind kind){Pipe*p=&S.p[k];uint32_t n=p->patch[s];int hadPatch=n!=NONE;MSXResidentSlotPatch*q;MSXResidentPatchKind finalKind=kind?kind:defaultKind(used);if(!hadPatch){n=S.nslot++;p->patch[s]=n;}q=&S.slot[n];if(hadPatch&&q->kind==MSX_RESIDENT_PATCH_IMPORT&&finalKind==MSX_RESIDENT_PATCH_META)finalKind=MSX_RESIDENT_PATCH_IMPORT;q->linkIndex=k;q->slot=s;q->generation=p->gen[s];q->used=used;q->kind=finalKind;if(used)getpayload(p,s,&q->payload);else{memset(&q->payload,0,sizeof(q->payload));q->payload.generation=p->gen[s];}if(used)S.stat.slotUploads++;else S.stat.slotInvalidates++;}
+static int payloadMetaEqual(const Pipe *p,uint32_t s,const MSXResidentPayload *x)
+{ const double *r=crow((Pipe *)p,s); return r[0]==x->volume&&r[1]==x->hstep&&r[2]==x->hresponse&&r[3]==x->uresponse&&r[4]==x->dresponse&&p->id[s]==x->parcelId; }
+static int payloadConcentrationEqual(const Pipe *p,uint32_t s,const MSXResidentPayload *x)
+{ const double *r=crow((Pipe *)p,s);uint32_t m;for(m=0;m<S.stride;m++)if(r[5+m]!=x->c[m]||lrow((Pipe *)p,s)[5+m]!=x->lastc[m])return 0;return 1; }
+static void writePayload(Pipe *p,uint32_t s,const MSXResidentPayload *x)
+{ double*r=crow(p,s);uint32_t m;r[0]=x->volume;r[1]=x->hstep;r[2]=x->hresponse;r[3]=x->uresponse;r[4]=x->dresponse;p->id[s]=x->parcelId;for(m=0;m<S.stride;m++){r[5+m]=x->c[m];lrow(p,s)[5+m]=x->lastc[m];} }
 
 MSXResidentStatus MSXresident_open(const char*path){FILE*f;char line[1024],id[EN_MAXID+1],want[EN_MAXID+1],h[65],*e;uint32_t row=0,k,cap,core,burst,guard,base=0;size_t b,n;Pipe*p;if(!path)return MSX_RESIDENT_ERR_ARGUMENT;freestate();f=fopen(path,"rb");if(!f)return MSX_RESIDENT_ERR_CSV;if(!fgets(line,sizeof(line),f))goto bad;e=strpbrk(line,"\r\n");if(!e||strcmp(line,"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n")&&strcmp(line,"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\r\n"))goto bad;S.nlinks=(uint32_t)MSX.Nobjects[LINK];if(!mul((size_t)S.nlinks+1,sizeof(Pipe),&b))goto ov;S.p=(Pipe*)calloc(1,b);if(!S.p)goto mem;while(fgets(line,sizeof(line),f)){e=strpbrk(line,"\r\n");if(!e||(*e=='\r'&&e[1]!='\n')||e[1+( *e=='\r')])goto bad;*e=0;if(!csv(line,&k,id,&cap,&core,&burst,&guard,h)||k!=row+1||!k||k>S.nlinks||!cap||core>cap||(guard!=2&&guard!=4)||cap>(uint32_t)MSX.MaxSegments)goto bad;want[0]=0;if(ENgetlinkid((int)k,want)||strcmp(id,want))goto bad;if(!row)strcpy(S.hash,h);else if(strcmp(S.hash,h))goto bad;if(S.slots>(size_t)UINT32_MAX-cap)goto ov;S.slots+=(size_t)cap;p=&S.p[k];p->d.linkIndex=k;p->d.capacity=cap;p->d.head=p->d.tail=NONE;p->d.orient=1;row++;}fclose(f);if(row!=S.nlinks)goto clean;S.stride=(uint32_t)MSX.Nobjects[SPECIES]+1;if(S.stride>UINT32_MAX-5)goto ov2;S.rowWidth=5+S.stride;if(!mul((size_t)S.nlinks+1,sizeof(uint32_t),&b))goto ov2;S.dirty=(uint32_t*)malloc(b);S.capacity=(uint32_t*)calloc(1,b);S.base=(uint32_t*)calloc(1,b);if(!S.dirty||!S.capacity||!S.base)goto mem2;for(k=0;k<=S.nlinks;k++)S.dirty[k]=NONE;for(k=1;k<=S.nlinks;k++){S.capacity[k]=S.p[k].d.capacity;S.base[k]=base;base+=S.capacity[k];}if(!mul(S.nlinks,sizeof(*S.desc),&b))goto ov2;S.desc=(MSXResidentDescriptorPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.slot),&b))goto ov2;S.slot=(MSXResidentSlotPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.hand),&b))goto ov2;S.hand=(MSXResidentHandoffItem*)calloc(1,b);if(!S.desc||!S.slot||!S.hand)goto mem2;S.tx=(Tx*)calloc((size_t)S.nlinks+1,sizeof(*S.tx));if(!S.tx)goto mem2;for(k=1;k<=S.nlinks;k++){Tx*t=&S.tx[k];p=&S.p[k];t->capacity=p->d.capacity;t->item=(MSXResidentHandoffItem*)calloc(t->capacity,sizeof(*t->item));t->result=(MSXResidentHandoffResult*)calloc(t->capacity,sizeof(*t->result));t->boundary=(Pseg*)calloc(t->capacity,sizeof(*t->boundary));t->c=(double*)calloc((size_t)t->capacity*S.stride,sizeof(*t->c));t->lastc=(double*)calloc((size_t)t->capacity*S.stride,sizeof(*t->lastc));if(!t->item||!t->result||!t->boundary||!t->c||!t->lastc)goto mem2;if(!mul(p->d.capacity,2*(size_t)S.rowWidth,&n)||!mul(n,sizeof(double),&b))goto ov2;p->row=(double*)calloc(1,b);p->used=(unsigned char*)calloc(p->d.capacity,1);p->gen=(uint32_t*)calloc(p->d.capacity,sizeof(uint32_t));p->id=(uint64_t*)calloc(p->d.capacity,sizeof(uint64_t));p->patch=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsI2s=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsKeep=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));if(!p->row||!p->used||!p->gen||!p->id||!p->patch||!p->obsI2s||!p->obsKeep)goto mem2;for(n=0;n<p->d.capacity;n++)p->patch[n]=NONE;}S.open=1;S.mode=MSX_RESIDENT_OFF;return MSX_RESIDENT_OK;bad:fclose(f);clean:freestate();return MSX_RESIDENT_ERR_CSV;ov:fclose(f);freestate();return MSX_RESIDENT_ERR_OVERFLOW;mem:fclose(f);freestate();return MSX_RESIDENT_ERR_MEMORY;ov2:freestate();return MSX_RESIDENT_ERR_OVERFLOW;mem2:freestate();return MSX_RESIDENT_ERR_MEMORY;}
 void MSXresident_close(void){freestate();}int MSXresident_isOpen(void){return S.open;}void MSXresident_setMode(MSXResidentMode m,int strict){S.mode=m<=MSX_RESIDENT_RESIDENT?m:MSX_RESIDENT_OFF;S.strict=!!strict;}MSXResidentMode MSXresident_mode(void){return S.mode;}
@@ -73,37 +85,246 @@ MSXResidentStatus MSXresident_validateConfig(const MSXResidentConfig *c)
   if(S.open)return MSXresident_verifyCaseHash(want);
   return MSX_RESIDENT_OK; }
 MSXResidentStatus MSXresident_observePipe(uint32_t k,const uint64_t*id,const MSXResidentPayload*in,uint32_t count,int32_t orient)
-{ Pipe*p;MSXResidentStatus z;uint32_t*i2s,*keep,i,s,m,newPatches=0;
-  if(S.mode==MSX_RESIDENT_OFF)return MSX_RESIDENT_OK; z=pipeok(k,&p);if(z)return z;
-  if((count&&(!id||!in))||count>p->d.capacity||(orient!=1&&orient!=-1))return MSX_RESIDENT_ERR_ARGUMENT;
-  /* Open reserves both arrays at the largest possible per-pipe batch.  The
-     descriptor is a cyclic span, so publish the input order in that span
-     rather than preserving arbitrary old slots. */
-  i2s=p->obsI2s; keep=p->obsKeep; memset(keep,0,(size_t)p->d.capacity*sizeof(*keep));
-  for(i=0;i<count;i++){if(!id[i]||!in[i].c||!in[i].lastc)return MSX_RESIDENT_ERR_ARGUMENT;for(s=0;s<i;s++)if(id[s]==id[i])return MSX_RESIDENT_ERR_ARGUMENT;i2s[i]=(uint32_t)(((int64_t)orient*i+(int64_t)p->d.capacity)%(int64_t)p->d.capacity);keep[i2s[i]]=1;}
-  /* Validate every bounded publication resource before changing state. */
-  if(p->d.epoch==UINT64_MAX)return MSX_RESIDENT_ERR_OVERFLOW;
-  if(S.dirty[k]==NONE&&S.ndesc>=S.nlinks)return MSX_RESIDENT_ERR_CAPACITY;
-  for(i=0;i<count;i++){s=i2s[i];if((!p->used[s]||p->id[s]!=id[i])&&p->gen[s]==UINT32_MAX)return MSX_RESIDENT_ERR_GENERATION;}
-  for(s=0;s<p->d.capacity;s++)if((p->used[s]&&!keep[s])||keep[s])if(p->patch[s]==NONE)newPatches++;
-  if(newPatches>S.slots-S.nslot)return MSX_RESIDENT_ERR_CAPACITY;
-  /* Commit is allocation-free and cannot fail after the preflight above. */
-  for(s=0;s<p->d.capacity;s++)if(p->used[s]&&!keep[s]){p->used[s]=0;p->id[s]=0;memset(crow(p,s),0,2*(size_t)S.rowWidth*sizeof(double));markslot(k,s,0);}
-  for(i=0;i<count;i++){double*r;s=i2s[i];if(!p->used[s]||p->id[s]!=id[i]){p->gen[s]++;p->used[s]=1;}p->id[s]=id[i];r=crow(p,s);r[0]=in[i].volume;r[1]=in[i].hstep;r[2]=in[i].hresponse;r[3]=in[i].uresponse;r[4]=in[i].dresponse;for(m=0;m<S.stride;m++){r[5+m]=in[i].c[m];lrow(p,s)[5+m]=in[i].lastc[m];}markslot(k,s,1);}
-  p->d.count=count;p->d.orient=orient;p->d.head=count?0:NONE;p->d.tail=count?i2s[count-1]:NONE;p->d.epoch++;markdesc(k);return MSX_RESIDENT_OK;
+{
+    Pipe *p; MSXResidentStatus z; uint32_t *i2s, *keep, i, s, j, needed = 0;
+    int topologyChanged = 0;
+    if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
+    z = pipeok(k, &p); if (z) return z;
+    if ((count && (!id || !in)) || count > p->d.capacity ||
+        (orient != 1 && orient != -1)) return MSX_RESIDENT_ERR_ARGUMENT;
+    i2s = p->obsI2s; keep = p->obsKeep;
+    memset(keep, 0, (size_t)p->d.capacity * sizeof(*keep));
+    for (i = 0; i < count; ++i)
+    {
+        if (!id[i] || !in[i].c || !in[i].lastc) return MSX_RESIDENT_ERR_ARGUMENT;
+        for (j = 0; j < i; ++j) if (id[j] == id[i]) return MSX_RESIDENT_ERR_ARGUMENT;
+        i2s[i] = NONE;
+        s = (uint32_t)find(p, id[i]);
+        if (s != NONE) { i2s[i] = s; keep[s] = 1; }
+    }
+    /* Preserve existing rows.  New rows are allocated only at a free cyclic
+       neighbour; an unrepresentable middle insertion is rejected instead of
+       silently moving surviving slots. */
+    for (i = 0; i < count; ++i) if (i2s[i] == NONE)
+    {
+        uint32_t candidate = NONE;
+        for (j = i; j > 0; --j) if (i2s[j - 1] != NONE)
+        {
+            candidate = nextslot(p, i2s[j - 1], orient); break;
+        }
+        if (candidate == NONE) for (j = i + 1; j < count; ++j)
+            if (i2s[j] != NONE) { candidate = prevslot(p, i2s[j], orient); break; }
+        if (candidate == NONE)
+            for (s = 0; s < p->d.capacity; ++s)
+                if (!p->used[s] || !keep[s]) { candidate = s; break; }
+        if (candidate == NONE || (p->used[candidate] && keep[candidate]))
+            return MSX_RESIDENT_ERR_CAPACITY;
+        for (j = 0; j < i; ++j) if (i2s[j] == candidate)
+            return MSX_RESIDENT_ERR_CAPACITY;
+        i2s[i] = candidate; keep[candidate] = 1;
+    }
+    if (count)
+    {
+        for (i = 1; i < count; ++i)
+            if (i2s[i] != nextslot(p, i2s[i - 1], orient))
+                return MSX_RESIDENT_ERR_ARGUMENT;
+        if (p->d.count != count || p->d.head != i2s[0] ||
+            p->d.tail != i2s[count - 1] || p->d.orient != orient)
+            topologyChanged = 1;
+    }
+    else if (p->d.count || p->d.head != NONE || p->d.tail != NONE)
+        topologyChanged = 1;
+    for (s = 0; s < p->d.capacity; ++s)
+        if (p->used[s] != keep[s]) { topologyChanged = 1; break; }
+    if (topologyChanged && p->d.epoch == UINT64_MAX) return MSX_RESIDENT_ERR_OVERFLOW;
+    if (topologyChanged && S.dirty[k] == NONE && S.ndesc >= S.nlinks)
+        return MSX_RESIDENT_ERR_CAPACITY;
+    for (s = 0; s < p->d.capacity; ++s)
+        if (p->used[s] && !keep[s] && p->patch[s] == NONE) ++needed;
+    for (i = 0; i < count; ++i)
+    {
+        s = i2s[i];
+        if (!p->used[s] || p->id[s] != id[i] ||
+            !payloadMetaEqual(p, s, &in[i]) ||
+            !payloadConcentrationEqual(p, s, &in[i]))
+            if (p->patch[s] == NONE) ++needed;
+        if ((!p->used[s] || p->id[s] != id[i]) && p->gen[s] == UINT32_MAX)
+            return MSX_RESIDENT_ERR_GENERATION;
+    }
+    if (needed > S.slots - S.nslot) return MSX_RESIDENT_ERR_CAPACITY;
+    /* Commit is allocation-free after the complete preflight above. */
+    for (s = 0; s < p->d.capacity; ++s) if (p->used[s] && !keep[s])
+    {
+        p->used[s] = 0; p->id[s] = 0;
+        memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+        markslot(k, s, 0, MSX_RESIDENT_PATCH_INVALIDATE);
+    }
+    for (i = 0; i < count; ++i)
+    {
+        MSXResidentPatchKind kind = MSX_RESIDENT_PATCH_META;
+        s = i2s[i];
+        if (!p->used[s] || p->id[s] != id[i])
+        {
+            p->gen[s]++; p->used[s] = 1; kind = MSX_RESIDENT_PATCH_IMPORT;
+        }
+        else if (!payloadConcentrationEqual(p, s, &in[i])) kind = MSX_RESIDENT_PATCH_IMPORT;
+        else if (!payloadMetaEqual(p, s, &in[i])) kind = MSX_RESIDENT_PATCH_META;
+        if (kind != MSX_RESIDENT_PATCH_META || !payloadMetaEqual(p, s, &in[i]) ||
+            !payloadConcentrationEqual(p, s, &in[i]))
+        {
+            writePayload(p, s, &in[i]);
+            markslot(k, s, 1, kind);
+        }
+    }
+    if (topologyChanged)
+    {
+        p->d.count = count; p->d.orient = orient;
+        p->d.head = count ? i2s[0] : NONE;
+        p->d.tail = count ? i2s[count - 1] : NONE;
+        p->d.epoch++; markdesc(k);
+    }
+    return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_stageInsert(uint32_t k,int side,const MSXResidentPayload *x,
+                                          uint32_t *slotOut,uint32_t *generationOut)
+{
+    Pipe *p; MSXResidentStatus z; uint32_t s;
+    if (!x || side < 0 || side > 1 || !x->parcelId || !x->c || !x->lastc)
+        return MSX_RESIDENT_ERR_ARGUMENT;
+    if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
+    z = pipeok(k, &p); if (z) return z;
+    if (find(p, x->parcelId) >= 0) return MSX_RESIDENT_ERR_ARGUMENT;
+    if (p->d.count >= p->d.capacity || p->d.epoch == UINT64_MAX)
+        return p->d.epoch == UINT64_MAX ? MSX_RESIDENT_ERR_OVERFLOW : MSX_RESIDENT_ERR_CAPACITY;
+    if (p->d.count == 0) s = 0;
+    else s = side ? nextslot(p, p->d.tail, p->d.orient) : prevslot(p, p->d.head, p->d.orient);
+    if (p->used[s] || (p->patch[s] != NONE && S.nslot >= S.slots))
+        return MSX_RESIDENT_ERR_CAPACITY;
+    if (p->gen[s] == UINT32_MAX) return MSX_RESIDENT_ERR_GENERATION;
+    if (p->patch[s] == NONE && S.nslot >= S.slots) return MSX_RESIDENT_ERR_CAPACITY;
+    p->gen[s]++; p->used[s] = 1; writePayload(p, s, x);
+    if (!p->d.count) p->d.head = p->d.tail = s;
+    else if (side) p->d.tail = s;
+    else p->d.head = s;
+    p->d.count++; p->d.epoch++;
+    markslot(k, s, 1, MSX_RESIDENT_PATCH_IMPORT); markdesc(k);
+    if (slotOut) *slotOut = s;
+    if (generationOut) *generationOut = p->gen[s];
+    return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_stageRemove(uint32_t k,uint32_t s,uint32_t generation)
+{
+    Pipe *p; MSXResidentStatus z; int side;
+    if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
+    z = pipeok(k, &p); if (z) return z;
+    if (s >= p->d.capacity || !p->used[s] || p->gen[s] != generation)
+        return MSX_RESIDENT_ERR_GENERATION;
+    if (s == p->d.head) side = 0;
+    else if (s == p->d.tail) side = 1;
+    else return MSX_RESIDENT_ERR_ARGUMENT;
+    if (p->d.epoch == UINT64_MAX) return MSX_RESIDENT_ERR_OVERFLOW;
+    p->used[s] = 0; p->id[s] = 0;
+    memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+    if (p->d.count == 1) p->d.head = p->d.tail = NONE;
+    else if (!side) p->d.head = nextslot(p, p->d.head, p->d.orient);
+    else p->d.tail = prevslot(p, p->d.tail, p->d.orient);
+    p->d.count--; p->d.epoch++;
+    markslot(k, s, 0, MSX_RESIDENT_PATCH_INVALIDATE); markdesc(k);
+    return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_stageClear(uint32_t k)
+{
+    Pipe *p; MSXResidentStatus z; uint32_t s, used = 0, reserve = 0;
+    if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
+    z = pipeok(k, &p); if (z) return z;
+    for (s = 0; s < p->d.capacity; ++s)
+        if (p->used[s])
+        {
+            ++used;
+            if (p->patch[s] == NONE) ++reserve;
+        }
+    if (!used && !p->d.count) return MSX_RESIDENT_OK;
+    if (used != p->d.count) return MSX_RESIDENT_ERR_GENERATION;
+    if (p->d.epoch == UINT64_MAX || reserve > S.slots - S.nslot)
+        return p->d.epoch == UINT64_MAX ? MSX_RESIDENT_ERR_OVERFLOW :
+                                          MSX_RESIDENT_ERR_CAPACITY;
+    /* All fallible checks are complete before the first invalidation. */
+    for (s = 0; s < p->d.capacity; ++s)
+        if (p->used[s])
+        {
+            p->used[s] = 0; p->id[s] = 0;
+            memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+            markslot(k, s, 0, MSX_RESIDENT_PATCH_INVALIDATE);
+        }
+    p->d.count = 0; p->d.head = p->d.tail = NONE;
+    p->d.epoch++; markdesc(k);
+    return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_stageMeta(uint32_t k,uint32_t s,uint32_t generation,
+                                         const MSXResidentPayload *x)
+{
+    Pipe *p; MSXResidentStatus z; double *r;
+    if (!x) return MSX_RESIDENT_ERR_ARGUMENT;
+    if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
+    z = pipeok(k, &p); if (z) return z;
+    if (s >= p->d.capacity || !p->used[s] || p->gen[s] != generation)
+        return MSX_RESIDENT_ERR_GENERATION;
+    if (x->parcelId && x->parcelId != p->id[s]) return MSX_RESIDENT_ERR_GENERATION;
+    r = crow(p, s);
+    if (r[0] == x->volume && r[1] == x->hstep && r[2] == x->hresponse &&
+        r[3] == x->uresponse && r[4] == x->dresponse)
+        return MSX_RESIDENT_OK;
+    r[0] = x->volume; r[1] = x->hstep; r[2] = x->hresponse;
+    r[3] = x->uresponse; r[4] = x->dresponse;
+    markslot(k, s, 1, MSX_RESIDENT_PATCH_META);
+    return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_stageReverse(uint32_t k)
+{
+    Pipe *p; MSXResidentStatus z;
+    if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
+    z = pipeok(k, &p); if (z) return z;
+    if (p->d.count <= 1) return MSX_RESIDENT_OK;
+    if (p->d.epoch == UINT64_MAX) return MSX_RESIDENT_ERR_OVERFLOW;
+    { uint32_t s = p->d.head; p->d.head = p->d.tail; p->d.tail = s; }
+    p->d.orient = -p->d.orient; p->d.epoch++; markdesc(k);
+    return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_getSlotForParcel(uint32_t k,uint64_t parcelId,
+                                                uint32_t *slotOut,uint32_t *generationOut)
+{
+    Pipe *p; int s; MSXResidentStatus z;
+    if (!parcelId) return MSX_RESIDENT_ERR_ARGUMENT;
+    z = pipeok(k, &p); if (z) return z; s = find(p, parcelId);
+    if (s < 0) return MSX_RESIDENT_ERR_GENERATION;
+    if (slotOut) *slotOut = (uint32_t)s;
+    if (generationOut) *generationOut = p->gen[s];
+    return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_getSlotGeneration(uint32_t k,uint32_t s,uint32_t *generationOut)
+{
+    Pipe *p; MSXResidentStatus z;
+    if (!generationOut) return MSX_RESIDENT_ERR_ARGUMENT;
+    z = pipeok(k, &p); if (z) return z;
+    if (s >= p->d.capacity || !p->used[s]) return MSX_RESIDENT_ERR_GENERATION;
+    *generationOut = p->gen[s]; return MSX_RESIDENT_OK;
 }
 MSXResidentStatus MSXresident_getSlotPayload(uint32_t k,uint32_t s,uint32_t g,MSXResidentPayload*x){Pipe*p;MSXResidentStatus z;if(!x)return MSX_RESIDENT_ERR_ARGUMENT;z=pipeok(k,&p);if(z)return z;if(s>=p->d.capacity||!p->used[s]||p->gen[s]!=g){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}getpayload(p,s,x);return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow*r,const MSXResidentPayload*x,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if((!r||!x)&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].globalRow!=S.base[r[i].linkIndex]+r[i].slot||r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].descriptorEpoch||p->id[r[i].slot]!=r[i].parcelId||!x[i].c||!x[i].lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=x[i].volume;q[1]=x[i].hstep;q[2]=x[i].hresponse;q[3]=x[i].uresponse;q[4]=x[i].dresponse;for(m=0;m<S.stride;m++){q[5+m]=x[i].c[m];lrow(p,r[i].slot)[5+m]=x[i].lastc[m];}}}return MSX_RESIDENT_OK;}
 uint64_t MSXresident_testAllocationCount(void){return ResidentAllocationCount;}
 void MSXresident_testResetAllocationCount(void){ResidentAllocationCount=0;}
 void MSXresident_testFailAllocationAfter(int64_t allocationIndex){ResidentAllocationFailAfter=allocationIndex;}
-MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*b){if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;b->descriptor=S.desc;b->descriptorCount=S.ndesc;b->slot=S.slot;b->slotCount=S.nslot;return MSX_RESIDENT_OK;}void MSXresident_clearPatches(void){uint32_t k,s;if(!S.open)return;S.ndesc=S.nslot=0;for(k=1;k<=S.nlinks;k++){S.dirty[k]=NONE;for(s=0;s<S.p[k].d.capacity;s++)S.p[k].patch[s]=NONE;}}
+MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*b){if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;b->descriptor=S.desc;b->descriptorCount=S.ndesc;b->slot=S.slot;b->slotCount=S.nslot;return MSX_RESIDENT_OK;}
+void MSXresident_clearPatches(void)
+{ uint32_t i,k,s; if(!S.open)return; for(i=0;i<S.ndesc;i++){k=S.desc[i].linkIndex;if(k&&k<=S.nlinks)S.dirty[k]=NONE;} for(i=0;i<S.nslot;i++){k=S.slot[i].linkIndex;s=S.slot[i].slot;if(k&&k<=S.nlinks&&s<S.p[k].d.capacity)S.p[k].patch[s]=NONE;} S.ndesc=S.nslot=0; }
 MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *o){uint32_t k;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(!S.open||!S.capacity||!S.base)return MSX_RESIDENT_DISABLED;if(!S.guard){S.guard=(uint32_t*)resident_calloc((size_t)S.nlinks+1,sizeof(*S.guard));if(!S.guard)return MSX_RESIDENT_ERR_MEMORY;for(k=1;k<=S.nlinks;k++)S.guard[k]=S.p[k].guard;}o->nLinks=S.nlinks;o->totalSlots=(uint32_t)S.slots;o->speciesStride=S.stride;o->capacity=S.capacity;o->base=S.base;o->guard=S.guard;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,uint32_t cap,uint32_t *count)
 { uint32_t k,s,n=0,total=0,base=0; if(!count||(!rows&&cap))return MSX_RESIDENT_ERR_ARGUMENT;*count=0;if(!S.open)return MSX_RESIDENT_DISABLED;
   for(k=1;k<=S.nlinks;k++){Pipe*p=&S.p[k];uint32_t seen=0;if(p->d.count>p->d.capacity||(p->d.count&&p->d.head>=p->d.capacity))return MSX_RESIDENT_ERR_CAPACITY;s=p->d.head;while(seen<p->d.count){if(s>=p->d.capacity||!p->used[s])return MSX_RESIDENT_ERR_GENERATION;if(n>=cap)return MSX_RESIDENT_ERR_CAPACITY;rows[n].linkIndex=k;rows[n].slot=s;rows[n].globalRow=base+s;rows[n].generation=p->gen[s];rows[n].descriptorHead=p->d.head;rows[n].descriptorCount=p->d.count;rows[n].descriptorOrient=p->d.orient;rows[n].descriptorEpoch=p->d.epoch;rows[n].parcelId=p->id[s];rows[n].volume=crow(p,s)[0];n++;seen++;s=(uint32_t)(((int64_t)s+p->d.orient+(int64_t)p->d.capacity)%(int64_t)p->d.capacity);}if(base>UINT32_MAX-p->d.capacity)return MSX_RESIDENT_ERR_OVERFLOW;base+=p->d.capacity;total+=seen;}
   if(total!=n||n>S.slots)return MSX_RESIDENT_ERR_OVERFLOW;*count=n;return MSX_RESIDENT_OK; }
-MSXResidentStatus MSXresident_getInitialBatch(MSXResidentPatchBatch *b){uint32_t k,s,n=0;if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;for(k=1;k<=S.nlinks;k++){S.desc[k-1].linkIndex=k;S.desc[k-1].descriptor=S.p[k].d;for(s=0;s<S.p[k].d.capacity;s++){MSXResidentSlotPatch*q=&S.slot[n++];q->linkIndex=k;q->slot=s;q->generation=S.p[k].gen[s];q->used=S.p[k].used[s];getpayload(&S.p[k],s,&q->payload);}}b->descriptor=S.desc;b->descriptorCount=S.nlinks;b->slot=S.slot;b->slotCount=n;return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_getInitialBatch(MSXResidentPatchBatch *b){uint32_t k,s,n=0;if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;if(!S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT;/* Initial image construction reuses the patch arenas; discard the staging
+   indices before filling the dense all-slot image so later incremental
+   markslot() calls cannot address overwritten records. */MSXresident_clearPatches();for(k=1;k<=S.nlinks;k++){S.desc[k-1].linkIndex=k;S.desc[k-1].descriptor=S.p[k].d;for(s=0;s<S.p[k].d.capacity;s++){MSXResidentSlotPatch*q=&S.slot[n++];q->linkIndex=k;q->slot=s;q->generation=S.p[k].gen[s];q->used=S.p[k].used[s];q->kind=q->used?MSX_RESIDENT_PATCH_IMPORT:MSX_RESIDENT_PATCH_INVALIDATE;getpayload(&S.p[k],s,&q->payload);}}b->descriptor=S.desc;b->descriptorCount=S.nlinks;b->slot=S.slot;b->slotCount=n;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_beginInitialImage(void)
 { if(!S.open||S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT; S.initialStaging=1; return MSX_RESIDENT_OK; }
 MSXResidentStatus MSXresident_stageInitialPipe(uint32_t k,const uint64_t *id,
@@ -233,7 +454,7 @@ void MSXresident_commitHandoffTransaction(MSXResidentHandoffTransaction *x)
         uint32_t s = t->result[i].slot;
         p->used[s] = 0; p->id[s] = 0;
         memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
-        markslot(t->plan.linkIndex, s, 0);
+        markslot(t->plan.linkIndex, s, 0, MSX_RESIDENT_PATCH_INVALIDATE);
     }
     p->d.count -= t->count;
     if (!p->d.count) p->d.head = p->d.tail = NONE;

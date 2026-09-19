@@ -21,7 +21,12 @@ typedef struct {
 } MSXResidentConfig;
 typedef struct { uint32_t linkIndex,capacity,head,tail,count; int32_t orient; uint64_t epoch; } MSXResidentPipeDesc;
 typedef struct { double volume,hstep,hresponse,uresponse,dresponse; uint64_t parcelId; uint32_t generation; const double *c,*lastc; } MSXResidentPayload;
-typedef struct { uint32_t linkIndex,slot,generation,used; MSXResidentPayload payload; } MSXResidentSlotPatch;
+typedef enum {
+ MSX_RESIDENT_PATCH_IMPORT = 1,
+ MSX_RESIDENT_PATCH_INVALIDATE = 2,
+ MSX_RESIDENT_PATCH_META = 3
+} MSXResidentPatchKind;
+typedef struct { uint32_t linkIndex,slot,generation,used; MSXResidentPatchKind kind; MSXResidentPayload payload; } MSXResidentSlotPatch;
 typedef struct { uint32_t linkIndex,reserved; MSXResidentPipeDesc descriptor; } MSXResidentDescriptorPatch;
 typedef struct { const MSXResidentDescriptorPatch *descriptor; uint32_t descriptorCount; const MSXResidentSlotPatch *slot; uint32_t slotCount; } MSXResidentPatchBatch;
 typedef struct { uint32_t linkIndex,slot,generation,boundarySide; uint64_t pipeEpoch; double requestedVolume; } MSXResidentHandoffItem;
@@ -41,6 +46,15 @@ MSXResidentStatus MSXresident_validateFeatures(int,int); MSXResidentStatus MSXre
 /* Pure configuration check: no CUDA allocation, topology mutation, or fallback. */
 MSXResidentStatus MSXresident_validateConfig(const MSXResidentConfig *config);
 MSXResidentStatus MSXresident_observePipe(uint32_t,const uint64_t*,const MSXResidentPayload*,uint32_t,int32_t);
+/* Incremental topology events.  They retain every surviving slot and only
+   advance descriptor epoch when the published ring topology changes. */
+MSXResidentStatus MSXresident_stageInsert(uint32_t,int,const MSXResidentPayload*,uint32_t*,uint32_t*);
+MSXResidentStatus MSXresident_stageRemove(uint32_t,uint32_t,uint32_t);
+MSXResidentStatus MSXresident_stageClear(uint32_t);
+MSXResidentStatus MSXresident_stageMeta(uint32_t,uint32_t,uint32_t,const MSXResidentPayload*);
+MSXResidentStatus MSXresident_stageReverse(uint32_t);
+MSXResidentStatus MSXresident_getSlotForParcel(uint32_t,uint64_t,uint32_t*,uint32_t*);
+MSXResidentStatus MSXresident_getSlotGeneration(uint32_t,uint32_t,uint32_t*);
 MSXResidentStatus MSXresident_getSlotPayload(uint32_t,uint32_t,uint32_t,MSXResidentPayload*);
 /* Updates only payload rows which still match the supplied active snapshot;
    it never changes descriptor topology or emits patches. */

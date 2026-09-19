@@ -78,6 +78,8 @@ typedef struct HybridPipe
        two allocators happen to recycle slots in the same order. */
     int *residentSlot;
     int *coreSlotForResident;
+    int *mapScratchResident;
+    int *mapScratchCore;
     uint64_t *observerId;
     MSXResidentPayload *observerPayload;
     struct HybridResidentTx *residentTx;
@@ -166,6 +168,110 @@ static int hybridRefreshResidentSlots(HybridPipe *p)
     return 1;
 }
 
+static int hybridResidentInsert(int k, int coreSlot, int atHead, Pseg source)
+{
+    HybridPipe *p = &Hybrid.pipe[k]; Pseg seg = source ? source : p->view[coreSlot];
+    MSXResidentPayload x; uint32_t residentSlot = 0, generation = 0;
+    MSXResidentStatus z;
+    if (!MSXresident_isOpen() || MSXresident_mode() == MSX_RESIDENT_OFF) return 0;
+    if (!seg) return ERR_PIPE_RING_CAPACITY;
+    memset(&x, 0, sizeof(x)); x.volume = seg->v; x.hstep = seg->hstep;
+    x.hresponse = seg->hresponse; x.uresponse = seg->uresponse;
+    x.dresponse = seg->dresponse; x.parcelId = seg->hybridId;
+    x.c = seg->c; x.lastc = seg->lastc;
+    z = MSXresident_stageInsert((uint32_t)k, atHead ? 0 : 1, &x,
+                                &residentSlot, &generation);
+    if (z != MSX_RESIDENT_OK) { HybridResidentStatus = z; return ERR_PIPE_RING_CAPACITY; }
+    p->residentSlot[coreSlot] = (int)residentSlot;
+    p->coreSlotForResident[residentSlot] = coreSlot;
+    (void)generation;
+    return 0;
+}
+
+static int hybridResidentRemove(int k, int coreSlot)
+{
+    HybridPipe *p = &Hybrid.pipe[k]; int residentSlot; uint32_t generation;
+    MSXResidentStatus z;
+    if (!MSXresident_isOpen() || MSXresident_mode() == MSX_RESIDENT_OFF) return 0;
+    if (coreSlot < 0 || coreSlot >= p->cap || !p->residentSlot) return ERR_PIPE_RING_CAPACITY;
+    residentSlot = p->residentSlot[coreSlot];
+    if (residentSlot < 0 || MSXresident_getSlotGeneration((uint32_t)k,
+                                                            (uint32_t)residentSlot,
+                                                            &generation) != MSX_RESIDENT_OK)
+        return ERR_PIPE_RING_CAPACITY;
+    z = MSXresident_stageRemove((uint32_t)k, (uint32_t)residentSlot,
+                                (uint32_t)generation);
+    if (z != MSX_RESIDENT_OK) { HybridResidentStatus = z; return ERR_PIPE_RING_CAPACITY; }
+    p->residentSlot[coreSlot] = -1;
+    p->coreSlotForResident[residentSlot] = -1;
+    return 0;
+}
+
+static int hybridResidentReverse(int k)
+{
+    MSXResidentStatus z;
+    if (!MSXresident_isOpen() || MSXresident_mode() == MSX_RESIDENT_OFF) return 0;
+    z = MSXresident_stageReverse((uint32_t)k);
+    if (z != MSX_RESIDENT_OK) { HybridResidentStatus = z; return ERR_PIPE_RING_CAPACITY; }
+    return 0;
+}
+
+/* MSXqual_reversesegs() has already flipped the linked list when this hook
+   runs.  Reversing it again is a bounded, non-fallible rollback used only if
+   the Resident metadata commit rejects the orientation change. */
+static void hybridRollbackListReverse(int k)
+{
+    Pseg seg, next, previous = NULL;
+    if (k <= 0 || k > MSX.Nobjects[LINK]) return;
+    seg = MSX.FirstSeg[k];
+    MSX.FirstSeg[k] = MSX.LastSeg[k];
+    MSX.LastSeg[k] = seg;
+    while (seg)
+    {
+        next = seg->prev;
+        seg->prev = previous;
+        seg->next = next;
+        previous = seg;
+        seg = next;
+    }
+}
+
+static int hybridSyncResidentMap(HybridPipe *p, int k)
+{
+    int coreSlot, residentSlot, remaining; uint32_t resident, generation; Pseg seg;
+    if (!p || !p->residentSlot || !p->coreSlotForResident ||
+        !p->mapScratchResident || !p->mapScratchCore || p->count < 0 ||
+        p->count > p->cap) return 0;
+    for (coreSlot = 0; coreSlot < p->cap; ++coreSlot)
+        p->mapScratchResident[coreSlot] = -1;
+    for (residentSlot = 0; residentSlot < p->cap; ++residentSlot)
+        p->mapScratchCore[residentSlot] = -1;
+    coreSlot = p->head; remaining = p->count;
+    while (remaining > 0 && coreSlot >= 0)
+    {
+        seg = p->view[coreSlot];
+        if (!seg || MSXresident_getSlotForParcel((uint32_t)k, seg->hybridId,
+                                                  &resident,
+                                                  &generation) != MSX_RESIDENT_OK)
+            return 0;
+        residentSlot = (int)resident;
+        if (residentSlot < 0 || residentSlot >= p->cap ||
+            p->mapScratchCore[residentSlot] >= 0)
+            return 0;
+        p->mapScratchResident[coreSlot] = residentSlot;
+        p->mapScratchCore[residentSlot] = coreSlot;
+        coreSlot = hybridNextSlot(p, coreSlot);
+        --remaining;
+    }
+    if (remaining != 0) return 0;
+    memcpy(p->residentSlot, p->mapScratchResident,
+           (size_t)p->cap * sizeof(*p->residentSlot));
+    memcpy(p->coreSlotForResident, p->mapScratchCore,
+           (size_t)p->cap * sizeof(*p->coreSlotForResident));
+    /* The observer is explicit/debug-only; restore the authoritative count. */
+    return 1;
+}
+
 /* Observer only: MSX.FirstSeg/LastSeg remain the sole topology authority. */
 static MSXResidentStatus hybridResidentObserve(int k)
 {
@@ -190,8 +296,7 @@ static MSXResidentStatus hybridResidentObserve(int k)
         }
         return HybridResidentStatus;
     }
-    if (p->count > p->cap || !p->observerPayload || !p->observerId ||
-        !hybridRefreshResidentSlots(p))
+    if (p->count > p->cap || !p->observerPayload || !p->observerId)
         return MSX_RESIDENT_ERR_MEMORY;
     payload = p->observerPayload;
     id = p->observerId;
@@ -218,19 +323,8 @@ static MSXResidentStatus hybridResidentObserve(int k)
        payload writeback address the same identities as the GPU image. */
     if (HybridResidentStatus == MSX_RESIDENT_OK)
     {
-        for (slot = 0; slot < p->cap; ++slot)
-        {
-            p->residentSlot[slot] = -1;
-            p->coreSlotForResident[slot] = -1;
-        }
-        slot = p->head;
-        for (pos = 0; pos < p->count; ++pos)
-        {
-            int resident = (int)(((int64_t)p->orient * pos + p->cap) % p->cap);
-            p->residentSlot[slot] = resident;
-            p->coreSlotForResident[resident] = slot;
-            slot = hybridNextSlot(p, slot);
-        }
+        if (!hybridSyncResidentMap(p, k))
+            HybridResidentStatus = MSX_RESIDENT_ERR_GENERATION;
     }
     return HybridResidentStatus;
 }
@@ -253,6 +347,8 @@ static void hybridFreePipe(HybridPipe *p)
     FREE(p->dresponse);
     FREE(p->residentSlot);
     FREE(p->coreSlotForResident);
+    FREE(p->mapScratchResident);
+    FREE(p->mapScratchCore);
     FREE(p->observerId);
     FREE(p->observerPayload);
     if (p->residentTx)
@@ -330,12 +426,15 @@ static int hybridAllocPipe(HybridPipe *p, int cap)
     p->dresponse = (double *)calloc(slots, sizeof(double));
     p->residentSlot = (int *)malloc(slots * sizeof(int));
     p->coreSlotForResident = (int *)malloc(slots * sizeof(int));
+    p->mapScratchResident = (int *)malloc(slots * sizeof(int));
+    p->mapScratchCore = (int *)malloc(slots * sizeof(int));
     p->observerId = (uint64_t *)calloc(slots, sizeof(uint64_t));
     p->observerPayload = (MSXResidentPayload *)calloc(slots, sizeof(MSXResidentPayload));
     p->residentTx = (HybridResidentTx *)calloc(1, sizeof(HybridResidentTx));
     if (!p->used || !p->view || !p->c || !p->lastc || !p->v ||
         !p->hstep || !p->hresponse || !p->uresponse || !p->dresponse ||
         !p->residentSlot || !p->coreSlotForResident ||
+        !p->mapScratchResident || !p->mapScratchCore ||
         !p->observerId || !p->observerPayload || !p->residentTx)
     {
         hybridFreePipe(p);
@@ -413,9 +512,11 @@ static int hybridEnsureCapacity(int k, int need)
     Pseg *oldview;
     unsigned char *oldused;
     int *oldResidentSlot, *oldCoreSlotForResident;
+    int *oldMapScratchResident, *oldMapScratchCore;
     Pseg *newview;
     unsigned char *newused;
     int *newResidentSlot, *newCoreSlotForResident;
+    int *newMapScratchResident, *newMapScratchCore;
     uint64_t *newObserverId;
     MSXResidentPayload *newObserverPayload;
 
@@ -445,16 +546,20 @@ static int hybridEnsureCapacity(int k, int need)
     newused = (unsigned char *)calloc((size_t)cap, sizeof(unsigned char));
     newResidentSlot = (int *)malloc((size_t)cap * sizeof(int));
     newCoreSlotForResident = (int *)malloc((size_t)cap * sizeof(int));
+    newMapScratchResident = (int *)malloc((size_t)cap * sizeof(int));
+    newMapScratchCore = (int *)malloc((size_t)cap * sizeof(int));
     newObserverId = (uint64_t *)calloc((size_t)cap, sizeof(uint64_t));
     newObserverPayload = (MSXResidentPayload *)calloc((size_t)cap, sizeof(MSXResidentPayload));
     if (!newc || !newlastc || !newv || !newhstep || !newhresponse ||
         !newuresponse || !newdresponse || !newview || !newused ||
         !newResidentSlot || !newCoreSlotForResident ||
+        !newMapScratchResident || !newMapScratchCore ||
         !newObserverId || !newObserverPayload)
     {
         FREE(newc); FREE(newlastc); FREE(newv); FREE(newhstep);
         FREE(newhresponse); FREE(newuresponse); FREE(newdresponse);
         FREE(newview); FREE(newused); FREE(newResidentSlot); FREE(newCoreSlotForResident);
+        FREE(newMapScratchResident); FREE(newMapScratchCore);
         FREE(newObserverId); FREE(newObserverPayload);
         return ERR_MEMORY;
     }
@@ -463,7 +568,10 @@ static int hybridEnsureCapacity(int k, int need)
     olddresponse = p->dresponse; oldview = p->view; oldused = p->used;
     oldResidentSlot = p->residentSlot;
     oldCoreSlotForResident = p->coreSlotForResident;
+    oldMapScratchResident = p->mapScratchResident;
+    oldMapScratchCore = p->mapScratchCore;
     for (i = 0; i < cap; ++i) newResidentSlot[i] = newCoreSlotForResident[i] = -1;
+    for (i = 0; i < cap; ++i) newMapScratchResident[i] = newMapScratchCore[i] = -1;
     oldslot = p->count > 0 ? p->head : -1;
     for (pos = 0; pos < p->count; pos++)
     {
@@ -481,6 +589,8 @@ static int hybridEnsureCapacity(int k, int need)
         newview[pos] = seg;
         newused[pos] = TRUE;
         newResidentSlot[pos] = oldResidentSlot ? oldResidentSlot[oldslot] : -1;
+        if (newResidentSlot[pos] >= 0 && newResidentSlot[pos] < cap)
+            newCoreSlotForResident[newResidentSlot[pos]] = pos;
         oldslot += p->orient;
         if (oldslot >= oldcap) oldslot = 0;
         if (oldslot < 0) oldslot = oldcap - 1;
@@ -503,6 +613,7 @@ static int hybridEnsureCapacity(int k, int need)
             FREE(newc); FREE(newlastc); FREE(newv); FREE(newhstep);
             FREE(newhresponse); FREE(newuresponse); FREE(newdresponse);
             FREE(newview); FREE(newused); FREE(newResidentSlot); FREE(newCoreSlotForResident);
+            FREE(newMapScratchResident); FREE(newMapScratchCore);
             FREE(newObserverId); FREE(newObserverPayload);
             return ERR_MEMORY;
         }
@@ -513,12 +624,15 @@ static int hybridEnsureCapacity(int k, int need)
     FREE(oldhresponse); FREE(olduresponse); FREE(olddresponse);
     FREE(oldview); FREE(oldused);
     FREE(oldResidentSlot); FREE(oldCoreSlotForResident);
+    FREE(oldMapScratchResident); FREE(oldMapScratchCore);
     FREE(p->observerId); FREE(p->observerPayload);
     p->c = newc; p->lastc = newlastc; p->v = newv; p->hstep = newhstep;
     p->hresponse = newhresponse; p->uresponse = newuresponse;
     p->dresponse = newdresponse; p->view = newview; p->used = newused;
     p->residentSlot = newResidentSlot;
     p->coreSlotForResident = newCoreSlotForResident;
+    p->mapScratchResident = newMapScratchResident;
+    p->mapScratchCore = newMapScratchCore;
     p->observerId = newObserverId; p->observerPayload = newObserverPayload;
     p->cap = cap;
     p->orient = 1;
@@ -886,7 +1000,18 @@ void MSXsegStorage_hybridCommitPreparedResidentMaterialization(
                                   : (i + 1 < t->count ? t->boundary[i + 1] : t->up[i]);
         t->oldCore[i]->next = NULL; t->oldCore[i]->prev = NULL;
         t->oldCore[i]->inHybridCore = FALSE; t->oldCore[i]->ownerLink = 0;
-        t->oldCore[i]->hybridId = 0; t->pipe->used[t->slot[i]] = FALSE;
+        t->oldCore[i]->hybridId = 0;
+        /* Handoff commit removes the resident row as well as the CPU Core
+           object.  Keep both directions of the slot map authoritative so a
+           later promote/demote cannot address a stale resident slot. */
+        if (t->slot[i] >= 0 && t->slot[i] < t->pipe->cap)
+        {
+            int residentSlot = t->pipe->residentSlot[t->slot[i]];
+            if (residentSlot >= 0 && residentSlot < t->pipe->cap)
+                t->pipe->coreSlotForResident[residentSlot] = -1;
+            t->pipe->residentSlot[t->slot[i]] = -1;
+            t->pipe->used[t->slot[i]] = FALSE;
+        }
     }
     if (down) down->prev = bottom; else MSX.FirstSeg[t->linkIndex] = bottom;
     if (up) up->next = top; else MSX.LastSeg[t->linkIndex] = top;
@@ -979,9 +1104,11 @@ static int hybridPromote(int k, Pseg boundary, int atHead)
         ENwriteline(MSX.Msg);
         return ERR_PIPE_RING_CAPACITY;
     }
+    /* Publish the fallible Resident row first.  The remaining CPU writes are
+       bounded stores/list rewiring and cannot leave a half-promoted slot. */
+    if (hybridResidentInsert(k, slot, atHead, boundary)) return ERR_PIPE_RING_CAPACITY;
     hybridCopyBoundaryToSlot(k, slot, boundary);
     p->used[slot] = TRUE;
-    if (p->residentSlot) p->residentSlot[slot] = -1;
     p->count++;
     if (p->count == 1) p->head = p->tail = slot;
     else if (atHead) p->head = slot;
@@ -1008,12 +1135,16 @@ static int hybridDemote(int k, int atHead)
     boundary = MSXqual_getFreeSeg(0.0, core->c);
     if (!boundary) return ERR_MEMORY;
     hybridCopySlotToBoundary(k, slot, boundary);
+    if (hybridResidentRemove(k, slot))
+    {
+        MSXqual_removeSeg(boundary);
+        return ERR_PIPE_RING_CAPACITY;
+    }
     hybridReplaceInList(k, core, boundary);
     core->inHybridCore = FALSE;
     core->ownerLink = 0;
     core->hybridId = 0;
     p->used[slot] = FALSE;
-    if (p->residentSlot) p->residentSlot[slot] = -1;
     if (p->count == 1)
     {
         p->count = 0;
@@ -1141,8 +1272,6 @@ int MSXsegStorage_hybridizeAll(void)
             MSX.ErrCode = err;
             return err;
         }
-        HybridResidentStatus = hybridResidentObserve(k);
-        if (HybridResidentStatus != MSX_RESIDENT_OK) return ERR_PIPE_RING_CAPACITY;
     }
     return 0;
 }
@@ -1181,6 +1310,7 @@ int MSXsegStorage_hybridRemoveHead(int k, Pseg seg)
         return ERR_PIPE_RING_CAPACITY;
     }
     next = seg->prev;
+    if (hybridResidentRemove(k, slot)) return ERR_PIPE_RING_CAPACITY;
     if (next) next->next = NULL;
     else MSX.LastSeg[k] = NULL;
     MSX.FirstSeg[k] = next;
@@ -1191,7 +1321,6 @@ int MSXsegStorage_hybridRemoveHead(int k, Pseg seg)
     seg->ownerLink = 0;
     seg->hybridId = 0;
     p->used[slot] = FALSE;
-    if (p->residentSlot) p->residentSlot[slot] = -1;
     if (p->count == 1)
     {
         p->count = 0;
@@ -1214,36 +1343,80 @@ void MSXsegStorage_hybridRebalanceAll(void)
     {
         err = hybridRebalanceLink(k);
         if (err) { MSX.ErrCode = err; return; }
-        HybridResidentStatus = hybridResidentObserve(k);
-        if (HybridResidentStatus != MSX_RESIDENT_OK) { MSX.ErrCode = ERR_PIPE_RING_CAPACITY; return; }
     }
 }
 
-void MSXsegStorage_hybridAfterListReorder(int k)
+int MSXsegStorage_hybridAfterListReorder(int k)
 {
     HybridPipe *p;
     Pseg firstCore, lastCore;
     int down, up, count;
-    if (!MSXsegStorage_isHybridLink(k)) return;
+    if (!MSXsegStorage_isHybridLink(k)) return 0;
     p = &Hybrid.pipe[k];
-    hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
-    if (count > 1) p->orient = -p->orient;
-    HybridResidentStatus = hybridResidentObserve(k);
-    if (HybridResidentStatus != MSX_RESIDENT_OK) MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+    if (p->count > 1)
+    {
+        /* Resident metadata is the fallible commit.  If it rejects (only
+           epoch exhaustion or a poisoned state), restore the already-flipped
+           CPU list before returning so the two owners cannot diverge. */
+        if (hybridResidentReverse(k))
+        {
+            hybridRollbackListReverse(k);
+            MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+            return ERR_PIPE_RING_CAPACITY;
+        }
+        p->orient = -p->orient;
+        hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+    }
+    return 0;
 }
 
 void MSXsegStorage_hybridClear(int k)
 {
     HybridPipe *p;
     Pseg seg, next;
+    MSXResidentStatus z;
     if (!MSXsegStorage_isHybridLink(k)) return;
     p = &Hybrid.pipe[k];
+    /* Validate every CPU-side mapping before the single fallible Resident
+       clear.  The commit loop below contains only bounded stores and pool
+       returns, so it cannot strand a half-cleared ring. */
+    for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev)
+        if (seg->inHybridCore)
+        {
+            int coreSlot = seg->hybridSlot;
+            int residentSlot;
+            if (coreSlot < 0 || coreSlot >= p->cap || !p->used[coreSlot] ||
+                !p->residentSlot || !p->coreSlotForResident)
+            {
+                MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+                return;
+            }
+            residentSlot = p->residentSlot[coreSlot];
+            if (residentSlot < 0 || residentSlot >= p->cap ||
+                p->coreSlotForResident[residentSlot] != coreSlot)
+            {
+                MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+                return;
+            }
+        }
+    z = MSXresident_stageClear((uint32_t)k);
+    if (z != MSX_RESIDENT_OK)
+    {
+        HybridResidentStatus = z;
+        MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+        return;
+    }
     seg = MSX.FirstSeg[k];
     while (seg)
     {
         next = seg->prev;
         if (seg->inHybridCore)
         {
+            int coreSlot = seg->hybridSlot;
+            int residentSlot = p->residentSlot[coreSlot];
+            p->residentSlot[coreSlot] = -1;
+            if (residentSlot >= 0 && residentSlot < p->cap)
+                p->coreSlotForResident[residentSlot] = -1;
             seg->inHybridCore = FALSE;
             seg->ownerLink = 0;
             seg->hybridId = 0;
@@ -1258,6 +1431,8 @@ void MSXsegStorage_hybridClear(int k)
     p->count = 0;
     p->head = p->tail = -1;
     memset(p->used, 0, (size_t)p->cap * sizeof(unsigned char));
+    memset(p->residentSlot, 0xFF, (size_t)p->cap * sizeof(int));
+    memset(p->coreSlotForResident, 0xFF, (size_t)p->cap * sizeof(int));
 }
 
 int MSXsegStorage_hybridCoreCount(int k)

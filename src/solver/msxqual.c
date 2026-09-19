@@ -511,6 +511,12 @@ int MSXqual_step(double *t, double *tleft)
                             MSXgpu_profileRunPhase(MSX_PROFILE_RUN_FLOW_REORIENT, phaseMs);
                             qualityApiExclusive += phaseMs;
                         }
+                        if (MSX.ErrCode)
+                        {
+                            finishQualityApiProfile(profileStage, qualityApiStart,
+                                                    qualityApiExclusive);
+                            return MSX.ErrCode;
+                        }
                     }
 
                     if (flowchanged)
@@ -1166,7 +1172,8 @@ int  flowdirchanged()
         if (newdir*MSX.FlowDir[k] < 0)
         {
             MSXqual_reversesegs(k);
-            MSXsegStorage_hybridAfterListReorder(k);
+            if (MSXsegStorage_hybridAfterListReorder(k))
+                return flowchanged;
         }
         if (newdir != MSX.FlowDir[k])
         {

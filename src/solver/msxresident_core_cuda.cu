@@ -34,8 +34,9 @@ static void MSXgpu_profileRecordTransfer(int direction,int scope,uint64_t bytes,
 #define MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC 10
 #define MSX_PROFILE_TRANSFER_SCOPE_AGGREGATE 11
 typedef struct { uint32_t link,capacity,head,tail,count; int32_t orient; uint64_t epoch; } DDesc;
-typedef struct { uint32_t link,row,generation,used; uint64_t id; double v,h,hr,ur,dr; } Stage;
-struct MSXResidentGpu { uint32_t n,slots,owned,stride,activeCount; int device,uploaded,poisoned,activePrepared,diagnostic,aggregateValid; uint64_t stateVersion,aggregateVersion; uint32_t *cap,*base,*hu,*hg,*haPipe,*haRow,*haGen,*haNf,*haNj,*haNa,*haNr,*daPipe,*daRow,*daNf,*daNj,*daNa,*daNr,*dBase; int *haErr,*daErr,*dError; uint64_t *he,*hi,*haEpoch; DDesc *hd,*dd; Stage *hPatch,*hGather,*dPatchStage,*dGatherStage; double *hPatchC,*hPatchL,*hGatherC,*hGatherL,*dPatchC,*dPatchL,*dGatherC,*dGatherL,*haVol,*haHyd,*haH,*haLast,*haReacted,*daVol,*daHyd,*daH,*daLast,*daReacted; uint32_t *du,*dg; uint64_t *di; double *dv,*dh,*dhr,*dur,*ddr,*dc,*dl,*dmass; MSXResidentGpuReduction *dred,*hAggLink,*dAggLink, c,aggregate; double *hAggMass,*dAggMass,*aggregateMass; };
+typedef struct { uint32_t link; DDesc descriptor; } DDescStage;
+typedef struct { uint32_t link,row,generation,used,kind,payloadRow; uint64_t id; double v,h,hr,ur,dr; } Stage;
+struct MSXResidentGpu { uint32_t n,slots,owned,stride,activeCount; int device,uploaded,poisoned,activePrepared,diagnostic,aggregateValid; uint64_t stateVersion,aggregateVersion; uint32_t *cap,*base,*hu,*hg,*haPipe,*haRow,*haGen,*haNf,*haNj,*haNa,*haNr,*daPipe,*daRow,*daNf,*daNj,*daNa,*daNr,*dBase; int *haErr,*daErr,*dError; uint64_t *he,*hi,*haEpoch; DDesc *hd,*dd; DDescStage *hPatchDesc,*dPatchDesc; Stage *hPatch,*hGather,*dPatchStage,*dGatherStage; double *hPatchC,*hPatchL,*hGatherC,*hGatherL,*dPatchC,*dPatchL,*dGatherC,*dGatherL,*haVol,*haHyd,*haH,*haLast,*haReacted,*daVol,*daHyd,*daH,*daLast,*daReacted; uint32_t *du,*dg; uint64_t *di; double *dv,*dh,*dhr,*dur,*ddr,*dc,*dl,*dmass; MSXResidentGpuReduction *dred,*hAggLink,*dAggLink, c,aggregate; double *hAggMass,*dAggMass,*aggregateMass; };
 static cudaError_t trackedCopy(void *dst,const void *src,size_t bytes,
                                cudaMemcpyKind kind,int direction,int scope)
 {
@@ -56,7 +57,7 @@ static int copyScope(MSXResidentGpu *g,const void *dst,const void *src,
         return MSX_PROFILE_TRANSFER_SCOPE_PATCH_STAGE;
     if (dst == (const void *)g->dPatchC || dst == (const void *)g->dPatchL)
         return MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD;
-    if (dst == (const void *)g->dd)
+    if (dst == (const void *)g->dPatchDesc)
         return MSX_PROFILE_TRANSFER_SCOPE_PATCH_DESCRIPTOR;
     if (dst == (const void *)g->dGatherStage ||
         dst == (const void *)g->hGather ||
@@ -88,10 +89,12 @@ typedef enum { V_OK,V_DESCRIPTOR,V_CAPACITY,V_GENERATION,V_EPOCH } VStatus;
 static int ck(cudaError_t e){return e==cudaSuccess;} static int mul(size_t a,size_t b,size_t*r){if(a&&b>SIZE_MAX/a)return 0;*r=a*b;return 1;} static int da(void**p,size_t n){return ck(cudaMalloc(p,n));}
 static int use(MSXResidentGpu*g){int now=-1;return g&&ck(cudaGetDevice(&now))&&((now==g->device)||ck(cudaSetDevice(g->device)));}
 static MSXResidentStatus badgpu(MSXResidentGpu*g,MSXResidentStatus s){if(g){g->c.cudaErrors++;if(!g->poisoned)g->c.cudaPoisons++;g->poisoned=1;g->activePrepared=0;}return s;}
-static void gone(MSXResidentGpu*g){if(!g)return;cudaFree(g->dd);cudaFree(g->dPatchStage);cudaFree(g->dGatherStage);cudaFree(g->dPatchC);cudaFree(g->dPatchL);cudaFree(g->dGatherC);cudaFree(g->dGatherL);cudaFree(g->du);cudaFree(g->dg);cudaFree(g->di);cudaFree(g->dv);cudaFree(g->dh);cudaFree(g->dhr);cudaFree(g->dur);cudaFree(g->ddr);cudaFree(g->dc);cudaFree(g->dl);cudaFree(g->dmass);cudaFree(g->dred);cudaFree(g->dAggLink);cudaFree(g->dAggMass);cudaFree(g->dBase);cudaFree(g->dError);cudaFree(g->daPipe);cudaFree(g->daRow);cudaFree(g->daVol);cudaFree(g->daHyd);cudaFree(g->daH);cudaFree(g->daNf);cudaFree(g->daNj);cudaFree(g->daNa);cudaFree(g->daNr);cudaFree(g->daErr);cudaFree(g->daLast);cudaFree(g->daReacted);cudaFreeHost(g->hd);cudaFreeHost(g->hPatch);cudaFreeHost(g->hGather);cudaFreeHost(g->hPatchC);cudaFreeHost(g->hPatchL);cudaFreeHost(g->hGatherC);cudaFreeHost(g->hGatherL);free(g->cap);free(g->base);free(g->hu);free(g->hg);free(g->he);free(g->hi);free(g->haPipe);free(g->haRow);free(g->haGen);free(g->haNf);free(g->haNj);free(g->haNa);free(g->haNr);free(g->haErr);free(g->haEpoch);free(g->haVol);free(g->haHyd);free(g->haH);free(g->haLast);free(g->haReacted);free(g->hAggLink);free(g->hAggMass);free(g->aggregateMass);free(g);}
+static void gone(MSXResidentGpu*g){if(!g)return;cudaFree(g->dd);cudaFree(g->dPatchDesc);cudaFree(g->dPatchStage);cudaFree(g->dGatherStage);cudaFree(g->dPatchC);cudaFree(g->dPatchL);cudaFree(g->dGatherC);cudaFree(g->dGatherL);cudaFree(g->du);cudaFree(g->dg);cudaFree(g->di);cudaFree(g->dv);cudaFree(g->dh);cudaFree(g->dhr);cudaFree(g->dur);cudaFree(g->ddr);cudaFree(g->dc);cudaFree(g->dl);cudaFree(g->dmass);cudaFree(g->dred);cudaFree(g->dAggLink);cudaFree(g->dAggMass);cudaFree(g->dBase);cudaFree(g->dError);cudaFree(g->daPipe);cudaFree(g->daRow);cudaFree(g->daVol);cudaFree(g->daHyd);cudaFree(g->daH);cudaFree(g->daNf);cudaFree(g->daNj);cudaFree(g->daNa);cudaFree(g->daNr);cudaFree(g->daErr);cudaFree(g->daLast);cudaFree(g->daReacted);cudaFreeHost(g->hd);cudaFreeHost(g->hPatchDesc);cudaFreeHost(g->hPatch);cudaFreeHost(g->hGather);cudaFreeHost(g->hPatchC);cudaFreeHost(g->hPatchL);cudaFreeHost(g->hGatherC);cudaFreeHost(g->hGatherL);free(g->cap);free(g->base);free(g->hu);free(g->hg);free(g->he);free(g->hi);free(g->haPipe);free(g->haRow);free(g->haGen);free(g->haNf);free(g->haNj);free(g->haNa);free(g->haNr);free(g->haErr);free(g->haEpoch);free(g->haVol);free(g->haHyd);free(g->haH);free(g->haLast);free(g->haReacted);free(g->hAggLink);free(g->hAggMass);free(g->aggregateMass);free(g);}
 extern "C" int MSXresidentGpu_isEnabled(void){return 1;}
 extern "C" MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen*o,MSXResidentGpu**out){MSXResidentGpu*g;size_t lb,rb,owned=0;if(!out||*out||!o||!o->nLinks||!o->totalSlots||!o->speciesStride||!o->capacity||!o->base)return MSX_RESIDENT_ERR_ARGUMENT;if(!ck(cudaSetDevice(0))||!ck(cudaFree(0)))return MSX_RESIDENT_ERR_GPU;if(!mul((size_t)o->nLinks+1,sizeof(uint32_t),&lb)||!mul((size_t)o->totalSlots,o->speciesStride,&rb)||!mul(rb,sizeof(double),&rb))return MSX_RESIDENT_ERR_OVERFLOW;for(uint32_t k=1;k<=o->nLinks;k++){if(!o->capacity[k]||o->base[k]>o->totalSlots||o->capacity[k]>o->totalSlots-o->base[k]||owned>o->totalSlots-o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;owned+=o->capacity[k];for(uint32_t q=1;q<k;q++)if(o->base[k]<o->base[q]+o->capacity[q]&&o->base[q]<o->base[k]+o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;}g=(MSXResidentGpu*)calloc(1,sizeof(*g));if(!g)return MSX_RESIDENT_ERR_MEMORY;g->device=0;g->n=o->nLinks;g->slots=o->totalSlots;g->owned=(uint32_t)owned;g->stride=o->speciesStride;g->cap=(uint32_t*)calloc(g->n+1,sizeof(uint32_t));g->base=(uint32_t*)calloc(g->n+1,sizeof(uint32_t));g->hu=(uint32_t*)calloc(g->slots,sizeof(uint32_t));g->hg=(uint32_t*)calloc(g->slots,sizeof(uint32_t));g->he=(uint64_t*)calloc(g->n+1,sizeof(uint64_t));g->hi=(uint64_t*)calloc(g->slots,sizeof(uint64_t));if(!g->cap||!g->base||!g->hu||!g->hg||!g->he||!g->hi)goto mem;memcpy(g->cap,o->capacity,lb);memcpy(g->base,o->base,lb);if(!ck(cudaHostAlloc(&g->hd,((size_t)g->n+1)*sizeof(DDesc),0))||!ck(cudaHostAlloc(&g->hPatch,(size_t)g->slots*sizeof(Stage),0))||!ck(cudaHostAlloc(&g->hGather,(size_t)g->slots*sizeof(Stage),0))||!ck(cudaHostAlloc(&g->hPatchC,rb,0))||!ck(cudaHostAlloc(&g->hPatchL,rb,0))||!ck(cudaHostAlloc(&g->hGatherC,rb,0))||!ck(cudaHostAlloc(&g->hGatherL,rb,0)))goto mem;
+if(!ck(cudaHostAlloc(&g->hPatchDesc,(size_t)g->n*sizeof(DDescStage),0)))goto mem;
 #define A(x,n) if(!da((void**)&g->x,n))goto mem
+A(dPatchDesc,(size_t)g->n*sizeof(DDescStage));
 A(dd,((size_t)g->n+1)*sizeof(DDesc));A(dPatchStage,(size_t)g->slots*sizeof(Stage));A(dGatherStage,(size_t)g->slots*sizeof(Stage));A(dPatchC,rb);A(dPatchL,rb);A(dGatherC,rb);A(dGatherL,rb);A(du,(size_t)g->slots*sizeof(uint32_t));A(dg,(size_t)g->slots*sizeof(uint32_t));A(di,(size_t)g->slots*sizeof(uint64_t));A(dv,(size_t)g->slots*sizeof(double));A(dh,(size_t)g->slots*sizeof(double));A(dhr,(size_t)g->slots*sizeof(double));A(dur,(size_t)g->slots*sizeof(double));A(ddr,(size_t)g->slots*sizeof(double));A(dc,rb);A(dl,rb);A(dmass,(size_t)g->stride*sizeof(double));A(dred,sizeof(*g->dred));
 #undef A
 g->haPipe=(uint32_t*)calloc(g->owned,sizeof(uint32_t));g->haRow=(uint32_t*)calloc(g->owned,sizeof(uint32_t));g->haGen=(uint32_t*)calloc(g->owned,sizeof(uint32_t));g->haNf=(uint32_t*)calloc(g->owned,sizeof(uint32_t));g->haNj=(uint32_t*)calloc(g->owned,sizeof(uint32_t));g->haNa=(uint32_t*)calloc(g->owned,sizeof(uint32_t));g->haNr=(uint32_t*)calloc(g->owned,sizeof(uint32_t));g->haErr=(int*)calloc(g->owned,sizeof(int));g->haEpoch=(uint64_t*)calloc(g->owned,sizeof(uint64_t));g->haVol=(double*)calloc(g->owned,sizeof(double));g->haHyd=(double*)calloc((size_t)g->owned*MSX_RESIDENT_HYD_STRIDE,sizeof(double));g->haH=(double*)calloc(g->owned,sizeof(double));g->haLast=(double*)calloc(g->owned,sizeof(double));g->haReacted=(double*)calloc((size_t)(g->n+1)*g->stride,sizeof(double));g->hAggLink=(MSXResidentGpuReduction*)calloc((size_t)g->n+1,sizeof(MSXResidentGpuReduction));g->hAggMass=(double*)calloc((size_t)(g->n+1)*g->stride,sizeof(double));g->aggregateMass=(double*)calloc(g->stride,sizeof(double));if(!g->haPipe||!g->haRow||!g->haGen||!g->haNf||!g->haNj||!g->haNa||!g->haNr||!g->haErr||!g->haEpoch||!g->haVol||!g->haHyd||!g->haH||!g->haLast||!g->haReacted||!g->hAggLink||!g->hAggMass||!g->aggregateMass)goto mem;
@@ -101,9 +104,147 @@ if(!ck(cudaMemcpy(g->dBase,g->base,((size_t)g->n+1)*sizeof(uint32_t),cudaMemcpyH
 /* haNf/haNj are preallocated active-result buffers.  They are only scratch
    while no active batch is prepared, so validation needs no steady-state
    allocation.  Each global row maps to one array element. */
-static VStatus valid(MSXResidentGpu*g,const MSXResidentPatchBatch*b,int initial){VStatus z=V_OK;if(!g||!b||(!b->descriptor&&b->descriptorCount)||(!b->slot&&b->slotCount)||(initial&&(b->descriptorCount!=g->n||b->slotCount!=g->owned)))return V_DESCRIPTOR;for(uint32_t i=0;i<b->descriptorCount;i++){const MSXResidentDescriptorPatch*x=&b->descriptor[i];const MSXResidentPipeDesc*d=&x->descriptor;uint32_t k=x->linkIndex;if(!k||k>g->n||d->linkIndex!=k||d->capacity!=g->cap[k]||d->orient<-1||d->orient>1||!d->orient||d->count>d->capacity||(d->count&&(d->head>=d->capacity||d->tail>=d->capacity))||(!d->count&&(d->head!=UINT32_MAX||d->tail!=UINT32_MAX))){z=V_DESCRIPTOR;goto done;}if(!initial&&d->epoch<g->he[k]){z=V_EPOCH;goto done;}if(g->haNj[k]){z=V_DESCRIPTOR;goto done;}g->haNj[k]=i+1;}for(uint32_t i=0;i<b->slotCount;i++){const MSXResidentSlotPatch*x=&b->slot[i];uint32_t r;if(!x->linkIndex||x->linkIndex>g->n||x->slot>=g->cap[x->linkIndex]){z=V_CAPACITY;goto done;}if(x->used&&(!x->generation||!x->payload.c||!x->payload.lastc)){z=V_DESCRIPTOR;goto done;}r=g->base[x->linkIndex]+x->slot;if(!initial&&x->generation<g->hg[r]){z=V_GENERATION;goto done;}if(g->haNf[r]){z=V_DESCRIPTOR;goto done;}g->haNf[r]=i+1;}for(uint32_t i=0;i<b->descriptorCount;i++){const MSXResidentPipeDesc*d=&b->descriptor[i].descriptor;uint32_t c=0,k=d->linkIndex;for(uint32_t s=0;s<d->capacity;s++){uint32_t row=g->base[k]+s,p=g->haNf[row];c+=p?b->slot[p-1].used:g->hu[row];}if(c!=d->count){z=V_DESCRIPTOR;goto done;}if(d->count){uint32_t s=d->head;for(uint32_t j=0;j<d->count;j++){uint32_t p=g->haNf[g->base[k]+s];if(!(p?b->slot[p-1].used:g->hu[g->base[k]+s])){z=V_DESCRIPTOR;goto done;}s=(uint32_t)(((int64_t)s+d->orient+(int64_t)d->capacity)%d->capacity);}if(s!=(uint32_t)(((int64_t)d->tail+d->orient+(int64_t)d->capacity)%d->capacity)){z=V_DESCRIPTOR;goto done;}}}if(initial)for(uint32_t k=1;k<=g->n;k++){if(!g->haNj[k]){z=V_DESCRIPTOR;goto done;}for(uint32_t s=0;s<g->cap[k];s++)if(!g->haNf[g->base[k]+s]){z=V_DESCRIPTOR;goto done;}}done:for(uint32_t i=0;i<b->descriptorCount;i++)if(b->descriptor[i].linkIndex&&b->descriptor[i].linkIndex<=g->n)g->haNj[b->descriptor[i].linkIndex]=0;for(uint32_t i=0;i<b->slotCount;i++)if(b->slot[i].linkIndex&&b->slot[i].linkIndex<=g->n&&b->slot[i].slot<g->cap[b->slot[i].linkIndex])g->haNf[g->base[b->slot[i].linkIndex]+b->slot[i].slot]=0;return z;}
+static VStatus valid(MSXResidentGpu*g,const MSXResidentPatchBatch*b,int initial)
+{
+    VStatus z = V_OK;
+    uint32_t i;
+    if (!g || !b || (!b->descriptor && b->descriptorCount) ||
+        (!b->slot && b->slotCount))
+        return V_DESCRIPTOR;
+    if (initial && (b->descriptorCount != g->n ||
+                    b->slotCount != g->owned))
+    {
+        z = V_DESCRIPTOR;
+        goto done;
+    }
+    for (i = 0; i < b->descriptorCount; ++i)
+    {
+        const MSXResidentDescriptorPatch *x = &b->descriptor[i];
+        const MSXResidentPipeDesc *d = &x->descriptor;
+        uint32_t k = x->linkIndex;
+        if (!k || k > g->n || d->linkIndex != k ||
+            d->capacity != g->cap[k] || d->orient < -1 || d->orient > 1 ||
+            !d->orient || d->count > d->capacity ||
+            (d->count && (d->head >= d->capacity || d->tail >= d->capacity)) ||
+            (!d->count && (d->head != UINT32_MAX || d->tail != UINT32_MAX)))
+        {
+            z = V_DESCRIPTOR;
+            goto done;
+        }
+        if (!initial && d->epoch < g->he[k])
+        {
+            z = V_EPOCH;
+            goto done;
+        }
+        if (g->haNj[k])
+        {
+            z = V_DESCRIPTOR;
+            goto done;
+        }
+        g->haNj[k] = i + 1;
+    }
+    for (i = 0; i < b->slotCount; ++i)
+    {
+        const MSXResidentSlotPatch *x = &b->slot[i];
+        MSXResidentPatchKind kind = x->kind ? x->kind :
+            (x->used ? MSX_RESIDENT_PATCH_IMPORT : MSX_RESIDENT_PATCH_INVALIDATE);
+        uint32_t r;
+        if (!x->linkIndex || x->linkIndex > g->n ||
+            x->slot >= g->cap[x->linkIndex])
+        {
+            z = V_CAPACITY;
+            goto done;
+        }
+        if (kind < MSX_RESIDENT_PATCH_IMPORT || kind > MSX_RESIDENT_PATCH_META ||
+            (kind == MSX_RESIDENT_PATCH_INVALIDATE && x->used) ||
+            (kind != MSX_RESIDENT_PATCH_INVALIDATE && !x->used) ||
+            (kind != MSX_RESIDENT_PATCH_INVALIDATE && !x->generation) ||
+            (kind == MSX_RESIDENT_PATCH_IMPORT &&
+                                (!x->payload.c || !x->payload.lastc)))
+        {
+            z = V_DESCRIPTOR;
+            goto done;
+        }
+        r = g->base[x->linkIndex] + x->slot;
+        if (!initial && x->generation < g->hg[r])
+        {
+            z = V_GENERATION;
+            goto done;
+        }
+        if (g->haNf[r])
+        {
+            z = V_DESCRIPTOR;
+            goto done;
+        }
+        g->haNf[r] = i + 1;
+    }
+    for (i = 0; i < b->descriptorCount; ++i)
+    {
+        const MSXResidentPipeDesc *d = &b->descriptor[i].descriptor;
+        uint32_t c = 0, k = d->linkIndex, s;
+        for (s = 0; s < d->capacity; ++s)
+        {
+            uint32_t row = g->base[k] + s;
+            uint32_t p = g->haNf[row];
+            c += p ? b->slot[p - 1].used : g->hu[row];
+        }
+        if (c != d->count)
+        {
+            z = V_DESCRIPTOR;
+            goto done;
+        }
+        if (d->count)
+        {
+            s = d->head;
+            for (uint32_t j = 0; j < d->count; ++j)
+            {
+                uint32_t p = g->haNf[g->base[k] + s];
+                if (!(p ? b->slot[p - 1].used :
+                        g->hu[g->base[k] + s]))
+                {
+                    z = V_DESCRIPTOR;
+                    goto done;
+                }
+                s = (uint32_t)(((int64_t)s + d->orient +
+                                (int64_t)d->capacity) % d->capacity);
+            }
+            if (s != (uint32_t)(((int64_t)d->tail + d->orient +
+                                 (int64_t)d->capacity) % d->capacity))
+            {
+                z = V_DESCRIPTOR;
+                goto done;
+            }
+        }
+    }
+    if (initial)
+        for (uint32_t k = 1; k <= g->n; ++k)
+        {
+            if (!g->haNj[k])
+            {
+                z = V_DESCRIPTOR;
+                goto done;
+            }
+            for (uint32_t s = 0; s < g->cap[k]; ++s)
+                if (!g->haNf[g->base[k] + s])
+                {
+                    z = V_DESCRIPTOR;
+                    goto done;
+                }
+        }
+done:
+    for (i = 0; i < b->descriptorCount; ++i)
+        if (b->descriptor[i].linkIndex &&
+            b->descriptor[i].linkIndex <= g->n)
+            g->haNj[b->descriptor[i].linkIndex] = 0;
+    for (i = 0; i < b->slotCount; ++i)
+        if (b->slot[i].linkIndex && b->slot[i].linkIndex <= g->n &&
+            b->slot[i].slot < g->cap[b->slot[i].linkIndex])
+            g->haNf[g->base[b->slot[i].linkIndex] + b->slot[i].slot] = 0;
+    return z;
+}
 static MSXResidentStatus invalid(MSXResidentGpu*g,VStatus v){if(v==V_CAPACITY){g->c.capacityReject++;g->c.capacityOverflow++;return MSX_RESIDENT_ERR_CAPACITY;}if(v==V_GENERATION){g->c.generationReject++;g->c.staleGeneration++;return MSX_RESIDENT_ERR_GENERATION;}if(v==V_EPOCH){g->c.epochStale++;g->c.epochMismatch++;return MSX_RESIDENT_ERR_GENERATION;}g->c.descriptorReject++;return MSX_RESIDENT_ERR_ARGUMENT;}
-__global__ static void scatter(const Stage*s,uint32_t n,uint32_t st,uint32_t*u,uint32_t*g,uint64_t*id,double*v,double*h,double*hr,double*ur,double*dr,const double*pc,const double*pl,double*c,double*l){uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){Stage x=s[i];uint32_t r=x.row;u[r]=x.used;g[r]=x.generation;id[r]=x.used?x.id:0;v[r]=x.used?x.v:0;h[r]=x.used?x.h:0;hr[r]=x.used?x.hr:0;ur[r]=x.used?x.ur:0;dr[r]=x.used?x.dr:0;for(uint32_t m=0;m<st;m++){c[(size_t)r*st+m]=x.used?pc[(size_t)i*st+m]:0;l[(size_t)r*st+m]=x.used?pl[(size_t)i*st+m]:0;}}}
+__global__ static void scatter(const Stage*s,uint32_t n,uint32_t st,uint32_t*u,uint32_t*g,uint64_t*id,double*v,double*h,double*hr,double*ur,double*dr,const double*pc,const double*pl,double*c,double*l){uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){Stage x=s[i];uint32_t r=x.row;u[r]=x.used;g[r]=x.generation;id[r]=x.used?x.id:0;v[r]=x.used?x.v:0;h[r]=x.used?x.h:0;hr[r]=x.used?x.hr:0;ur[r]=x.used?x.ur:0;dr[r]=x.used?x.dr:0;if(x.kind==MSX_RESIDENT_PATCH_IMPORT)for(uint32_t m=0;m<st;m++){c[(size_t)r*st+m]=pc[(size_t)x.payloadRow*st+m];l[(size_t)r*st+m]=pl[(size_t)x.payloadRow*st+m];}}}
+__global__ static void scatterDescriptors(const DDescStage*s,uint32_t n,DDesc*d){uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)d[s[i].link]=s[i].descriptor;}
 __global__ static void gather(const Stage*q,uint32_t n,uint32_t st,const uint32_t*u,const uint32_t*g,const uint64_t*id,const double*v,const double*h,const double*hr,const double*ur,const double*dr,const double*c,const double*l,Stage*o,double*oc,double*ol){uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){uint32_t r=q[i].row;Stage x=q[i];x.used=u[r];x.generation=g[r];x.id=id[r];x.v=v[r];x.h=h[r];x.hr=hr[r];x.ur=ur[r];x.dr=dr[r];o[i]=x;for(uint32_t m=0;m<st;m++){oc[(size_t)i*st+m]=c[(size_t)r*st+m];ol[(size_t)i*st+m]=l[(size_t)r*st+m];}}}
 #define MSX_RESIDENT_RED_THREADS 128
 #define MSX_RESIDENT_MASS_TILE 8
@@ -178,7 +319,89 @@ __global__ static void redLink(uint32_t nLinks,uint32_t st,const DDesc*d,
         __syncthreads();
     }
 }
-static MSXResidentStatus patch(MSXResidentGpu*g,const MSXResidentPatchBatch*b,int init){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g||g->poisoned)return MSX_RESIDENT_ERR_POISONED;VStatus v=valid(g,b,init);if(v!=V_OK)return invalid(g,v);for(uint32_t i=0;i<b->slotCount;i++){const MSXResidentSlotPatch*x=&b->slot[i];Stage*s=&g->hPatch[i];s->link=x->linkIndex;s->row=g->base[x->linkIndex]+x->slot;s->generation=x->generation;s->used=x->used;s->id=x->payload.parcelId;s->v=x->payload.volume;s->h=x->payload.hstep;s->hr=x->payload.hresponse;s->ur=x->payload.uresponse;s->dr=x->payload.dresponse;for(uint32_t m=0;m<g->stride;m++){g->hPatchC[(size_t)i*g->stride+m]=x->used?x->payload.c[m]:0;g->hPatchL[(size_t)i*g->stride+m]=x->used?x->payload.lastc[m]:0;}}if(b->slotCount){if(!ck(trackedCopy(g->dPatchStage,g->hPatch,(size_t)b->slotCount*sizeof(Stage),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_PATCH_STAGE))||!ck(trackedCopy(g->dPatchC,g->hPatchC,(size_t)b->slotCount*g->stride*sizeof(double),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD))||!ck(trackedCopy(g->dPatchL,g->hPatchL,(size_t)b->slotCount*g->stride*sizeof(double),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);scatter<<<(b->slotCount+255)/256,256>>>(g->dPatchStage,b->slotCount,g->stride,g->du,g->dg,g->di,g->dv,g->dh,g->dhr,g->dur,g->ddr,g->dPatchC,g->dPatchL,g->dc,g->dl);if(!ck(cudaGetLastError())||!ck(cudaDeviceSynchronize()))return badgpu(g,MSX_RESIDENT_ERR_GPU);}for(uint32_t i=0;i<b->descriptorCount;i++){const MSXResidentPipeDesc*d=&b->descriptor[i].descriptor;g->hd[d->linkIndex]={d->linkIndex,d->capacity,d->head,d->tail,d->count,d->orient,d->epoch};}if(b->descriptorCount&&!ck(trackedCopy(g->dd,g->hd,((size_t)g->n+1)*sizeof(DDesc),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_PATCH_DESCRIPTOR)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);for(uint32_t i=0;i<b->slotCount;i++){Stage*s=&g->hPatch[i];g->hu[s->row]=s->used;g->hg[s->row]=s->generation;g->hi[s->row]=s->used?s->id:0;}for(uint32_t i=0;i<b->descriptorCount;i++)g->he[b->descriptor[i].linkIndex]=b->descriptor[i].descriptor.epoch;g->uploaded=1;return MSX_RESIDENT_OK;}
+static MSXResidentStatus patch(MSXResidentGpu*g,const MSXResidentPatchBatch*b,int init)
+{
+    uint32_t i, m, payloadCount = 0; VStatus v;
+    if (!use(g)) return badgpu(g, MSX_RESIDENT_ERR_GPU);
+    if (!g || g->poisoned) return MSX_RESIDENT_ERR_POISONED;
+    v = valid(g, b, init); if (v != V_OK) return invalid(g, v);
+    /* Pack every dirty descriptor before the first device mutation.  The
+       staging record carries its link index, so one H2D API call can feed a
+       device scatter instead of issuing one cudaMemcpy per descriptor. */
+    for (i = 0; i < b->descriptorCount; ++i)
+    {
+        const MSXResidentPipeDesc *d = &b->descriptor[i].descriptor;
+        g->hPatchDesc[i].link = d->linkIndex;
+        g->hPatchDesc[i].descriptor = {d->linkIndex, d->capacity, d->head,
+                                       d->tail, d->count, d->orient, d->epoch};
+    }
+    for (i = 0; i < b->slotCount; ++i)
+    {
+        const MSXResidentSlotPatch *x = &b->slot[i]; Stage *s = &g->hPatch[i];
+        MSXResidentPatchKind kind = x->kind ? x->kind :
+            (x->used ? MSX_RESIDENT_PATCH_IMPORT : MSX_RESIDENT_PATCH_INVALIDATE);
+        if (kind < MSX_RESIDENT_PATCH_IMPORT || kind > MSX_RESIDENT_PATCH_META ||
+            (kind == MSX_RESIDENT_PATCH_INVALIDATE && x->used) ||
+            (kind != MSX_RESIDENT_PATCH_INVALIDATE && !x->used))
+            return invalid(g, V_DESCRIPTOR);
+        s->link=x->linkIndex; s->row=g->base[x->linkIndex]+x->slot;
+        s->generation=x->generation; s->used=x->used; s->kind=(uint32_t)kind;
+        s->payloadRow=payloadCount; s->id=x->payload.parcelId; s->v=x->payload.volume;
+        s->h=x->payload.hstep; s->hr=x->payload.hresponse; s->ur=x->payload.uresponse;
+        s->dr=x->payload.dresponse;
+        if (kind == MSX_RESIDENT_PATCH_IMPORT)
+        {
+            if (!x->payload.c || !x->payload.lastc) return invalid(g, V_DESCRIPTOR);
+            for (m=0;m<g->stride;m++)
+            { g->hPatchC[(size_t)payloadCount*g->stride+m]=x->payload.c[m];
+              g->hPatchL[(size_t)payloadCount*g->stride+m]=x->payload.lastc[m]; }
+            ++payloadCount;
+        }
+    }
+    if (b->slotCount &&
+        !ck(trackedCopy(g->dPatchStage,g->hPatch,(size_t)b->slotCount*sizeof(Stage),
+                        cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,
+                        MSX_PROFILE_TRANSFER_SCOPE_PATCH_STAGE)))
+        return badgpu(g, MSX_RESIDENT_ERR_TRANSFER);
+    if (payloadCount &&
+        (!ck(trackedCopy(g->dPatchC,g->hPatchC,(size_t)payloadCount*g->stride*sizeof(double),
+                         cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,
+                         MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD)) ||
+         !ck(trackedCopy(g->dPatchL,g->hPatchL,(size_t)payloadCount*g->stride*sizeof(double),
+                         cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,
+                         MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD))))
+        return badgpu(g, MSX_RESIDENT_ERR_TRANSFER);
+    if (b->slotCount)
+    {
+        scatter<<<(b->slotCount+255)/256,256>>>(g->dPatchStage,b->slotCount,g->stride,
+            g->du,g->dg,g->di,g->dv,g->dh,g->dhr,g->dur,g->ddr,
+            g->dPatchC,g->dPatchL,g->dc,g->dl);
+        if (!ck(cudaGetLastError()) || !ck(cudaDeviceSynchronize()))
+            return badgpu(g, MSX_RESIDENT_ERR_GPU);
+    }
+    if (b->descriptorCount &&
+        !ck(trackedCopy(g->dPatchDesc, g->hPatchDesc,
+                        (size_t)b->descriptorCount * sizeof(DDescStage),
+                        cudaMemcpyHostToDevice, MSX_PROFILE_TRANSFER_H2D,
+                        MSX_PROFILE_TRANSFER_SCOPE_PATCH_DESCRIPTOR)))
+        return badgpu(g, MSX_RESIDENT_ERR_TRANSFER);
+    if (b->descriptorCount)
+    {
+        scatterDescriptors<<<(b->descriptorCount + 255) / 256, 256>>>(
+            g->dPatchDesc, b->descriptorCount, g->dd);
+        if (!ck(cudaGetLastError()) || !ck(cudaDeviceSynchronize()))
+            return badgpu(g, MSX_RESIDENT_ERR_GPU);
+    }
+    for (i = 0; i < b->descriptorCount; ++i)
+    {
+        const MSXResidentPipeDesc *d = &b->descriptor[i].descriptor;
+        g->hd[d->linkIndex] = {d->linkIndex, d->capacity, d->head, d->tail,
+                               d->count, d->orient, d->epoch};
+    }
+    for (i=0;i<b->slotCount;i++){Stage*s=&g->hPatch[i];g->hu[s->row]=s->used;g->hg[s->row]=s->generation;g->hi[s->row]=s->used?s->id:0;}
+    for (i=0;i<b->descriptorCount;i++)g->he[b->descriptor[i].linkIndex]=b->descriptor[i].descriptor.epoch;
+    g->uploaded=1; return MSX_RESIDENT_OK;
+}
 extern "C" MSXResidentStatus MSXresidentGpu_initialUpload(MSXResidentGpu*g,const MSXResidentPatchBatch*b){MSXResidentStatus z;if(!g||g->uploaded)return MSX_RESIDENT_ERR_ARGUMENT;z=patch(g,b,1);if(z==MSX_RESIDENT_OK){g->stateVersion++;g->aggregateValid=0;}return z;}extern "C" MSXResidentStatus MSXresidentGpu_applyPatches(MSXResidentGpu*g,const MSXResidentPatchBatch*b){MSXResidentStatus z;if(!g||!g->uploaded)return MSX_RESIDENT_ERR_ARGUMENT;z=patch(g,b,0);if(z==MSX_RESIDENT_OK){g->stateVersion++;g->aggregateValid=0;}return z;}
 extern "C" MSXResidentStatus MSXresidentGpu_fetchHandoffBatch(MSXResidentGpu*g,const MSXResidentHandoffItem*items,uint32_t n,MSXResidentGpuFetchOutput*out){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g||g->poisoned)return MSX_RESIDENT_ERR_POISONED;if(!out||(!items&&n)||n>g->slots||(!out->meta&&n)||(!out->cOut&&n)||(!out->lastcOut&&n)||out->stride<g->stride||!g->uploaded)return MSX_RESIDENT_ERR_ARGUMENT;for(uint32_t i=0;i<n;i++){const MSXResidentHandoffItem*x=&items[i];if(x->boundarySide>1||x->linkIndex<1||x->linkIndex>g->n||x->slot>=g->cap[x->linkIndex]){g->c.fetchStale++;return MSX_RESIDENT_ERR_GENERATION;}if(x->pipeEpoch!=g->he[x->linkIndex]){g->c.epochStale++;g->c.epochMismatch++;return MSX_RESIDENT_ERR_GENERATION;}uint32_t r=g->base[x->linkIndex]+x->slot;if(!g->hu[r]||g->hg[r]!=x->generation){g->c.fetchStale++;g->c.staleGeneration++;return MSX_RESIDENT_ERR_GENERATION;}g->hGather[i]={x->linkIndex,r,x->generation,1,0,0,0,0,0,0};}if(!n)return MSX_RESIDENT_OK;if(!ck(cudaMemcpy(g->dGatherStage,g->hGather,(size_t)n*sizeof(Stage),cudaMemcpyHostToDevice)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);gather<<<(n+255)/256,256>>>(g->dGatherStage,n,g->stride,g->du,g->dg,g->di,g->dv,g->dh,g->dhr,g->dur,g->ddr,g->dc,g->dl,g->dGatherStage,g->dGatherC,g->dGatherL);if(!ck(cudaGetLastError())||!ck(cudaDeviceSynchronize())||!ck(cudaMemcpy(g->hGather,g->dGatherStage,(size_t)n*sizeof(Stage),cudaMemcpyDeviceToHost))||!ck(cudaMemcpy(g->hGatherC,g->dGatherC,(size_t)n*g->stride*sizeof(double),cudaMemcpyDeviceToHost))||!ck(cudaMemcpy(g->hGatherL,g->dGatherL,(size_t)n*g->stride*sizeof(double),cudaMemcpyDeviceToHost)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);for(uint32_t i=0;i<n;i++)if(!g->hGather[i].used||g->hGather[i].generation!=items[i].generation||!g->hGather[i].id){g->c.fetchStale++;g->c.staleGeneration++;return MSX_RESIDENT_ERR_GENERATION;}for(uint32_t i=0;i<n;i++){Stage*s=&g->hGather[i];MSXResidentHandoffResult*z=&out->meta[i];z->linkIndex=items[i].linkIndex;z->slot=items[i].slot;z->generation=s->generation;z->boundarySide=items[i].boundarySide;z->pipeEpoch=items[i].pipeEpoch;z->payload.volume=s->v;z->payload.hstep=s->h;z->payload.hresponse=s->hr;z->payload.uresponse=s->ur;z->payload.dresponse=s->dr;z->payload.parcelId=s->id;z->payload.generation=s->generation;z->payload.c=out->cOut+(size_t)i*out->stride;z->payload.lastc=out->lastcOut+(size_t)i*out->stride;for(uint32_t m=0;m<g->stride;m++){out->cOut[(size_t)i*out->stride+m]=g->hGatherC[(size_t)i*g->stride+m];out->lastcOut[(size_t)i*out->stride+m]=g->hGatherL[(size_t)i*g->stride+m];}}g->c.handoffCount+=n;return MSX_RESIDENT_OK;}
 extern "C" MSXResidentStatus MSXresidentGpu_fetchHandoffs(MSXResidentGpu*g,const MSXResidentHandoffPlan*p,MSXResidentGpuFetchOutput*out,uint32_t n){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g||g->poisoned)return MSX_RESIDENT_ERR_POISONED;if(!p||!out||n!=p->itemCount||(!p->item&&n)||(!out->meta&&n)||(!out->cOut&&n)||(!out->lastcOut&&n)||out->stride<g->stride||!g->uploaded)return MSX_RESIDENT_ERR_ARGUMENT;for(uint32_t i=0;i<n;i++){const MSXResidentHandoffItem*x=&p->item[i];if(x->linkIndex!=p->linkIndex||x->boundarySide!=p->boundarySide||x->pipeEpoch!=p->pipeEpoch){g->c.fetchStale++;return MSX_RESIDENT_ERR_GENERATION;}}return MSXresidentGpu_fetchHandoffBatch(g,p->item,n,out);}
