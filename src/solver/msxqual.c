@@ -95,6 +95,7 @@ static int    transport(int64_t tstep);
 static void   initSegs(void);
 static int    flowdirchanged(void);
 static void   advectSegs(double dt);
+static Pseg   getResidentLazyNewSeg(int k, const double *upnodequal);
 static void   getNewSegWallQual(int k, double dt, Pseg seg);
 static void   shiftSegWallQual(int k, double dt);
 static void   getNewSegWallQualRing(int k, double dt, Pseg seg);
@@ -1442,9 +1443,20 @@ void advectSegs(double dt)
 
     for (k=1; k<=MSX.Nobjects[LINK]; k++)
     {
-    // --- zero out WQ in new segment to be added at entrance of link
+        // --- zero out WQ in new segment to be added at entrance of link
 
         for (m=1; m<=MSX.Nobjects[SPECIES]; m++) MSX.C1[m] = 0.0;
+
+        /* Resident's supported no-WALL/no-dispersion path does not need an
+           entrance parcel until evalnodeoutflow proves that the endpoint
+           cannot merge.  WALL, dispersion, and all non-Resident paths retain
+           the original eager allocation and lifetime. */
+        if (MSXresidentRuntime_isResident() &&
+            !MSX.HasWallSpecies && !MSX.DispersionFlag)
+        {
+            MSX.NewSeg[k] = NULL;
+            continue;
+        }
 
     // --- get a free segment to add to entrance of link
 
@@ -1473,6 +1485,37 @@ void advectSegs(double dt)
             }
         }
     }
+}
+
+static Pseg getResidentLazyNewSeg(int k, const double *upnodequal)
+/* Allocate a Resident entrance parcel only after the merge predicate selects
+** the append path.  MSXqual_getFreeSeg still owns private c/lastc setup and
+** hstep initialization; only BULK c is overwritten, matching the old
+** evalnodeoutflow semantics. */
+{
+    Pseg seg;
+    int m;
+    if (k <= 0 || k > MSX.Nobjects[LINK]) return NULL;
+    seg = MSX.NewSeg[k];
+    if (!seg)
+    {
+        /* The eager allocation happened immediately after advectSegs()
+           cleared C1.  Do not inherit a node/tank value that may have reused
+           C1 before this append decision; zero is the original c/lastc seed. */
+        memset(MSX.C1, 0,
+               ((size_t)MSX.Nobjects[SPECIES] + 1) * sizeof(double));
+        seg = MSXqual_getFreeSeg(0.0, MSX.C1);
+        if (!seg)
+        {
+            MSX.ErrCode = ERR_MEMORY;
+            return NULL;
+        }
+        MSX.NewSeg[k] = seg;
+    }
+    for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+        if (MSX.Species[m].type == BULK)
+            seg->c[m] = upnodequal[m];
+    return seg;
 }
 
 //=============================================================================
@@ -2119,9 +2162,11 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
 {
 
     double v;
-    Pseg seg;
+    Pseg seg, newseg;
     int m;
     int useNewSeg = 0;
+    int residentLazyNewSeg = (MSXresidentRuntime_isResident() &&
+                              !MSX.HasWallSpecies && !MSX.DispersionFlag);
 
     // Find flow volume (v) released over time step
     v = fabs(MSX.Q[k]) * tstep;
@@ -2129,10 +2174,14 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
 
     // Release flow and mass into upstream end of the link
 
-    for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+    newseg = MSX.NewSeg[k];
+    if (!residentLazyNewSeg)
     {
-        if (MSX.Species[m].type == BULK)
-            MSX.NewSeg[k]->c[m] = upnodequal[m];
+        for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+        {
+            if (MSX.Species[m].type == BULK)
+                newseg->c[m] = upnodequal[m];
+        }
     }
 
     if (MSXsegStorage_isPipeRingLink(k))
@@ -2153,16 +2202,26 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
             }
             else
             {
-                MSX.NewSeg[k]->v = v;
+                if (residentLazyNewSeg)
+                {
+                    newseg = getResidentLazyNewSeg(k, upnodequal);
+                    if (!newseg) return;
+                }
+                newseg->v = v;
                 MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_NEW_SEGMENT);
-                MSX.ErrCode = MSXsegStorage_pipeAppendTail(k, MSX.NewSeg[k]);
+                MSX.ErrCode = MSXsegStorage_pipeAppendTail(k, newseg);
             }
         }
         else
         {
-            MSX.NewSeg[k]->v = v;
+            if (residentLazyNewSeg)
+            {
+                newseg = getResidentLazyNewSeg(k, upnodequal);
+                if (!newseg) return;
+            }
+            newseg->v = v;
             MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_NEW_SEGMENT);
-            MSX.ErrCode = MSXsegStorage_pipeAppendTail(k, MSX.NewSeg[k]);
+            MSX.ErrCode = MSXsegStorage_pipeAppendTail(k, newseg);
         }
         return;
     }
@@ -2207,18 +2266,28 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
 
         else
         {
-            MSX.NewSeg[k]->v = v;
+            if (residentLazyNewSeg)
+            {
+                newseg = getResidentLazyNewSeg(k, upnodequal);
+                if (!newseg) return;
+            }
+            newseg->v = v;
             MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_NEW_SEGMENT);
-            MSXqual_addSeg(k, MSX.NewSeg[k]);
+            MSXqual_addSeg(k, newseg);
         }
     }
 
     // ... link has no segments so add one
     else
     {
-        MSX.NewSeg[k]->v = v;
+        if (residentLazyNewSeg)
+        {
+            newseg = getResidentLazyNewSeg(k, upnodequal);
+            if (!newseg) return;
+        }
+        newseg->v = v;
         MSXsegProfile_event(k, MSX_PROFILE_UPSTREAM_NEW_SEGMENT);
-        MSXqual_addSeg(k, MSX.NewSeg[k]);
+        MSXqual_addSeg(k, newseg);
     }
 
 }
