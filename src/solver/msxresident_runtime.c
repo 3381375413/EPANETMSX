@@ -381,6 +381,13 @@ int MSXresidentRuntime_residentNotReady(void)
 int MSXresidentRuntime_isResident(void) { return R.resident; }
 int MSXresidentRuntime_reactReady(void) { return R.resident && R.dispatchReady; }
 int MSXresidentRuntime_handoffReady(void) { return R.resident && R.handoffReady; }
+uint64_t MSXresidentRuntime_stateVersion(void)
+{
+    if (!R.resident) return 0;
+    /* Every committed topology patch advances stateVersion together with the
+       topology epoch; the monotonic runtime sequence is the stable key. */
+    return R.stateVersion;
+}
 int MSXresidentRuntime_linkFallback(int k) { return R.resident && k>0 && R.fallback && R.fallback[k]; }
 void MSXresidentRuntime_markRebalance(void) { R.patchClass = 1; }
 /* Keep Resident transport displacement identical to CPU Advect: one quality

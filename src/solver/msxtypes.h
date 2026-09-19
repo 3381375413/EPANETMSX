@@ -566,6 +566,11 @@ typedef struct
     double transport_call_ms;
     double outer_patch_ms;
     double report_ms;
+    double report_snapshot_wait_ms;
+    double report_core_reduce_ms;
+    double report_boundary_sum_ms;
+    double report_pack_ms;
+    double report_write_ms;
     double final_mass_ms;
     double outer_other_ms;
 
@@ -652,6 +657,11 @@ typedef enum
     MSX_PROFILE_RUN_TRANSPORT_CALL,
     MSX_PROFILE_RUN_OUTER_PATCH,
     MSX_PROFILE_RUN_REPORT,
+    MSX_PROFILE_RUN_REPORT_SNAPSHOT_WAIT,
+    MSX_PROFILE_RUN_REPORT_CORE_REDUCE,
+    MSX_PROFILE_RUN_REPORT_BOUNDARY_SUM,
+    MSX_PROFILE_RUN_REPORT_PACK,
+    MSX_PROFILE_RUN_REPORT_WRITE,
     MSX_PROFILE_RUN_FINAL_MASS,
     MSX_PROFILE_RUN_OUTER_OTHER,
     MSX_PROFILE_RUN_TRANSPORT_PRE_STEP_SYNC,

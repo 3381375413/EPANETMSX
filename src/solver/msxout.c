@@ -16,6 +16,9 @@
 #include <stdlib.h>
 
 #include "msxtypes.h"
+#include "msxgpu.h"
+#include "msxresident_runtime.h"
+#include "msxsegment_storage.h"
 
 //  External variables
 //--------------------
@@ -32,6 +35,8 @@ static long  LinkBytesPerPeriod;       // Bytes per time period used by all link
 double MSXqual_getNodeQual(int j, int m);
 double MSXqual_getLinkQual(int k, int m);
 int MSXqual_getLinkQualChecked(int k, int m, double *value);
+int MSXqual_getLinkQualBatchChecked(int k, double *values, int valueCount);
+int MSXqual_buildLinkQualitySnapshot(void);
 
 //  Exported functions
 //--------------------
@@ -47,6 +52,13 @@ float MSXout_getLinkQual(int k, int j, int m);
 static int   saveStatResults(void);
 static void  getStatResults(int objType, int m, double* stats1,
              double* stats2, REAL4* x);
+static int   writeBlock(FILE *f, const void *data, size_t size, size_t count);
+
+static int writeBlock(FILE *f, const void *data, size_t size, size_t count)
+{
+    if (!f || (count && !data)) return ERR_IO_OUT_FILE;
+    return fwrite(data, size, count, f) == count ? 0 : ERR_IO_OUT_FILE;
+}
 
 
 //=============================================================================
@@ -85,7 +97,15 @@ int MSXout_open()
 // --- write initial results to file
 
     MSX.Nperiods = 0;
-    MSXout_saveInitialResults();
+    if (MSXout_saveInitialResults())
+    {
+        if (MSX.TmpOutFile.file != MSX.OutFile.file && MSX.TmpOutFile.file)
+            fclose(MSX.TmpOutFile.file);
+        fclose(MSX.OutFile.file);
+        MSX.OutFile.file = NULL;
+        MSX.TmpOutFile.file = NULL;
+        return ERR_IO_OUT_FILE;
+    }
     return 0;
 }
 
@@ -104,28 +124,32 @@ int MSXout_saveInitialResults()
 */
 {
     int   m;
+    int   err;
     INT4  n;
     INT4  magic = MAGICNUMBER;
     INT4  version = VERSION;
     FILE* f = MSX.OutFile.file;
 
+    if (!f) return ERR_IO_OUT_FILE;
     rewind(f);
-    fwrite(&magic, sizeof(INT4), 1, f);                     //Magic number
-    fwrite(&version, sizeof(INT4), 1, f);                   //Version number
+    err = writeBlock(f, &magic, sizeof(INT4), 1);           //Magic number
+    if (err) return err;
+    err = writeBlock(f, &version, sizeof(INT4), 1);         //Version number
+    if (err) return err;
     n = (INT4)MSX.Nobjects[NODE];
-    fwrite(&n, sizeof(INT4), 1, f);                         //Number of nodes
+    if ((err = writeBlock(f, &n, sizeof(INT4), 1))) return err; //Number of nodes
     n = (INT4)MSX.Nobjects[LINK];
-    fwrite(&n, sizeof(INT4), 1, f);                         //Number of links
+    if ((err = writeBlock(f, &n, sizeof(INT4), 1))) return err; //Number of links
     n = (INT4)MSX.Nobjects[SPECIES];
-    fwrite(&n, sizeof(INT4), 1, f);                         //Number of species
+    if ((err = writeBlock(f, &n, sizeof(INT4), 1))) return err; //Number of species
     n = (INT4)MSX.Rstep;
-    fwrite(&n, sizeof(INT4), 1, f);                         //Reporting step size
+    if ((err = writeBlock(f, &n, sizeof(INT4), 1))) return err; //Reporting step size
     for (m=1; m<=MSX.Nobjects[SPECIES]; m++)
     {
         n = (INT4)strlen(MSX.Species[m].id);
-        fwrite(&n, sizeof(INT4), 1, f);                     //Length of species ID
-        fwrite(MSX.Species[m].id, sizeof(char), n, f);      //Species ID string                                                   
-        fwrite(&MSX.Species[m].units, sizeof(char), MAXUNITS, f);   //Species mass units
+        if ((err = writeBlock(f, &n, sizeof(INT4), 1))) return err; //Length of species ID
+        if ((err = writeBlock(f, MSX.Species[m].id, sizeof(char), (size_t)n))) return err; //Species ID string
+        if ((err = writeBlock(f, &MSX.Species[m].units, sizeof(char), MAXUNITS))) return err; //Species mass units
     }
     ResultsOffset = ftell(f);
     NodeBytesPerPeriod = MSX.Nobjects[NODE]*MSX.Nobjects[SPECIES]*sizeof(REAL4);
@@ -152,28 +176,123 @@ int MSXout_saveResults()
 **    an error code (or 0 if no error).
 */
 {
-    int   m, j;
-    REAL4 x;
-    for (m=1; m<=MSX.Nobjects[SPECIES]; m++)
+    int m, j, status = 0;
+    int nNode = MSX.Nobjects[NODE], nLink = MSX.Nobjects[LINK];
+    int nSpecies = MSX.Nobjects[SPECIES];
+    size_t linkStride = (size_t)nSpecies + 1;
+    REAL4 *packed = NULL;
+    double *linkValues = NULL;
+    double phaseStart = 0.0;
+    int stage = MSXgpu_profileStageEnabled();
+
+    packed = (REAL4 *)calloc((size_t)MAX(nNode, nLink) + 1,
+                             sizeof(REAL4));
+    linkValues = (double *)calloc(((size_t)nLink + 1) * linkStride,
+                                  sizeof(double));
+    if (!packed || !linkValues)
     {
-        for (j=1; j<=MSX.Nobjects[NODE]; j++)
+        free(packed);
+        free(linkValues);
+        return ERR_MEMORY;
+    }
+
+    /* Freeze the report's storage view before obtaining any result.  Ring
+       mirrors belong to the same snapshot-wait phase as pending Resident
+       patches, so the outer quality report no longer hides this work. */
+    if (stage) phaseStart = MSXgpu_wallTimeMs();
+    MSXsegStorage_syncAllPsegMirrors();
+    if (MSXresidentRuntime_isResident())
+    {
+        status = MSXresidentRuntime_flushPatches();
+    }
+    else status = 0;
+    if (stage)
+        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT_SNAPSHOT_WAIT,
+                               MSXgpu_wallTimeMs() - phaseStart);
+    if (status) goto report_done;
+
+    /* A separate aggregate call warms the per-link device cache once; every
+       link batch below then reads that same stateVersion. */
+    if (MSXresidentRuntime_isResident())
+    {
+        MSXResidentStatus residentStatus;
+        double *snapshotMass = NULL;
+        MSXResidentGpuReduction snapshot;
+
+        snapshotMass = (double *)calloc(linkStride, sizeof(double));
+        if (!snapshotMass)
         {
-            x = (REAL4)MSXqual_getNodeQual(j, m);
-            fwrite(&x, sizeof(REAL4), 1, MSX.TmpOutFile.file);
+            status = ERR_MEMORY;
+            goto report_done;
+        }
+        if (stage) phaseStart = MSXgpu_wallTimeMs();
+        residentStatus = MSXresidentRuntime_reduce(
+            snapshotMass, (uint32_t)linkStride, &snapshot);
+        if (stage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT_CORE_REDUCE,
+                                   MSXgpu_wallTimeMs() - phaseStart);
+        free(snapshotMass);
+        if (residentStatus != MSX_RESIDENT_OK)
+        {
+            status = MSX.ErrCode ? MSX.ErrCode : ERR_GPU_KERNEL_RUNTIME_ERROR;
+            goto report_done;
         }
     }
-    for (m=1; m<=MSX.Nobjects[SPECIES]; m++)
+
+    /* One CPU walk per link computes every species' volume-weighted sum. */
+    if (stage) phaseStart = MSXgpu_wallTimeMs();
+    status = MSXqual_buildLinkQualitySnapshot();
+    if (status)
+        goto report_boundary_done;
+    for (j = 1; j <= nLink; j++)
     {
-        for (j=1; j<=MSX.Nobjects[LINK]; j++)
-        {
-            double value;
-            int status = MSXqual_getLinkQualChecked(j, m, &value);
-            if (status) return status;
-            x = (REAL4)value;
-            fwrite(&x, sizeof(REAL4), 1, MSX.TmpOutFile.file);
-        }
+        status = MSXqual_getLinkQualBatchChecked(
+            j, linkValues + (size_t)j * linkStride, (int)linkStride);
+        if (status) break;
     }
-    return 0;
+report_boundary_done:
+    if (stage)
+        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT_BOUNDARY_SUM,
+                               MSXgpu_wallTimeMs() - phaseStart);
+    if (status) goto report_done;
+
+    for (m = 1; m <= nSpecies; m++)
+    {
+        if (stage) phaseStart = MSXgpu_wallTimeMs();
+        for (j = 1; j <= nNode; j++)
+            packed[j] = (REAL4)MSXqual_getNodeQual(j, m);
+        if (stage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT_PACK,
+                                   MSXgpu_wallTimeMs() - phaseStart);
+        if (stage) phaseStart = MSXgpu_wallTimeMs();
+        status = writeBlock(MSX.TmpOutFile.file, packed + 1,
+                            sizeof(REAL4), (size_t)nNode);
+        if (stage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT_WRITE,
+                                   MSXgpu_wallTimeMs() - phaseStart);
+        if (status) goto report_done;
+    }
+    for (m = 1; m <= nSpecies; m++)
+    {
+        if (stage) phaseStart = MSXgpu_wallTimeMs();
+        for (j = 1; j <= nLink; j++)
+            packed[j] = (REAL4)linkValues[(size_t)j * linkStride + m];
+        if (stage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT_PACK,
+                                   MSXgpu_wallTimeMs() - phaseStart);
+        if (stage) phaseStart = MSXgpu_wallTimeMs();
+        status = writeBlock(MSX.TmpOutFile.file, packed + 1,
+                            sizeof(REAL4), (size_t)nLink);
+        if (stage)
+            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REPORT_WRITE,
+                                   MSXgpu_wallTimeMs() - phaseStart);
+        if (status) goto report_done;
+    }
+
+report_done:
+    free(packed);
+    free(linkValues);
+    return status;
 }
 
 //=============================================================================
@@ -207,12 +326,16 @@ int MSXout_saveFinalResults()
 // --- write closing records to the file
 
     n = (INT4)ResultsOffset;
-    fwrite(&n, sizeof(INT4), 1, MSX.OutFile.file);
+    if (writeBlock(MSX.OutFile.file, &n, sizeof(INT4), 1))
+        return ERR_IO_OUT_FILE;
     n = (INT4)MSX.Nperiods;
-    fwrite(&n, sizeof(INT4), 1, MSX.OutFile.file);
+    if (writeBlock(MSX.OutFile.file, &n, sizeof(INT4), 1))
+        return ERR_IO_OUT_FILE;
     n = (INT4)MSX.ErrCode;
-    fwrite(&n, sizeof(INT4), 1, MSX.OutFile.file);
-    fwrite(&magic, sizeof(INT4), 1, MSX.OutFile.file);
+    if (writeBlock(MSX.OutFile.file, &n, sizeof(INT4), 1))
+        return ERR_IO_OUT_FILE;
+    if (writeBlock(MSX.OutFile.file, &magic, sizeof(INT4), 1))
+        return ERR_IO_OUT_FILE;
     return 0;
 }
 
@@ -299,14 +422,21 @@ int  saveStatResults()
         for (m = 1; m <= MSX.Nobjects[SPECIES]; m++ )
         {
             getStatResults(NODE, m, stats1, stats2, x);
-            fwrite(x+1, sizeof(REAL4), MSX.Nobjects[NODE], MSX.OutFile.file);
+            if (writeBlock(MSX.OutFile.file, x+1, sizeof(REAL4),
+                           (size_t)MSX.Nobjects[NODE]))
+            {
+                err = ERR_IO_OUT_FILE;
+                break;
+            }
         }
-        for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+        for (m = 1; !err && m <= MSX.Nobjects[SPECIES]; m++)
         {
             getStatResults(LINK, m, stats1, stats2, x);    
-            fwrite(x+1, sizeof(REAL4), MSX.Nobjects[LINK], MSX.OutFile.file);
+            if (writeBlock(MSX.OutFile.file, x+1, sizeof(REAL4),
+                           (size_t)MSX.Nobjects[LINK]))
+                err = ERR_IO_OUT_FILE;
         }
-        MSX.Nperiods = 1;
+        if (!err) MSX.Nperiods = 1;
     }
     else err = ERR_MEMORY;
 

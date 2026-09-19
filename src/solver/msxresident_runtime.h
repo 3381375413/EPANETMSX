@@ -14,6 +14,8 @@ int MSXresidentRuntime_residentNotReady(void);
 int MSXresidentRuntime_isResident(void);
 int MSXresidentRuntime_reactReady(void);
 int MSXresidentRuntime_handoffReady(void);
+/* Monotonic Resident CPU/GPU state epoch for versioned quality snapshots. */
+uint64_t MSXresidentRuntime_stateVersion(void);
 int MSXresidentRuntime_reactCore(double dt);
 typedef struct {
     uint64_t magic;

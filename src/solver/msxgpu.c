@@ -352,6 +352,11 @@ void MSXgpu_profileRunPhase(MSXProfileRunPhase phase, double ms)
     case MSX_PROFILE_RUN_TRANSPORT_CALL: dst = &RunTotals.transport_call_ms; break;
     case MSX_PROFILE_RUN_OUTER_PATCH: dst = &RunTotals.outer_patch_ms; break;
     case MSX_PROFILE_RUN_REPORT: dst = &RunTotals.report_ms; break;
+    case MSX_PROFILE_RUN_REPORT_SNAPSHOT_WAIT: dst = &RunTotals.report_snapshot_wait_ms; break;
+    case MSX_PROFILE_RUN_REPORT_CORE_REDUCE: dst = &RunTotals.report_core_reduce_ms; break;
+    case MSX_PROFILE_RUN_REPORT_BOUNDARY_SUM: dst = &RunTotals.report_boundary_sum_ms; break;
+    case MSX_PROFILE_RUN_REPORT_PACK: dst = &RunTotals.report_pack_ms; break;
+    case MSX_PROFILE_RUN_REPORT_WRITE: dst = &RunTotals.report_write_ms; break;
     case MSX_PROFILE_RUN_FINAL_MASS: dst = &RunTotals.final_mass_ms; break;
     case MSX_PROFILE_RUN_OUTER_OTHER: dst = &RunTotals.outer_other_ms; break;
     case MSX_PROFILE_RUN_TRANSPORT_PRE_STEP_SYNC: dst = &RunTotals.transport_pre_step_sync_ms; break;
@@ -1014,8 +1019,11 @@ static void writeProfileSummary(void)
         fprintf(f, "    \"quality_api_ms\": %.6f, \"hyd_read_ms\": %.6f, \"hyd_eval_ms\": %.6f, \"flow_reorient_ms\": %.6f, \"node_sort_ms\": %.6f, \"segment_init_ms\": %.6f,\n",
                 r->quality_api_ms, r->hyd_read_ms, r->hyd_eval_ms,
                 r->flow_reorient_ms, r->node_sort_ms, r->segment_init_ms);
-        fprintf(f, "    \"transport_call_ms\": %.6f, \"outer_patch_ms\": %.6f, \"report_ms\": %.6f, \"final_mass_ms\": %.6f, \"outer_other_ms\": %.6f,\n",
+        fprintf(f, "    \"transport_call_ms\": %.6f, \"outer_patch_ms\": %.6f, \"report_ms\": %.6f, \"report_snapshot_wait_ms\": %.6f, \"report_core_reduce_ms\": %.6f, \"report_boundary_sum_ms\": %.6f, \"report_pack_ms\": %.6f, \"report_write_ms\": %.6f, \"final_mass_ms\": %.6f, \"outer_other_ms\": %.6f,\n",
                 r->transport_call_ms, r->outer_patch_ms, r->report_ms,
+                r->report_snapshot_wait_ms, r->report_core_reduce_ms,
+                r->report_boundary_sum_ms, r->report_pack_ms,
+                r->report_write_ms,
                 r->final_mass_ms, r->outer_other_ms);
         fprintf(f, "    \"quality_api_calls\": %llu, \"hyd_event_count\": %llu, \"quality_substep_count\": %llu, \"report_count\": %llu, \"transport_call_count\": %llu,\n",
                 (unsigned long long)r->quality_api_calls,

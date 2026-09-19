@@ -80,6 +80,8 @@ int    MSXqual_close(void);
 double MSXqual_getNodeQual(int j, int m);
 double MSXqual_getLinkQual(int k, int m);
 int    MSXqual_getLinkQualChecked(int k, int m, double *value);
+int    MSXqual_getLinkQualBatchChecked(int k, double *values, int valueCount);
+int    MSXqual_buildLinkQualitySnapshot(void);
 int    MSXqual_isSame(double c1[], double c2[]);
 void   MSXqual_removeSeg(Pseg seg);
 Pseg   MSXqual_getFreeSeg(double v, double c[]);
@@ -113,6 +115,55 @@ static int selectnonstacknode(int numsorted, int* indegree);
 static int findstoredmass(double* mass);
 
 static void   evalHydVariables(int k);
+
+typedef struct
+{
+    int valid;
+    int nLinks;
+    int nSpecies;
+    uint64_t qualityEpoch;
+    int64_t qualityTime;
+    uint64_t residentEpoch;
+    double *values;
+} MSXLinkQualitySnapshot;
+
+static MSXLinkQualitySnapshot LinkQualitySnapshot;
+static uint64_t QualityMutationVersion = 1;
+
+static void linkQualitySnapshotVersion(uint64_t *epoch, int64_t *qualityTime,
+                                       uint64_t *residentEpoch)
+{
+    if (epoch) *epoch = QualityMutationVersion;
+    if (qualityTime) *qualityTime = MSX.Qtime;
+    if (residentEpoch) *residentEpoch = MSXresidentRuntime_stateVersion();
+}
+
+static int linkQualitySnapshotMatches(void)
+{
+    uint64_t epoch, residentEpoch;
+    int64_t qualityTime;
+    linkQualitySnapshotVersion(&epoch, &qualityTime, &residentEpoch);
+    return LinkQualitySnapshot.valid &&
+           LinkQualitySnapshot.nLinks == MSX.Nobjects[LINK] &&
+           LinkQualitySnapshot.nSpecies == MSX.Nobjects[SPECIES] &&
+           LinkQualitySnapshot.qualityEpoch == epoch &&
+           LinkQualitySnapshot.qualityTime == qualityTime &&
+           LinkQualitySnapshot.residentEpoch == residentEpoch;
+}
+
+void MSXqual_invalidateLinkQualitySnapshot(void)
+{
+    LinkQualitySnapshot.valid = 0;
+    QualityMutationVersion++;
+    if (!QualityMutationVersion) QualityMutationVersion++;
+}
+
+static void freeLinkQualitySnapshot(void)
+{
+    free(LinkQualitySnapshot.values);
+    memset(&LinkQualitySnapshot, 0, sizeof(LinkQualitySnapshot));
+    QualityMutationVersion = 1;
+}
 
 static void finishQualityApiProfile(int enabled, double startMs,
                                     double exclusiveMs)
@@ -263,6 +314,8 @@ int  MSXqual_init()
 {
     int i, n, m;
     int errcode = 0;
+
+    freeLinkQualitySnapshot();
 
 // --- initialize node concentrations, tank volumes, & source mass flows
 
@@ -539,7 +592,6 @@ int MSXqual_step(double *t, double *tleft)
             if (MSX.Saveflag && MSX.Qtime == MSX.Rtime)
             {
                 double phaseStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
-                MSXsegStorage_syncAllPsegMirrors();
                 CALL(errcode, MSXout_saveResults());
                 if (profileStage)
                 {
@@ -692,33 +744,28 @@ double  MSXqual_getNodeQual(int j, int m)
 
 //=============================================================================
 
-int MSXqual_getLinkQualChecked(int k, int m, double *value)
+static int computeLinkQualBatch(int k, double *values, int valueCount)
 /*
-**   Purpose:
-**     computes average quality in link k.
-**
-**   Input:
-**     k = link index
-**     m = species index.
-**
-**   Returns:
-**     zero on success or an explicit Resident/GPU error.
+**   Computes all species averages for one link in one storage traversal.
+**   Resident Core mass/volume is obtained once from the per-link aggregate
+**   cache and then combined with the CPU Boundary rows.  The helper is kept
+**   internal to the report path; the scalar checked API below preserves the
+**   public query behavior.
 */
 {
-    double  vsum = 0.0,
-            msum = 0.0;
-    double  *c,
-            *v;
-    Pseg    seg;
-    int     pos,
-            n,
-            slot;
+    double *c, *v, *residentMass = NULL;
+    double vsum = 0.0;
+    Pseg seg;
+    MSXResidentGpuReduction reduction;
+    MSXResidentStatus status;
+    int pos, n, slot, m, speciesCount;
 
-    if (!value) return ERR_INVALID_OBJECT_PARAMS;
-    *value = 0.0;
-    if (k < 1 || k > MSX.Nobjects[LINK] ||
-        m < 1 || m > MSX.Nobjects[SPECIES])
+    speciesCount = MSX.Nobjects[SPECIES];
+    if (!values || valueCount < speciesCount + 1)
+        return ERR_INVALID_OBJECT_PARAMS;
+    if (k < 1 || k > MSX.Nobjects[LINK])
         return ERR_INVALID_OBJECT_INDEX;
+    memset(values, 0, (size_t)(speciesCount + 1) * sizeof(double));
 
     if (MSXsegStorage_isPipeRingLink(k))
     {
@@ -730,67 +777,183 @@ int MSXqual_getLinkQualChecked(int k, int m, double *value)
             v = MSXsegStorage_pipeVPtr(k, slot);
             if (c == NULL || v == NULL) continue;
             vsum += *v;
-            msum += c[m] * (*v);
+            for (m = 1; m <= speciesCount; m++)
+                values[m] += c[m] * (*v);
         }
-        if (vsum > 0.0)
-        {
-            *value = msum / vsum;
-            return 0;
-        }
-        else
-        {
-            *value = (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
-                      MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
-            return 0;
-        }
-    }
-
-    /* Resident Core Pseg views are topology mirrors only.  Combine the GPU
-       aggregate with CPU Boundary rows at the same flushed state version. */
-    if (MSXresidentRuntime_isResident() && MSXsegStorage_isHybridLink(k))
-    {
-        double *residentMass = (double *)calloc(
-            (size_t)MSX.Nobjects[SPECIES] + 1, sizeof(double));
-        double residentVolume = 0.0;
-        MSXResidentGpuReduction reduction;
-        MSXResidentStatus status;
-        if (!residentMass) return ERR_MEMORY;
-        status = MSXresidentRuntime_reduceLink(
-            (uint32_t)k, residentMass,
-            (uint32_t)MSX.Nobjects[SPECIES] + 1, &residentVolume,
-            &reduction);
-        if (status != MSX_RESIDENT_OK)
-        {
-            free(residentMass);
-            return MSX.ErrCode ? MSX.ErrCode : ERR_GPU_KERNEL_RUNTIME_ERROR;
-        }
-        vsum += residentVolume;
-        msum += residentMass[m];
-        free(residentMass);
-    }
-
-    seg = MSX.FirstSeg[k];
-    while (seg != NULL)
-    {
-        if (!MSXresidentRuntime_isResident() ||
-            !MSXsegStorage_isHybridCoreSegment(seg))
-        {
-            vsum += seg->v;
-            msum += (seg->c[m])*(seg->v);
-        }
-        seg = seg->prev;
-    }
-    if (vsum > 0.0)
-    {
-        *value = msum / vsum;
-        return 0;
     }
     else
     {
-        *value = (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
-                  MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
+        /* Resident Core Pseg views are topology mirrors only.  Combining the
+           device aggregate here keeps the report snapshot at one version and
+           avoids a reduction or segment walk for every species. */
+        if (MSXresidentRuntime_isResident() && MSXsegStorage_isHybridLink(k))
+        {
+            residentMass = (double *)calloc((size_t)speciesCount + 1,
+                                             sizeof(double));
+            if (!residentMass) return ERR_MEMORY;
+            status = MSXresidentRuntime_reduceLink(
+                (uint32_t)k, residentMass, (uint32_t)speciesCount + 1,
+                &vsum, &reduction);
+            if (status != MSX_RESIDENT_OK)
+            {
+                free(residentMass);
+                return MSX.ErrCode ? MSX.ErrCode : ERR_GPU_KERNEL_RUNTIME_ERROR;
+            }
+            for (m = 1; m <= speciesCount; m++) values[m] = residentMass[m];
+            free(residentMass);
+        }
+
+        seg = MSX.FirstSeg[k];
+        while (seg != NULL)
+        {
+            if (!MSXresidentRuntime_isResident() ||
+                !MSXsegStorage_isHybridCoreSegment(seg))
+            {
+                vsum += seg->v;
+                for (m = 1; m <= speciesCount; m++)
+                    values[m] += seg->c[m] * seg->v;
+            }
+            seg = seg->prev;
+        }
+    }
+
+    if (vsum > 0.0)
+    {
+        for (m = 1; m <= speciesCount; m++) values[m] /= vsum;
+    }
+    else
+    {
+        for (m = 1; m <= speciesCount; m++)
+            values[m] = (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
+                         MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
+    }
+    return 0;
+}
+
+int MSXqual_buildLinkQualitySnapshot(void)
+{
+    uint64_t epoch, residentEpoch;
+    int64_t qualityTime;
+    double *values;
+    size_t stride, total;
+    int k, status;
+
+    if (linkQualitySnapshotMatches()) return 0;
+    stride = (size_t)MSX.Nobjects[SPECIES] + 1;
+    total = ((size_t)MSX.Nobjects[LINK] + 1) * stride;
+    values = (double *)calloc(total, sizeof(double));
+    if (!values) return ERR_MEMORY;
+
+    /* Invalidate before construction.  A failed build therefore cannot leave
+       a stale same-Qtime array visible to toolkit callers. */
+    LinkQualitySnapshot.valid = 0;
+    for (k = 1; k <= MSX.Nobjects[LINK]; k++)
+    {
+        status = computeLinkQualBatch(k, values + (size_t)k * stride,
+                                      (int)stride);
+        if (status)
+        {
+            free(values);
+            return status;
+        }
+    }
+    linkQualitySnapshotVersion(&epoch, &qualityTime, &residentEpoch);
+    free(LinkQualitySnapshot.values);
+    LinkQualitySnapshot.values = values;
+    LinkQualitySnapshot.nLinks = MSX.Nobjects[LINK];
+    LinkQualitySnapshot.nSpecies = MSX.Nobjects[SPECIES];
+    LinkQualitySnapshot.qualityEpoch = epoch;
+    LinkQualitySnapshot.qualityTime = qualityTime;
+    LinkQualitySnapshot.residentEpoch = residentEpoch;
+    LinkQualitySnapshot.valid = 1;
+    return 0;
+}
+
+int MSXqual_getLinkQualBatchChecked(int k, double *values, int valueCount)
+{
+    size_t stride;
+    if (linkQualitySnapshotMatches())
+    {
+        stride = (size_t)MSX.Nobjects[SPECIES] + 1;
+        if (!values || valueCount < (int)stride)
+            return ERR_INVALID_OBJECT_PARAMS;
+        if (k < 1 || k > MSX.Nobjects[LINK])
+            return ERR_INVALID_OBJECT_INDEX;
+        memcpy(values, LinkQualitySnapshot.values + (size_t)k * stride,
+               stride * sizeof(double));
         return 0;
     }
+    return computeLinkQualBatch(k, values, valueCount);
+}
+
+int MSXqual_getLinkQualChecked(int k, int m, double *value)
+{
+    double vsum = 0.0, msum = 0.0, *c, *v, *residentMass = NULL;
+    Pseg seg;
+    MSXResidentGpuReduction reduction;
+    MSXResidentStatus residentStatus;
+    int pos, n, slot;
+    if (!value) return ERR_INVALID_OBJECT_PARAMS;
+    *value = 0.0;
+    if (k < 1 || k > MSX.Nobjects[LINK] ||
+        m < 1 || m > MSX.Nobjects[SPECIES])
+        return ERR_INVALID_OBJECT_INDEX;
+    if (linkQualitySnapshotMatches())
+    {
+        *value = LinkQualitySnapshot.values[
+            (size_t)k * ((size_t)MSX.Nobjects[SPECIES] + 1) + m];
+        return 0;
+    }
+
+    if (MSXsegStorage_isPipeRingLink(k))
+    {
+        n = MSXsegStorage_pipeCount(k);
+        for (pos = 0; pos < n; pos++)
+        {
+            slot = MSXsegStorage_pipeSlotFromHead(k, pos);
+            c = MSXsegStorage_pipeC(k, slot);
+            v = MSXsegStorage_pipeVPtr(k, slot);
+            if (!c || !v) continue;
+            vsum += *v;
+            msum += c[m] * (*v);
+        }
+    }
+    else
+    {
+        if (MSXresidentRuntime_isResident() && MSXsegStorage_isHybridLink(k))
+        {
+            residentMass = (double *)calloc(
+                (size_t)MSX.Nobjects[SPECIES] + 1, sizeof(double));
+            if (!residentMass) return ERR_MEMORY;
+            residentStatus = MSXresidentRuntime_reduceLink(
+                (uint32_t)k, residentMass,
+                (uint32_t)MSX.Nobjects[SPECIES] + 1, &vsum, &reduction);
+            if (residentStatus != MSX_RESIDENT_OK)
+            {
+                free(residentMass);
+                return MSX.ErrCode ? MSX.ErrCode : ERR_GPU_KERNEL_RUNTIME_ERROR;
+            }
+            msum = residentMass[m];
+            free(residentMass);
+        }
+        seg = MSX.FirstSeg[k];
+        while (seg != NULL)
+        {
+            if (!MSXresidentRuntime_isResident() ||
+                !MSXsegStorage_isHybridCoreSegment(seg))
+            {
+                vsum += seg->v;
+                msum += seg->c[m] * seg->v;
+            }
+            seg = seg->prev;
+        }
+    }
+    if (vsum > 0.0)
+        *value = msum / vsum;
+    else
+        *value = (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
+                  MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
+    return 0;
 }
 
 double MSXqual_getLinkQual(int k, int m)
@@ -820,6 +983,7 @@ int MSXqual_close()
 */
 {
     int errcode = 0;
+    freeLinkQualitySnapshot();
     if (!MSX.ProjectOpened) return 0;
     /* GPU mirror must close while chemistry and the primary CUDA context are valid. */
     MSXresidentRuntime_close();
@@ -962,6 +1126,7 @@ static void profileTransportPostStep(int profileStage, double simTime,
     MSXsegProfile_endStep(simTime);
     MSXsegStorage_hybridTimingStepEnd();
     MSXgpu_endStep(errcode);
+    MSXqual_invalidateLinkQualitySnapshot();
     if (profileStage)
         MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_POST_STEP,
                                MSXgpu_wallTimeMs() - start);
@@ -1019,6 +1184,10 @@ int  transport(int64_t tstep)
         }
         timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         MSXgpu_reactBegin();
+        /* Boundary/tank chemistry mutates CPU-owned report rows at the same
+           quality time; invalidate before it starts so a re-entrant toolkit
+           query cannot observe the previous report snapshot. */
+        MSXqual_invalidateLinkQualitySnapshot();
         errcode = MSXchem_react(dt);        // react species in each pipe & tank
         MSXgpu_reactEnd();
         if (profileStage)
