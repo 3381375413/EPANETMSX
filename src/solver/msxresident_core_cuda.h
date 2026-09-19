@@ -70,6 +70,8 @@ MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu *, const MSXReside
 void MSXresidentGpu_setDiagnosticMode(MSXResidentGpu *, int enabled);
 MSXResidentStatus MSXresidentGpu_getDeviceView(MSXResidentGpu *, MSXResidentGpuDeviceView *);
 MSXResidentStatus MSXresidentGpu_finishActive(MSXResidentGpu *, MSXResidentGpuReactResult *);
+/* Explicit debug snapshot only: normal Resident reaction consumes device-owned
+   Core state and uses selected handoff fetches instead of this full gather. */
 MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu *,
                                              MSXResidentGpuActiveSyncOutput *,
                                              uint32_t);

@@ -38,8 +38,8 @@ int  MSXsegStorage_isHybridCoreIdentity(int k, uint64_t hybridId);
    Resident row slot, not an assumed dense-Core slot. */
 int  MSXsegStorage_isHybridCoreSlotIdentity(int k, int slot,
                                             uint64_t hybridId);
-/* Writes a Resident-computed payload into the matching dense Core view.
-   It is identity checked and allocation-free. */
+/* Explicit compatibility/debug snapshot helper.  Normal Resident reaction
+   keeps Core concentrations device-owned and does not call this backfill. */
 int  MSXsegStorage_hybridApplyResidentPayload(int k, int residentSlot,
                                               uint64_t hybridId,
                                               const MSXResidentPayload *payload);
@@ -97,6 +97,7 @@ void MSXsegStorage_hybridTimingAddUnpack(double ms);
 void MSXsegStorage_hybridTimingStepBegin(void);
 void MSXsegStorage_hybridTimingStepEnd(void);
 void MSXsegStorage_hybridSyncSegmentScalars(Pseg seg);
+/* Legacy non-Resident mirror maintenance; Resident normal stepping skips it. */
 void MSXsegStorage_hybridSyncAllScalars(void);
 /* Opaque prepared topology mapping.  Its fixed per-link arena is allocated
    during Hybrid reserve; preparation only fills and validates it. Commit is

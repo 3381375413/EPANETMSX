@@ -75,8 +75,8 @@ MSXResidentStatus MSXresident_getSlotPayload(uint32_t,uint32_t,uint32_t,MSXResid
    not expose the CPU concentration image as an authoritative value. */
 MSXResidentStatus MSXresident_getSlotIdentity(uint32_t,uint32_t,uint32_t*,
                                                uint64_t*,uint64_t*);
-/* Updates only payload rows which still match the supplied active snapshot;
-   it never changes descriptor topology or emits patches. */
+/* Explicit compatibility/debug snapshot helper.  Normal Resident reaction
+   does not call this CPU-image backfill path. */
 MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow *,
                                                  const MSXResidentPayload *,uint32_t);
 MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*); void MSXresident_clearPatches(void);

@@ -1046,7 +1046,11 @@ int  transport(int64_t tstep)
             return errcode;
         }
         timer = profileStage ? MSXgpu_wallTimeMs() : 0.0;
-        MSXsegStorage_syncAllScalarsFromPseg();
+        /* Resident Core scalar state is device-owned after handoff.  The
+           legacy full scalar mirror remains for non-Resident Hybrid/PSEG,
+           but must not scan the Resident Core each transport step. */
+        if (!MSXresidentRuntime_isResident())
+            MSXsegStorage_syncAllScalarsFromPseg();
         if (profileStage)
             MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_SCALAR_SYNC,
                                    MSXgpu_wallTimeMs() - timer);
@@ -1925,7 +1929,8 @@ void topological_transport(double dt)
             segqual_update(m, dt);
         }
     }
-    if (MSXsegStorage_isHybridEnabled() && MSX.DispersionFlag)
+    if (MSXsegStorage_isHybridEnabled() && !MSXresidentRuntime_isResident() &&
+        MSX.DispersionFlag)
         MSXsegStorage_hybridSyncAllScalars();
     if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.disperse_ms += MSXgpu_wallTimeMs() - timer;
 }

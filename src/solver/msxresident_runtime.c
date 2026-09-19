@@ -12,8 +12,8 @@ extern MSXproject MSX;
 
 typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; MSXResidentGpu *gpu;
     uint64_t wouldDescriptors, wouldSlots, stale, fallbacks; MSXResidentStatus lastStatus;
-    MSXResidentActiveRow *rows,*activeRows; MSXResidentActiveItem *active;
-    MSXResidentGpuActiveSyncRow *sync; MSXResidentPayload *payload; uint32_t activeCap, stride;
+    MSXResidentActiveRow *rows; MSXResidentActiveItem *active;
+    uint32_t activeCap, stride;
     MSXResidentHandoffPlan *plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *out;
     double *c,*lastc; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
     uint32_t *offset; uint32_t itemCap, itemCount;
@@ -94,18 +94,15 @@ static int resolveCapacityPath(char out[MAXFNAME], const char *capacity, const c
 
 static void runtimeFreeBuffers(void)
 {
-    free(R.rows); free(R.activeRows); free(R.active); free(R.sync); free(R.payload); free(R.plan); free(R.item); free(R.out);
+    free(R.rows); free(R.active); free(R.plan); free(R.item); free(R.out);
     free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset);
-    R.rows=0; R.activeRows=0; R.active=0; R.sync=0; R.payload=0; R.plan=0; R.item=0; R.out=0; R.c=0; R.lastc=0;
+    R.rows=0; R.active=0; R.plan=0; R.item=0; R.out=0; R.c=0; R.lastc=0;
     R.tx=0; R.fallback=0; R.offset=0;
 }
 static int runtimeAllocateBuffers(const MSXResidentLayout *l)
 {
     R.rows=(MSXResidentActiveRow*)calloc(l->totalSlots,sizeof(*R.rows));
-    R.activeRows=(MSXResidentActiveRow*)calloc(l->totalSlots,sizeof(*R.activeRows));
     R.active=(MSXResidentActiveItem*)calloc(l->totalSlots,sizeof(*R.active));
-    R.sync=(MSXResidentGpuActiveSyncRow*)calloc(l->totalSlots,sizeof(*R.sync));
-    R.payload=(MSXResidentPayload*)calloc(l->totalSlots,sizeof(*R.payload));
     R.plan=(MSXResidentHandoffPlan*)calloc((size_t)l->nLinks+1,sizeof(*R.plan));
     R.item=(MSXResidentHandoffItem*)calloc(l->totalSlots,sizeof(*R.item));
     R.out=(MSXResidentHandoffResult*)calloc(l->totalSlots,sizeof(*R.out));
@@ -114,7 +111,7 @@ static int runtimeAllocateBuffers(const MSXResidentLayout *l)
     R.tx=(MSXResidentHandoffTransaction*)calloc((size_t)l->nLinks+1,sizeof(*R.tx));
     R.fallback=(unsigned char*)calloc((size_t)l->nLinks+1,1);
     R.offset=(uint32_t*)calloc((size_t)l->nLinks+1,sizeof(*R.offset));
-    if(!R.rows||!R.activeRows||!R.active||!R.sync||!R.payload||!R.plan||!R.item||!R.out||!R.c||!R.lastc||!R.tx||!R.fallback||!R.offset)
+    if(!R.rows||!R.active||!R.plan||!R.item||!R.out||!R.c||!R.lastc||!R.tx||!R.fallback||!R.offset)
     { runtimeFreeBuffers(); return fail(MSX_RESIDENT_ERR_MEMORY,"runtime_buffers"); }
     R.activeCap=R.itemCap=l->totalSlots; R.stride=l->speciesStride;
     return 0;
@@ -365,7 +362,7 @@ void MSXresidentRuntime_close(void)
     MSXsegStorage_hybridAbortInitialImage();
     MSXresident_abortInitialImage();
     if (R.opened || MSXresident_isOpen()) MSXresident_close();
-    free(R.rows); free(R.activeRows); free(R.active); free(R.sync); free(R.payload); free(R.plan); free(R.item); free(R.out); free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset); memset(&R,0,sizeof(R));
+    free(R.rows); free(R.active); free(R.plan); free(R.item); free(R.out); free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset); memset(&R,0,sizeof(R));
 }
 int MSXresidentRuntime_residentNotReady(void)
 { return R.resident && !R.dispatchReady; }
@@ -613,7 +610,7 @@ int MSXresidentRuntime_completeHandoffs(void)
 }
 int MSXresidentRuntime_reactCore(double dt)
 {
-    MSXResidentStatus s; MSXResidentGpuReactResult out; MSXResidentGpuActiveSyncOutput sync;
+    MSXResidentStatus s; MSXResidentGpuReactResult out;
     uint32_t n=0,i,active=0,m;
     int err; double timer=0.0, phaseStart=0.0;
     int stage = MSXgpu_profileStageEnabled();
@@ -634,7 +631,6 @@ int MSXresidentRuntime_reactCore(double dt)
     phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
     for(i=0;i<n;i++) if(MSXsegStorage_isHybridCoreSlotIdentity((int)R.rows[i].linkIndex,(int)R.rows[i].slot,R.rows[i].parcelId)){
         MSXResidentActiveItem *a=&R.active[active];
-        R.activeRows[active]=R.rows[i];
         a->linkIndex=R.rows[i].linkIndex; a->globalRow=R.rows[i].globalRow; a->generation=R.rows[i].generation; a->descriptorEpoch=R.rows[i].descriptorEpoch; a->volume=R.rows[i].volume; a->hyd=MSX.Link[a->linkIndex].HydVar;
         active++;
     }
@@ -658,44 +654,11 @@ int MSXresidentRuntime_reactCore(double dt)
         MSX.GpuTimingRecord.resident_active_rows += active;
     { MSXResidentActiveBatch b; b.item=R.active; b.itemCount=active; err=MSXgpu_reactResidentCore(R.gpu,&b,dt,&out); }
     if(err){R.dispatchReady=0;R.lastStatus=MSX_RESIDENT_ERR_POISONED;return fail(MSX_RESIDENT_ERR_POISONED,"react_dispatch");}
-    memset(&sync,0,sizeof(sync)); sync.row=R.sync; sync.cOut=R.c; sync.lastcOut=R.lastc; sync.stride=R.stride;
-    if (stage) timer=MSXgpu_wallTimeMs();
-    s=MSXresidentGpu_syncActive(R.gpu,&sync,active);
-    if (stage)
-    {
-        double syncMs=MSXgpu_wallTimeMs()-timer;
-        MSX.GpuTimingRecord.resident_sync_ms+=syncMs;
-        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_FULL_SYNC_GATHER,syncMs);
-    }
-    if(s!=MSX_RESIDENT_OK){R.dispatchReady=0;return fail(s,"active_sync");}
-    phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
-    for(i=0;i<active;i++){
-        MSXResidentGpuActiveSyncRow *q=&R.sync[i]; MSXResidentPayload *p=&R.payload[i];
-        if(q->linkIndex!=R.activeRows[i].linkIndex||q->globalRow!=R.activeRows[i].globalRow||q->generation!=R.activeRows[i].generation||q->descriptorEpoch!=R.activeRows[i].descriptorEpoch||!MSXsegStorage_isHybridCoreSlotIdentity((int)q->linkIndex,(int)R.activeRows[i].slot,R.activeRows[i].parcelId)){
-            if (stage)
-                MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_SYNC_VALIDATE,
-                                       MSXgpu_wallTimeMs()-phaseStart);
-            R.dispatchReady=0;return fail(MSX_RESIDENT_ERR_GENERATION,"active_sync_validate");
-        }
-        p->volume=R.activeRows[i].volume; p->hstep=q->hstep; p->hresponse=q->hresponse; p->uresponse=q->uresponse; p->dresponse=q->dresponse; p->parcelId=R.activeRows[i].parcelId; p->generation=q->generation; p->c=R.c+(size_t)i*R.stride; p->lastc=R.lastc+(size_t)i*R.stride;
-    }
-    if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_SYNC_VALIDATE,
-                                      MSXgpu_wallTimeMs()-phaseStart);
-    phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
-    s=MSXresident_applyActivePayload(R.activeRows,R.payload,active);
-    if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_PAYLOAD_APPLY,
-                                      MSXgpu_wallTimeMs()-phaseStart);
-    if(s!=MSX_RESIDENT_OK){R.dispatchReady=0;return fail(s,"active_cpu_apply");}
-    phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
-    for(i=0;i<active;i++)if(!MSXsegStorage_hybridApplyResidentPayload((int)R.activeRows[i].linkIndex,(int)R.activeRows[i].slot,R.activeRows[i].parcelId,&R.payload[i])){
-        if (stage)
-            MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_DENSE_APPLY,
-                                   MSXgpu_wallTimeMs()-phaseStart);
-        R.dispatchReady=0;return fail(MSX_RESIDENT_ERR_GENERATION,"active_dense_apply");
-    }
-    if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_DENSE_APPLY,
-                                      MSXgpu_wallTimeMs()-phaseStart);
-    if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_dense_apply"))
+    /* finishActive has already committed hstep and concentrations in the
+       device-owned Core image.  Normal Resident execution deliberately does
+       not gather full Core rows or write them back into CPU Pseg mirrors;
+       selected handoff fetches remain the only normal concentration export. */
+    if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_after_react"))
         return MSX.ErrCode;
     if(!out.reacted || out.reactedStride<(uint32_t)MSX.Nobjects[SPECIES]+1 || out.reactedLinkCount<(uint32_t)MSX.Nobjects[LINK]+1){R.dispatchReady=0;return fail(MSX_RESIDENT_ERR_TRANSFER,"react_result");}
     phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
