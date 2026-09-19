@@ -1492,19 +1492,6 @@ static void hybridSnapshotApplyPromote(RebalanceSnapshot *s,
     hybridSnapshotRefreshEndpoints(s, p);
 }
 
-/* A1 deliberately leaves hybridInitializeLink's per-promote algorithm and
-   its internal rescan seam intact.  Once it succeeds, its known final shape
-   is enough to refresh the round image without another full linked-list scan. */
-static void hybridSnapshotAfterInitialization(RebalanceSnapshot *s,
-                                               HybridPipe *p)
-{
-    s->coreCount = p->count;
-    s->downCount = s->guard;
-    s->upCount = s->total - s->downCount - s->coreCount;
-    if (s->upCount < 0) s->upCount = 0;
-    hybridSnapshotRefreshEndpoints(s, p);
-}
-
 int MSXsegStorage_hybridAuditSnapshot(int k,
                                       MSXHybridAuditSnapshot *snapshot,
                                       MSXHybridAuditRow *rows,
@@ -1740,6 +1727,48 @@ static int hybridInitializeLink(int k)
         err = hybridPromote(k, seg, FALSE);
         if (err) return err;
         hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+    }
+    return 0;
+}
+
+/* Resident-only empty-Core rebuild.  The legacy hybridInitializeLink above
+   intentionally keeps its count/find rescans for non-Resident and audit
+   callers.  Resident already owns one authoritative RebalanceSnapshot for
+   this round, so every successful promote can advance the image directly.
+   A failed promote leaves the previously committed prefix in both the CPU
+   topology and this snapshot; there is deliberately no rollback here. */
+static int hybridInitializeResidentLink(int k, RebalanceSnapshot *s)
+{
+    HybridPipe *p = &Hybrid.pipe[k];
+    Pseg seg;
+    int i, err, guard;
+
+    if (!s || s->linkIndex != k || s->coreCount != 0 ||
+        s->total <= 0 || s->total <= 2 * s->guard)
+        return ERR_PIPE_RING_CAPACITY;
+    guard = s->guard;
+    seg = MSX.FirstSeg[k];
+    for (i = 0; i < guard && seg; ++i) seg = seg->prev;
+    if (!seg) return ERR_PIPE_RING_CAPACITY;
+
+    err = hybridPromote(k, seg, TRUE);
+    if (err) return err;
+    s->coreCount = 1;
+    s->downCount = guard;
+    s->upCount = s->total - guard - 1;
+    hybridSnapshotRefreshEndpoints(s, p);
+
+    while (s->upCount > guard)
+    {
+        seg = s->lastCore ? s->lastCore->prev : NULL;
+        if (!seg || seg->inHybridCore) return ERR_PIPE_RING_CAPACITY;
+        err = hybridPromote(k, seg, FALSE);
+        if (err) return err;
+        ++s->coreCount;
+        --s->upCount;
+        /* p->tail is the newly published dense-Core endpoint.  Refreshing
+           from the view preserves endpoint identity without a list rescan. */
+        hybridSnapshotRefreshEndpoints(s, p);
     }
     return 0;
 }
@@ -2265,7 +2294,6 @@ void MSXsegStorage_hybridRebalanceAll(void)
            CPU topology mutation or selected GPU fetch. */
         for (k = 1; k <= Hybrid.nLinks; k++)
         {
-            HybridPipe *p = &Hybrid.pipe[k];
             RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
             phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
             if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
@@ -2275,11 +2303,10 @@ void MSXsegStorage_hybridRebalanceAll(void)
             {
                 phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
                 if (audit) HybridRebalanceStage = HYBRID_REBALANCE_EMPTY_INIT;
-                err = hybridInitializeLink(k);
+                err = hybridInitializeResidentLink(k, s);
                 if (audit) metrics.rb_empty_init_ms +=
                     MSXgpu_wallTimeMs() - phaseStart;
                 if (err) { MSX.ErrCode = err; goto resident_done; }
-                hybridSnapshotAfterInitialization(s, p);
                 if (HybridRebalanceMetrics) ++HybridRebalanceMetrics->rebuilt_links;
             }
         }
