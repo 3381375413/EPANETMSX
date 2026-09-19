@@ -38,6 +38,21 @@ typedef struct {
    fixed row in the published resident span, never a Pseg or ring index. */
 typedef struct { uint32_t linkIndex,globalRow,generation; uint64_t descriptorEpoch; double volume; const double *hyd; } MSXResidentActiveItem;
 typedef struct { const MSXResidentActiveItem *item; uint32_t itemCount; } MSXResidentActiveBatch;
+/* C1 streaming active builder.  The writer is caller-owned and remains valid
+   from begin through submit/finish or abort.  appendActive writes the final
+   pinned active metadata directly; it never performs a device operation. */
+typedef struct {
+    MSXResidentGpu *owner;
+    uint64_t buildSequence;
+    uint64_t topologyVersion;
+    uint32_t count;
+    uint32_t expectedCount;
+    const uint32_t *touchedRows;
+    uint32_t touchedCount;
+    int building;
+    int sealed;
+    int valid;
+} MSXResidentGpuActiveWriter;
 /* Read-only source table supplied for a Resident reaction.  The caller must
    initialize every (linkCount+1)*stride double before submit. */
 typedef struct { const double *pipeHyd; uint32_t linkCount,hydStride,hydLayout; } MSXResidentHydView;
@@ -83,6 +98,23 @@ MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu *, const MSXReside
    pattern, enqueue one full-table H2D only when the applied version changed,
    then enqueue active metadata on the same stream. */
 MSXResidentStatus MSXresidentGpu_prepareActiveHyd(MSXResidentGpu *, const MSXResidentActiveBatch *, const MSXResidentHydView *, MSXResidentGpuDeviceView *, MSXResidentGpuReactResult *);
+/* C1 streaming active preparation.  begin/append/seal are host-only.  The
+   prepared submit consumes the sealed writer and is the first operation that
+   may enqueue memset/H2D work. */
+MSXResidentStatus MSXresidentGpu_beginActive(MSXResidentGpu *, uint32_t expectedCount,
+                                             uint64_t topologyVersion,
+                                             MSXResidentGpuActiveWriter *);
+MSXResidentStatus MSXresidentGpu_appendActive(MSXResidentGpu *,
+                                              MSXResidentGpuActiveWriter *,
+                                              const MSXResidentActiveRow *);
+MSXResidentStatus MSXresidentGpu_sealActive(MSXResidentGpu *,
+                                            MSXResidentGpuActiveWriter *,
+                                            uint64_t topologyVersion);
+MSXResidentStatus MSXresidentGpu_abortActiveBuild(MSXResidentGpu *,
+                                                   MSXResidentGpuActiveWriter *);
+MSXResidentStatus MSXresidentGpu_prepareSealedActiveHyd(
+    MSXResidentGpu *, MSXResidentGpuActiveWriter *, const MSXResidentHydView *,
+    MSXResidentGpuDeviceView *, MSXResidentGpuReactResult *);
 /* Selects whether finishActive returns optional per-active solver counters.
    Required hstep/error/quality state is retained in every mode. */
 void MSXresidentGpu_setDiagnosticMode(MSXResidentGpu *, int enabled);

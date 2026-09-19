@@ -130,6 +130,10 @@ int MSXgpu_submitResidentCore(MSXResidentGpu *, const MSXResidentActiveBatch *,
 int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *, const MSXResidentActiveBatch *,
                                  const MSXResidentHydView *, double dt,
                                  MSXgpuResidentCoreToken *);
+int MSXgpu_submitResidentCoreHydPrepared(MSXResidentGpu *,
+                                         MSXResidentGpuActiveWriter *,
+                                         const MSXResidentHydView *, double dt,
+                                         MSXgpuResidentCoreToken *);
 int MSXgpu_finishResidentCore(MSXResidentGpu *, MSXgpuResidentCoreToken *,
                               MSXResidentGpuReactResult *);
 int MSXgpu_abortResidentCore(MSXResidentGpu *, MSXgpuResidentCoreToken *);

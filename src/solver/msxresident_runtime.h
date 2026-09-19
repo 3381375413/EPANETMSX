@@ -64,7 +64,12 @@ int MSXresidentRuntime_linkFallback(int linkIndex);
 const char *MSXresidentRuntime_status(void);
 MSXResidentStatus MSXresidentRuntime_lastStatus(void);
 const char *MSXresidentRuntime_resolvedCapacityPath(void);
-typedef struct { uint64_t wouldDescriptorPatches,wouldSlotPatches,stalePatches,fallbacks; int opened,resident; } MSXResidentRuntimeMetrics;
+typedef struct {
+    uint64_t wouldDescriptorPatches,wouldSlotPatches,stalePatches,fallbacks;
+    uint64_t activeIteratorPasses,activeRowsAppended,activeFullRowCopies,
+             activeBuilderAborts;
+    int opened,resident;
+} MSXResidentRuntimeMetrics;
 void MSXresidentRuntime_getMetrics(MSXResidentRuntimeMetrics *);
 
 #endif

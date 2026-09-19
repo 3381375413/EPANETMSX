@@ -12,6 +12,11 @@ MSXResidentStatus MSXresidentGpu_reduce(MSXResidentGpu*a,double*b,uint32_t c,MSX
 MSXResidentStatus MSXresidentGpu_reduceLink(MSXResidentGpu*a,uint32_t b,double*c,uint32_t d,double*e,MSXResidentGpuReduction*f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu*a,const MSXResidentActiveBatch*b,MSXResidentGpuDeviceView*c,MSXResidentGpuReactResult*d){(void)a;(void)b;if(c)memset(c,0,sizeof(*c));if(d)memset(d,0,sizeof(*d));return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_prepareActiveHyd(MSXResidentGpu*a,const MSXResidentActiveBatch*b,const MSXResidentHydView*h,MSXResidentGpuDeviceView*c,MSXResidentGpuReactResult*d){(void)a;(void)b;(void)h;if(c)memset(c,0,sizeof(*c));if(d)memset(d,0,sizeof(*d));return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_beginActive(MSXResidentGpu*a,uint32_t n,uint64_t t,MSXResidentGpuActiveWriter*w){(void)a;(void)n;(void)t;if(w)memset(w,0,sizeof(*w));return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_appendActive(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w,const MSXResidentActiveRow*x){(void)a;(void)w;(void)x;return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_sealActive(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w,uint64_t t){(void)a;(void)w;(void)t;return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_abortActiveBuild(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w){(void)a;(void)w;return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_prepareSealedActiveHyd(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w,const MSXResidentHydView*h,MSXResidentGpuDeviceView*c,MSXResidentGpuReactResult*d){(void)a;(void)w;(void)h;if(c)memset(c,0,sizeof(*c));if(d)memset(d,0,sizeof(*d));return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_getDeviceView(MSXResidentGpu*a,MSXResidentGpuDeviceView*b){(void)a;if(b)memset(b,0,sizeof(*b));return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_finishActive(MSXResidentGpu*a,MSXResidentGpuReactResult*b){(void)a;if(b)memset(b,0,sizeof(*b));return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_finishActiveAfterWait(MSXResidentGpu*a,MSXResidentGpuReactResult*b){(void)a;if(b)memset(b,0,sizeof(*b));return MSX_RESIDENT_DISABLED;}

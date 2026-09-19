@@ -1476,6 +1476,11 @@ int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *gpu, const MSXResidentActiveBat
                                  const MSXResidentHydView *hyd, double dt,
                                  MSXgpuResidentCoreToken *token)
 { (void)gpu; (void)batch; (void)hyd; (void)dt; if(token) memset(token,0,sizeof(*token)); return ERR_GPU_NOT_ENABLED; }
+int MSXgpu_submitResidentCoreHydPrepared(MSXResidentGpu *gpu,
+                                         MSXResidentGpuActiveWriter *writer,
+                                         const MSXResidentHydView *hyd, double dt,
+                                         MSXgpuResidentCoreToken *token)
+{ (void)gpu; (void)writer; (void)hyd; (void)dt; if(token) memset(token,0,sizeof(*token)); return ERR_GPU_NOT_ENABLED; }
 int MSXgpu_finishResidentCore(MSXResidentGpu *gpu, MSXgpuResidentCoreToken *token,
                               MSXResidentGpuReactResult *result)
 { (void)gpu; (void)token; if(result) memset(result,0,sizeof(*result)); return ERR_GPU_NOT_ENABLED; }
@@ -2936,9 +2941,11 @@ fail: MSXgpu_closeResidentPrograms(); return err;
 /* P3 lifecycle: prepare and launch on the Runtime-owned stream, then return
    before any device wait.  The Driver API consumes the same underlying stream
    handle exposed by the CUDA Runtime core. */
-int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *resident, const MSXResidentActiveBatch *batch,
-                                 const MSXResidentHydView *hyd,
-                                 double dt, MSXgpuResidentCoreToken *token)
+static int submitResidentCoreHydInternal(MSXResidentGpu *resident,
+                                         const MSXResidentActiveBatch *batch,
+                                         MSXResidentGpuActiveWriter *writer,
+                                         const MSXResidentHydView *hyd,
+                                         double dt, MSXgpuResidentCoreToken *token)
 {
     MSXResidentGpuDeviceView view;
     MSXResidentStatus residentStatus;
@@ -2954,7 +2961,7 @@ int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *resident, const MSXResidentActi
     if (!token) return ERR_GPU_UNSUPPORTED_FEATURE;
     if (token->inFlight || token->magic) return ERR_GPU_KERNEL_RUNTIME_ERROR;
     memset(token, 0, sizeof(*token));
-    if (!resident || !batch || (!batch->item && batch->itemCount))
+    if (!resident || (!writer && (!batch || (!batch->item && batch->itemCount))))
         return ERR_GPU_UNSUPPORTED_FEATURE;
     err = MSXgpu_prepareResidentContext();
     if (err) return err;
@@ -2967,8 +2974,9 @@ int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *resident, const MSXResidentActi
     MSXresidentGpu_setDiagnosticMode(resident,
         MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC));
     if (stage) prepareStart = MSXgpu_wallTimeMs();
-    residentStatus = hyd ? MSXresidentGpu_prepareActiveHyd(resident, batch, hyd, &view, NULL) :
-                           MSXresidentGpu_prepareActive(resident, batch, &view, NULL);
+    residentStatus = writer ? MSXresidentGpu_prepareSealedActiveHyd(resident, writer, hyd, &view, NULL) :
+                              (hyd ? MSXresidentGpu_prepareActiveHyd(resident, batch, hyd, &view, NULL) :
+                                     MSXresidentGpu_prepareActive(resident, batch, &view, NULL));
     if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_PREPARE,
                                       MSXgpu_wallTimeMs() - prepareStart);
     if (residentStatus != MSX_RESIDENT_OK)
@@ -3062,6 +3070,18 @@ submit_fail:
     setGpuError(err ? err : ERR_GPU_KERNEL_RUNTIME_ERROR,GPU_STAGE_NONE,-1,-1,-1,-1,-1,0.0);
     return err ? err : ERR_GPU_KERNEL_RUNTIME_ERROR;
 }
+
+int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *resident,
+                                 const MSXResidentActiveBatch *batch,
+                                 const MSXResidentHydView *hyd,
+                                 double dt, MSXgpuResidentCoreToken *token)
+{ return submitResidentCoreHydInternal(resident, batch, NULL, hyd, dt, token); }
+
+int MSXgpu_submitResidentCoreHydPrepared(MSXResidentGpu *resident,
+                                         MSXResidentGpuActiveWriter *writer,
+                                         const MSXResidentHydView *hyd,
+                                         double dt, MSXgpuResidentCoreToken *token)
+{ return submitResidentCoreHydInternal(resident, NULL, writer, hyd, dt, token); }
 
 int MSXgpu_submitResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBatch *batch,
                               double dt, MSXgpuResidentCoreToken *token)

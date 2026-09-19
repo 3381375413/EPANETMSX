@@ -12,7 +12,7 @@ extern MSXproject MSX;
 
 typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; MSXResidentGpu *gpu;
     uint64_t wouldDescriptors, wouldSlots, stale, fallbacks; MSXResidentStatus lastStatus;
-    MSXResidentActiveRow *rows; MSXResidentActiveItem *active; double *pipeHyd;
+    MSXResidentActiveRow *rows; double *pipeHyd;
     uint32_t activeCap, stride;
     MSXResidentHandoffPlan *plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *out;
     double *c,*lastc; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
@@ -20,6 +20,9 @@ typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; 
     double handoffPlanMs;
     int auditPoisonCpuMirrors, auditAggregateFail, auditHyd, inFlight;
     uint64_t sequence, topologyVersion, stateVersion;
+    uint64_t activeIteratorPasses, activeRowsAppended, activeFullRowCopies,
+             activeBuilderAborts;
+    MSXResidentGpuActiveWriter activeWriter;
     MSXResidentRuntimeToken flight;
     char status[96], resolvedCapacity[MAXFNAME]; } Runtime;
 static Runtime R;
@@ -64,14 +67,14 @@ static int auditHydRequested(void)
 /* Compare the source values that the legacy active-major path consumed with
    the corresponding pipe-major rows.  This is intentionally opt-in: the
    production path does not walk all active HydVar values a second time. */
-static int auditHydTable(const MSXResidentActiveBatch *batch,
+static int auditHydTable(const MSXResidentActiveRow *rows, uint32_t count,
                          const MSXResidentHydView *hyd)
 {
     uint32_t i, mismatches = 0;
-    if (!batch || !hyd || !hyd->pipeHyd) return -1;
-    for (i = 0; i < batch->itemCount; ++i)
+    if ((!rows && count) || !hyd || !hyd->pipeHyd) return -1;
+    for (i = 0; i < count; ++i)
     {
-        uint32_t k = batch->item[i].linkIndex;
+        uint32_t k = rows[i].linkIndex;
         const double *oldHyd = MSX.Link[k].HydVar;
         const double *pipeHyd = hyd->pipeHyd +
             (size_t)k * MSX_RESIDENT_HYD_STRIDE;
@@ -80,7 +83,7 @@ static int auditHydTable(const MSXResidentActiveBatch *batch,
             ++mismatches;
     }
     fprintf(stderr, "RESIDENT_HYD_AUDIT,active=%u,mismatches=%u\n",
-            batch->itemCount, mismatches);
+            count, mismatches);
     fflush(stderr);
     return mismatches ? -1 : 0;
 }
@@ -123,9 +126,9 @@ static int resolveCapacityPath(char out[MAXFNAME], const char *capacity, const c
 
 static void runtimeFreeBuffers(void)
 {
-    free(R.rows); free(R.active); free(R.pipeHyd); free(R.plan); free(R.item); free(R.out);
+    free(R.rows); free(R.pipeHyd); free(R.plan); free(R.item); free(R.out);
     free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset);
-    R.rows=0; R.active=0; R.pipeHyd=0; R.plan=0; R.item=0; R.out=0; R.c=0; R.lastc=0;
+    R.rows=0; R.pipeHyd=0; R.plan=0; R.item=0; R.out=0; R.c=0; R.lastc=0;
     R.tx=0; R.fallback=0; R.offset=0;
 }
 static int runtimeAllocateBuffers(const MSXResidentLayout *l)
@@ -137,7 +140,6 @@ static int runtimeAllocateBuffers(const MSXResidentLayout *l)
     if (hydValues > SIZE_MAX / sizeof(double))
         return fail(MSX_RESIDENT_ERR_OVERFLOW,"runtime_hyd_bytes");
     R.rows=(MSXResidentActiveRow*)calloc(l->totalSlots,sizeof(*R.rows));
-    R.active=(MSXResidentActiveItem*)calloc(l->totalSlots,sizeof(*R.active));
     R.pipeHyd=(double*)calloc(hydValues,sizeof(*R.pipeHyd));
     R.plan=(MSXResidentHandoffPlan*)calloc((size_t)l->nLinks+1,sizeof(*R.plan));
     R.item=(MSXResidentHandoffItem*)calloc(l->totalSlots,sizeof(*R.item));
@@ -147,7 +149,7 @@ static int runtimeAllocateBuffers(const MSXResidentLayout *l)
     R.tx=(MSXResidentHandoffTransaction*)calloc((size_t)l->nLinks+1,sizeof(*R.tx));
     R.fallback=(unsigned char*)calloc((size_t)l->nLinks+1,1);
     R.offset=(uint32_t*)calloc((size_t)l->nLinks+1,sizeof(*R.offset));
-    if(!R.rows||!R.active||!R.pipeHyd||!R.plan||!R.item||!R.out||!R.c||!R.lastc||!R.tx||!R.fallback||!R.offset)
+    if(!R.rows||!R.pipeHyd||!R.plan||!R.item||!R.out||!R.c||!R.lastc||!R.tx||!R.fallback||!R.offset)
     { runtimeFreeBuffers(); return fail(MSX_RESIDENT_ERR_MEMORY,"runtime_buffers"); }
     R.activeCap=R.itemCap=l->totalSlots; R.stride=l->speciesStride;
     return 0;
@@ -441,13 +443,19 @@ void MSXresidentRuntime_close(void)
            be reused. */
         (void)MSXresidentGpu_invalidateHyd(R.gpu);
     }
+    fprintf(stderr,
+            "RESIDENT_ACTIVE_BUILDER,iterator_passes=%llu,rows_appended=%llu,full_row_copies=%llu,builder_aborts=%llu\n",
+            (unsigned long long)R.activeIteratorPasses,
+            (unsigned long long)R.activeRowsAppended,
+            (unsigned long long)R.activeFullRowCopies,
+            (unsigned long long)R.activeBuilderAborts);
     /* Same CUDA context: destroy dependent program objects before its mirror. */
     MSXgpu_closeResidentPrograms();
     if (R.gpu) { MSXresidentGpu_close(R.gpu); R.gpu=0; }
     MSXsegStorage_hybridAbortInitialImage();
     MSXresident_abortInitialImage();
     if (R.opened || MSXresident_isOpen()) MSXresident_close();
-    free(R.rows); free(R.active); free(R.plan); free(R.item); free(R.out); free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset); memset(&R,0,sizeof(R));
+    free(R.rows); free(R.plan); free(R.item); free(R.out); free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset); memset(&R,0,sizeof(R));
 }
 int MSXresidentRuntime_residentNotReady(void)
 { return R.resident && !R.dispatchReady; }
@@ -700,14 +708,16 @@ int MSXresidentRuntime_completeHandoffs(void)
                                           fetchCalls);
     return 0;
 }
-static MSXResidentStatus runtimeBuildActive(uint32_t *activeOut)
+static MSXResidentStatus runtimeBuildActive(MSXResidentGpuActiveWriter *writer,
+                                            uint32_t *activeOut)
 {
-    MSXResidentStatus s; uint32_t n=0,i,active=0;
+    MSXResidentStatus s; uint32_t n=0,i;
     double timer=0.0, phaseStart=0.0;
     int stage=MSXgpu_profileStageEnabled();
-    if (!activeOut) return MSX_RESIDENT_ERR_ARGUMENT;
+    if (!writer || !activeOut) return MSX_RESIDENT_ERR_ARGUMENT;
     if (stage) timer=MSXgpu_wallTimeMs();
     s=MSXresident_enumerateActive(R.rows,R.activeCap,&n);
+    R.activeIteratorPasses++;
     if (stage)
     {
         double elapsed=MSXgpu_wallTimeMs()-timer;
@@ -715,27 +725,51 @@ static MSXResidentStatus runtimeBuildActive(uint32_t *activeOut)
         MSX.GpuTimingRecord.resident_enumerate_filter_ms+=elapsed;
     }
     if(s!=MSX_RESIDENT_OK)return s;
+    s=MSXresidentGpu_beginActive(R.gpu,n,R.topologyVersion,writer);
+    if(s!=MSX_RESIDENT_OK)return s;
     if(stage)phaseStart=MSXgpu_wallTimeMs();
     for(i=0;i<n;i++)
-        if(MSXsegStorage_isHybridCoreSlotIdentity((int)R.rows[i].linkIndex,
-                                                   (int)R.rows[i].slot,
-                                                   R.rows[i].parcelId))
+    {
+        /* The Hybrid identity check is deliberately before the GPU mirror
+           check in appendActive, preserving the historical error order. */
+        if(!MSXsegStorage_isHybridCoreSlotIdentity((int)R.rows[i].linkIndex,
+                                                    (int)R.rows[i].slot,
+                                                    R.rows[i].parcelId))
         {
-            MSXResidentActiveItem *a=&R.active[active];
-            a->linkIndex=R.rows[i].linkIndex; a->globalRow=R.rows[i].globalRow;
-            a->generation=R.rows[i].generation; a->descriptorEpoch=R.rows[i].descriptorEpoch;
-            a->volume=R.rows[i].volume; a->hyd=NULL;
-            active++;
+            R.activeBuilderAborts++;
+            (void)MSXresidentGpu_abortActiveBuild(R.gpu,writer);
+            return MSX_RESIDENT_ERR_GENERATION;
         }
+        s=MSXresidentGpu_appendActive(R.gpu,writer,&R.rows[i]);
+        if(s!=MSX_RESIDENT_OK)
+        {
+            R.activeBuilderAborts++;
+            (void)MSXresidentGpu_abortActiveBuild(R.gpu,writer);
+            return s;
+        }
+        R.activeRowsAppended++;
+    }
     if(stage)
     {
         double elapsed=MSXgpu_wallTimeMs()-phaseStart;
         MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_IDENTITY_FILTER,elapsed);
         MSX.GpuTimingRecord.resident_enumerate_filter_ms+=elapsed;
     }
-    if(active!=n)return MSX_RESIDENT_ERR_GENERATION;
-    if(stage)MSX.GpuTimingRecord.resident_active_rows+=active;
-    *activeOut=active; return MSX_RESIDENT_OK;
+    if (R.topologyVersion != writer->topologyVersion)
+    {
+        R.activeBuilderAborts++;
+        (void)MSXresidentGpu_abortActiveBuild(R.gpu,writer);
+        return MSX_RESIDENT_ERR_GENERATION;
+    }
+    s=MSXresidentGpu_sealActive(R.gpu,writer,R.topologyVersion);
+    if(s!=MSX_RESIDENT_OK)
+    {
+        R.activeBuilderAborts++;
+        (void)MSXresidentGpu_abortActiveBuild(R.gpu,writer);
+        return s;
+    }
+    if(stage)MSX.GpuTimingRecord.resident_active_rows+=n;
+    *activeOut=n; return MSX_RESIDENT_OK;
 }
 
 /* A stale caller token must never leave the device submission live: its
@@ -754,7 +788,7 @@ static void runtimeDrainFlight(void)
 
 int MSXresidentRuntime_submitCore(double dt, MSXResidentRuntimeToken *token)
 {
-    MSXResidentStatus s; MSXResidentActiveBatch batch; MSXResidentHydView hyd;
+    MSXResidentStatus s; MSXResidentHydView hyd;
     uint32_t active=0,k,m; int err; size_t hydValues;
     double flushStart=0.0; int stage=MSXgpu_profileStageEnabled();
     if (!token || token->magic || token->inFlight) return fail(MSX_RESIDENT_ERR_ARGUMENT,"submit_token");
@@ -766,10 +800,9 @@ int MSXresidentRuntime_submitCore(double dt, MSXResidentRuntimeToken *token)
     if(stage)MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_FLUSH,
                                     MSXgpu_wallTimeMs()-flushStart);
     if(err)return MSX.ErrCode;
-    s=runtimeBuildActive(&active);
+    s=runtimeBuildActive(&R.activeWriter,&active);
     if(s!=MSX_RESIDENT_OK){R.dispatchReady=0;return fail(s,"active_identity_filter");}
     memset(token,0,sizeof(*token));
-    batch.item=R.active; batch.itemCount=active;
     hydValues=((size_t)MSX.Nobjects[LINK]+1u)*MSX_RESIDENT_HYD_STRIDE;
     memset(R.pipeHyd,0,hydValues*sizeof(double));
     for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)
@@ -777,10 +810,14 @@ int MSXresidentRuntime_submitCore(double dt, MSXResidentRuntimeToken *token)
             R.pipeHyd[(size_t)k*MSX_RESIDENT_HYD_STRIDE+m]=MSX.Link[k].HydVar[m];
     hyd.pipeHyd=R.pipeHyd; hyd.linkCount=(uint32_t)MSX.Nobjects[LINK];
     hyd.hydStride=MSX_RESIDENT_HYD_STRIDE; hyd.hydLayout=MSX_RESIDENT_HYD_PIPE_MAJOR;
-    if (R.auditHyd && auditHydTable(&batch,&hyd) != 0)
-    { R.dispatchReady=0; return fail(MSX_RESIDENT_ERR_ARGUMENT,"audit_hyd"); }
-    err=MSXgpu_submitResidentCoreHyd(R.gpu,&batch,&hyd,dt,&token->gpu);
-    if(err){R.dispatchReady=0;(void)fail(MSX_RESIDENT_ERR_GPU,"submit_gpu");return err;}
+    if (R.auditHyd && auditHydTable(R.rows,active,&hyd) != 0)
+    { R.dispatchReady=0; R.activeBuilderAborts++;
+      (void)MSXresidentGpu_abortActive(R.gpu);
+      return fail(MSX_RESIDENT_ERR_ARGUMENT,"audit_hyd"); }
+    err=MSXgpu_submitResidentCoreHydPrepared(R.gpu,&R.activeWriter,&hyd,dt,&token->gpu);
+    if(err){R.dispatchReady=0; R.activeBuilderAborts++;
+        (void)MSXresidentGpu_abortActive(R.gpu);
+        (void)fail(MSX_RESIDENT_ERR_GPU,"submit_gpu");return err;}
     R.sequence++; if(!R.sequence)R.sequence++;
     R.inFlight=1; R.stateVersion++;
     token->magic=MSX_RESIDENT_RUNTIME_TOKEN_MAGIC; token->stepId=R.sequence;
@@ -852,4 +889,4 @@ const char *MSXresidentRuntime_status(void) { return R.status; }
 MSXResidentStatus MSXresidentRuntime_lastStatus(void) { return R.lastStatus; }
 const char *MSXresidentRuntime_resolvedCapacityPath(void) { return R.resolvedCapacity; }
 void MSXresidentRuntime_getMetrics(MSXResidentRuntimeMetrics *m)
-{ if(!m)return; m->wouldDescriptorPatches=R.wouldDescriptors; m->wouldSlotPatches=R.wouldSlots; m->stalePatches=R.stale; m->fallbacks=R.fallbacks; m->opened=R.opened; m->resident=R.resident; }
+{ if(!m)return; m->wouldDescriptorPatches=R.wouldDescriptors; m->wouldSlotPatches=R.wouldSlots; m->stalePatches=R.stale; m->fallbacks=R.fallbacks; m->activeIteratorPasses=R.activeIteratorPasses; m->activeRowsAppended=R.activeRowsAppended; m->activeFullRowCopies=R.activeFullRowCopies; m->activeBuilderAborts=R.activeBuilderAborts; m->opened=R.opened; m->resident=R.resident; }
