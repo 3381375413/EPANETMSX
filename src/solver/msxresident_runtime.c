@@ -416,6 +416,14 @@ MSXResidentStatus MSXresidentRuntime_fetchBatch(
 
 void MSXresidentRuntime_close(void)
 {
+    int emitDiagnosticSummary = 0;
+    if (R.auditPoisonCpuMirrors || R.auditHyd || R.auditAggregateFail)
+        emitDiagnosticSummary = 1;
+    else if (R.opened || R.gpu)
+        emitDiagnosticSummary =
+            MSXresidentRuntime_diagnosticSummaryGate(
+                MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC),
+                0);
     if (R.inFlight)
     {
         /* Close is a lifecycle boundary: never release the CUDA/core buffers
@@ -429,7 +437,8 @@ void MSXresidentRuntime_close(void)
     if (R.gpu)
     {
         MSXResidentGpuTransferStats hydStats;
-        if (MSXresidentGpu_getTransferStats(R.gpu, &hydStats) == MSX_RESIDENT_OK)
+        if (emitDiagnosticSummary &&
+            MSXresidentGpu_getTransferStats(R.gpu, &hydStats) == MSX_RESIDENT_OK)
             fprintf(stderr,
                     "RESIDENT_HYD_CACHE,candidate_comparisons=%llu,uploads=%llu,skips=%llu,bytes=%llu,api_calls=%llu,applied_valid=%d,pending=%d\n",
                     (unsigned long long)hydStats.hydCandidateComparisons,
@@ -443,12 +452,13 @@ void MSXresidentRuntime_close(void)
            be reused. */
         (void)MSXresidentGpu_invalidateHyd(R.gpu);
     }
-    fprintf(stderr,
-            "RESIDENT_ACTIVE_BUILDER,iterator_passes=%llu,rows_appended=%llu,full_row_copies=%llu,builder_aborts=%llu\n",
-            (unsigned long long)R.activeIteratorPasses,
-            (unsigned long long)R.activeRowsAppended,
-            (unsigned long long)R.activeFullRowCopies,
-            (unsigned long long)R.activeBuilderAborts);
+    if (emitDiagnosticSummary)
+        fprintf(stderr,
+                "RESIDENT_ACTIVE_BUILDER,iterator_passes=%llu,rows_appended=%llu,full_row_copies=%llu,builder_aborts=%llu\n",
+                (unsigned long long)R.activeIteratorPasses,
+                (unsigned long long)R.activeRowsAppended,
+                (unsigned long long)R.activeFullRowCopies,
+                (unsigned long long)R.activeBuilderAborts);
     /* Same CUDA context: destroy dependent program objects before its mirror. */
     MSXgpu_closeResidentPrograms();
     if (R.gpu) { MSXresidentGpu_close(R.gpu); R.gpu=0; }

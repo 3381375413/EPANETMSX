@@ -5,6 +5,15 @@
 #include "msxresident_core_cuda.h"
 #include "msxgpu.h"
 
+/* Resident close summaries are diagnostics, not part of the cache protocol.
+   Keep this predicate pure so the CPU contract harness can cover the off and
+   explicit-audit cases without linking the production runtime. */
+static int MSXresidentRuntime_diagnosticSummaryGate(int diagnosticDetail,
+                                                    int auditRequested)
+{
+    return diagnosticDetail || auditRequested;
+}
+
 /* Phase 3C-1 lifecycle boundary.  These hooks never alter segment topology. */
 int MSXresidentRuntime_preHybridInit(void);
 int MSXresidentRuntime_afterHybridInit(void);
