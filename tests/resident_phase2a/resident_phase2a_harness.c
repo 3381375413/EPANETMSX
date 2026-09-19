@@ -144,5 +144,9 @@ static void t17(void){char b[768];MSXResidentLayout l;MSXResidentPatchBatch x;in
  OK(MSXresident_beginInitialImage()==0&&MSXsegStorage_hybridPrepareInitialImage()==0&&MSXsegStorage_hybridStageInitialImage()==0);
  OK(MSXresident_getInitialBatch(&x)==0&&x.descriptorCount==2&&x.descriptor[0].linkIndex==1&&x.descriptor[0].descriptor.count==5&&x.descriptor[1].linkIndex==2&&x.descriptor[1].descriptor.count==1);
  OK(MSXsegStorage_hybridCommitInitialImage()==0&&MSXresident_commitInitialImage()==0&&MSXsegStorage_hybridCoreCount(1)==5&&MSXsegStorage_hybridCoreCount(2)==1);
-}
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+ }
+/* 25: the A1 snapshot contract uses the canonical all-downstream shape when
+   a pipe has no Core.  This is also the reference form used by audit checks
+   after a batch demote removes the last Core row. */
+static void t25(void){char b[512];MSXResidentLayout l;MSXHybridAuditSnapshot s;MSXHybridAuditRow rows[8];uint32_t n=0;Pseg prev=NULL;int i;setup(1,1);MSX.SegmentStorage=SEG_STORAGE_HYBRID;onecsv(b,sizeof(b),UP,16);csv("resident_phase2a.csv",b);OK(MSXresident_open("resident_phase2a.csv")==0);MSXresident_setMode(MSX_RESIDENT_RESIDENT,1);OK(MSXsegStorage_open()==0&&MSXresident_getLayout(&l)==0&&MSXsegStorage_hybridReserve(&l)==0);for(i=0;i<4;i++){Pseg q=fseg(i+1,(uint64_t)(1200+i));OK(q!=NULL);q->next=prev;if(prev)prev->prev=q;else MSX.FirstSeg[1]=q;prev=q;MSX.LastSeg[1]=q;MSX.Link[1].nsegs++;}OK(MSXsegStorage_hybridizeAll()==0);OK(MSXsegStorage_hybridAuditSnapshot(1,&s,rows,8,&n)==0&&n==4&&s.total==4&&s.core_count==0&&s.downstream_boundary==4&&s.upstream_boundary==0&&s.first_core_slot==-1&&s.last_core_slot==-1);for(i=0;i<4;i++)OK(rows[i].core==0);}
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}

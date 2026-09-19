@@ -27,6 +27,28 @@ extern MSXproject MSX;
 
 typedef struct HybridDemoteRequest HybridDemoteRequest;
 
+/* One read-only topology image for a Resident Rebalance round.  The image is
+   rebuilt from FirstSeg -> prev once per pipe and then carried through the
+   demote plan/commit and ordinary promote phases.  Pseg pointers are valid
+   until the corresponding phase commits; endpoint pointers are refreshed from
+   the dense view after every successful topology mutation. */
+typedef struct RebalanceSnapshot
+{
+    int linkIndex;
+    int total;
+    int coreCount;
+    int downCount;
+    int upCount;
+    Pseg firstCore;
+    Pseg lastCore;
+    uint64_t firstCoreId;
+    uint64_t lastCoreId;
+    int head;
+    int tail;
+    int orient;
+    int guard;
+} RebalanceSnapshot;
+
 typedef struct PipeRingStorage
 {
     int opened;
@@ -152,6 +174,7 @@ typedef struct HybridStorage
     uint32_t *demoteBoundaryNext;
     uint32_t demoteBoundaryFreeHead;
     uint32_t demoteBoundaryCapacity;
+    RebalanceSnapshot *rebalanceSnapshot;
 } HybridStorage;
 
 static HybridStorage Hybrid = {0};
@@ -521,6 +544,7 @@ static void hybridClear(void)
     FREE(Hybrid.demoteItem);
     FREE(Hybrid.demoteC);
     FREE(Hybrid.demoteLastC);
+    FREE(Hybrid.rebalanceSnapshot);
     FREE(Hybrid.pipe);
     memset(&Hybrid, 0, sizeof(Hybrid));
 }
@@ -641,11 +665,20 @@ static int hybridOpen(void)
          _stricmp(timing, "NO") == 0));
     Hybrid.pipe = (HybridPipe *)calloc((size_t)Hybrid.nLinks + 1, sizeof(HybridPipe));
     if (!Hybrid.pipe) return ERR_MEMORY;
+    Hybrid.rebalanceSnapshot = (RebalanceSnapshot *)calloc(
+        (size_t)Hybrid.nLinks + 1, sizeof(*Hybrid.rebalanceSnapshot));
+    if (!Hybrid.rebalanceSnapshot)
+    {
+        FREE(Hybrid.pipe);
+        memset(&Hybrid, 0, sizeof(Hybrid));
+        return ERR_MEMORY;
+    }
     cap = MAX(16, MIN(MAX(16, MSX.MaxSegments), 128));
     for (k = 1; k <= Hybrid.nLinks; k++)
     {
         Hybrid.pipe[k].head = -1;
         Hybrid.pipe[k].tail = -1;
+        Hybrid.pipe[k].orient = 1;
         /* Allocate lazily per link.  A link receives storage at first promotion. */
         (void)cap;
     }
@@ -1354,6 +1387,124 @@ static void hybridFindCore(HybridPipe *p, int k, Pseg *firstCore,
     }
 }
 
+/* Capture the authoritative CPU topology once for a Resident Rebalance
+   round.  This deliberately does not call hybridFindCore: the latter remains
+   the legacy/non-Resident and audit rescan seam. */
+static void hybridCaptureRebalanceSnapshot(int k, RebalanceSnapshot *s)
+{
+    HybridPipe *p = &Hybrid.pipe[k];
+    Pseg seg;
+    int nDown = 0, nUp = 0, nCore = 0, total = 0, seenCore = FALSE;
+
+    memset(s, 0, sizeof(*s));
+    s->linkIndex = k;
+    s->head = -1;
+    s->tail = -1;
+    s->orient = p->orient;
+    s->guard = hybridPipeGuard(p);
+    for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev)
+    {
+        ++total;
+        if (seg->inHybridCore)
+        {
+            if (!s->firstCore) s->firstCore = seg;
+            s->lastCore = seg;
+            ++nCore;
+            seenCore = TRUE;
+        }
+        else if (!seenCore) ++nDown;
+        else ++nUp;
+    }
+    s->total = total;
+    s->coreCount = nCore;
+    /* With no Core, all segments are the canonical downstream boundary. */
+    s->downCount = nCore ? nDown : total;
+    s->upCount = nCore ? nUp : 0;
+    if (s->firstCore)
+    {
+        s->head = s->firstCore->hybridSlot;
+        s->tail = s->lastCore->hybridSlot;
+        s->firstCoreId = s->firstCore->hybridId;
+        s->lastCoreId = s->lastCore->hybridId;
+    }
+    p->count = s->coreCount;
+    p->downstreamBoundary = s->downCount;
+    p->upstreamBoundary = s->upCount;
+    p->head = s->head;
+    p->tail = s->tail;
+    if (HybridRebalanceMetrics)
+    {
+        ++HybridRebalanceMetrics->scan_passes;
+        HybridRebalanceMetrics->core_visits += (uint64_t)s->coreCount;
+        HybridRebalanceMetrics->boundary_visits +=
+            (uint64_t)s->downCount + (uint64_t)s->upCount;
+    }
+}
+
+static void hybridSnapshotRefreshEndpoints(RebalanceSnapshot *s,
+                                            HybridPipe *p)
+{
+    s->head = p->head;
+    s->tail = p->tail;
+    s->coreCount = p->count;
+    if (s->coreCount <= 0)
+    {
+        s->coreCount = 0;
+        s->firstCore = NULL;
+        s->lastCore = NULL;
+        s->firstCoreId = 0;
+        s->lastCoreId = 0;
+        s->head = -1;
+        s->tail = -1;
+        s->downCount = s->total;
+        s->upCount = 0;
+    }
+    else
+    {
+        s->firstCore = p->view[p->head];
+        s->lastCore = p->view[p->tail];
+        s->firstCoreId = s->firstCore ? s->firstCore->hybridId : 0;
+        s->lastCoreId = s->lastCore ? s->lastCore->hybridId : 0;
+    }
+    p->count = s->coreCount;
+    p->downstreamBoundary = s->downCount;
+    p->upstreamBoundary = s->upCount;
+}
+
+static void hybridSnapshotApplyDemote(RebalanceSnapshot *s,
+                                      HybridPipe *p, int atHead)
+{
+    if (s->coreCount > 0) --s->coreCount;
+    if (atHead) ++s->downCount;
+    else ++s->upCount;
+    hybridSnapshotRefreshEndpoints(s, p);
+}
+
+static void hybridSnapshotApplyPromote(RebalanceSnapshot *s,
+                                       HybridPipe *p, int atHead)
+{
+    ++s->coreCount;
+    if (atHead)
+    {
+        if (s->downCount > 0) --s->downCount;
+    }
+    else if (s->upCount > 0) --s->upCount;
+    hybridSnapshotRefreshEndpoints(s, p);
+}
+
+/* A1 deliberately leaves hybridInitializeLink's per-promote algorithm and
+   its internal rescan seam intact.  Once it succeeds, its known final shape
+   is enough to refresh the round image without another full linked-list scan. */
+static void hybridSnapshotAfterInitialization(RebalanceSnapshot *s,
+                                               HybridPipe *p)
+{
+    s->coreCount = p->count;
+    s->downCount = s->guard;
+    s->upCount = s->total - s->downCount - s->coreCount;
+    if (s->upCount < 0) s->upCount = 0;
+    hybridSnapshotRefreshEndpoints(s, p);
+}
+
 int MSXsegStorage_hybridAuditSnapshot(int k,
                                       MSXHybridAuditSnapshot *snapshot,
                                       MSXHybridAuditRow *rows,
@@ -1760,6 +1911,7 @@ static int hybridDemoteResidentBatch(void)
     HybridDemoteRequest *request = Hybrid.demoteRequest;
     MSXResidentHandoffResult *result = Hybrid.demoteResult;
     MSXResidentHandoffItem *item = Hybrid.demoteItem;
+    RebalanceSnapshot *snapshot = Hybrid.rebalanceSnapshot;
     double *c = Hybrid.demoteC, *lastc = Hybrid.demoteLastC;
     uint32_t capacity = Hybrid.demoteCapacity;
     uint32_t count = 0, pos = 0, i, begin, end;
@@ -1771,21 +1923,15 @@ static int hybridDemoteResidentBatch(void)
     double planTimer = detail ? timer : 0.0;
     double validateTimer = 0.0;
 
+    if (!snapshot) return ERR_MEMORY;
     for (i = 1; i <= (uint32_t)Hybrid.nLinks; i++)
     {
-        HybridPipe *p = &Hybrid.pipe[i];
-        Pseg firstCore, lastCore;
-        int down, up, ncore;
-        int guard = hybridPipeGuard(p);
-        hybridFindCore(p, (int)i, &firstCore, &lastCore, &down, &up, &ncore);
-        if (ncore > 0)
-        {
-            int remaining = ncore;
-            while (remaining > 0 && down < guard)
-            { count++; remaining--; down++; }
-            while (remaining > 0 && up < guard)
-            { count++; remaining--; up++; }
-        }
+        RebalanceSnapshot *s = &snapshot[i];
+        int downDemote = MIN(s->coreCount,
+                             MAX(0, s->guard - s->downCount));
+        int upDemote = MIN(s->coreCount - downDemote,
+                           MAX(0, s->guard - s->upCount));
+        count += (uint32_t)(downDemote + upDemote);
     }
     if (!count)
     {
@@ -1804,15 +1950,17 @@ static int hybridDemoteResidentBatch(void)
     for (i = 1; i <= (uint32_t)Hybrid.nLinks; i++)
     {
         HybridPipe *p = &Hybrid.pipe[i];
-        Pseg firstCore, lastCore;
-        int down, up, ncore, remaining, head, tail, guard;
+        RebalanceSnapshot *s = &snapshot[i];
+        int downDemote, upDemote, remaining, head, tail;
         uint64_t parcelId;
-        hybridFindCore(p, (int)i, &firstCore, &lastCore, &down, &up, &ncore);
-        guard = hybridPipeGuard(p);
-        remaining = ncore;
-        head = p->head;
-        tail = p->tail;
-        while (remaining > 0 && down < guard)
+        downDemote = MIN(s->coreCount,
+                         MAX(0, s->guard - s->downCount));
+        upDemote = MIN(s->coreCount - downDemote,
+                       MAX(0, s->guard - s->upCount));
+        remaining = downDemote + upDemote;
+        head = s->head;
+        tail = s->tail;
+        while (remaining > 0 && downDemote > 0)
         {
             HybridDemoteRequest *r = &request[pos++];
             r->linkIndex = (int)i; r->atHead = TRUE; r->coreSlot = head;
@@ -1823,7 +1971,7 @@ static int hybridDemoteResidentBatch(void)
             }
             r->core = p->view[head];
             head = hybridNextSlot(p, head);
-            remaining--; down++;
+            remaining--; downDemote--;
             if (!r->core || !p->residentSlot ||
                 p->residentSlot[r->coreSlot] < 0)
             { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
@@ -1844,7 +1992,7 @@ static int hybridDemoteResidentBatch(void)
             { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
               hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_MEMORY; }
         }
-        while (remaining > 0 && up < guard)
+        while (remaining > 0 && upDemote > 0)
         {
             HybridDemoteRequest *r = &request[pos++];
             r->linkIndex = (int)i; r->atHead = FALSE; r->coreSlot = tail;
@@ -1855,7 +2003,7 @@ static int hybridDemoteResidentBatch(void)
             }
             r->core = p->view[tail];
             tail = hybridPrevSlot(p, tail);
-            remaining--; up++;
+            remaining--; upDemote--;
             if (!r->core || !p->residentSlot ||
                 p->residentSlot[r->coreSlot] < 0)
             { if (detail) hybridRebalanceAddPlan(MSXgpu_wallTimeMs() - planTimer);
@@ -1961,6 +2109,9 @@ static int hybridDemoteResidentBatch(void)
         }
         else
         {
+            hybridSnapshotApplyDemote(&snapshot[request[i].linkIndex],
+                                      &Hybrid.pipe[request[i].linkIndex],
+                                      request[i].atHead);
             if (HybridRebalanceMetrics) ++HybridRebalanceMetrics->commit_rows;
             request[i].boundary = NULL;
         }
@@ -1974,27 +2125,28 @@ static int hybridDemoteResidentBatch(void)
     return 0;
 }
 
-static int hybridPromoteResidentExcess(int k)
+static int hybridPromoteResidentExcess(int k, RebalanceSnapshot *s)
 {
     HybridPipe *p = &Hybrid.pipe[k];
-    Pseg firstCore, lastCore, seg;
-    int down, up, count, guard = hybridPipeGuard(p), err;
-    hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
-    while (count > 0 && down > guard)
+    Pseg seg;
+    int guard, err;
+    if (!s) return ERR_MEMORY;
+    guard = s->guard;
+    while (s->coreCount > 0 && s->downCount > guard)
     {
-        seg = firstCore->next;
+        seg = s->firstCore ? s->firstCore->next : NULL;
         if (!seg || seg->inHybridCore) break;
         err = hybridPromote(k, seg, TRUE);
         if (err) return err;
-        firstCore = p->view[p->head]; count++; down--;
+        hybridSnapshotApplyPromote(s, p, TRUE);
     }
-    while (count > 0 && up > guard)
+    while (s->coreCount > 0 && s->upCount > guard)
     {
-        seg = lastCore->prev;
+        seg = s->lastCore ? s->lastCore->prev : NULL;
         if (!seg || seg->inHybridCore) break;
         err = hybridPromote(k, seg, FALSE);
         if (err) return err;
-        lastCore = p->view[p->tail]; count++; up--;
+        hybridSnapshotApplyPromote(s, p, FALSE);
     }
     return 0;
 }
@@ -2114,14 +2266,12 @@ void MSXsegStorage_hybridRebalanceAll(void)
         for (k = 1; k <= Hybrid.nLinks; k++)
         {
             HybridPipe *p = &Hybrid.pipe[k];
-            Pseg firstCore, lastCore;
-            int down, up, count, total = 0, guard = hybridPipeGuard(p);
+            RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
             phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
             if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
-            total = hybridCountSegmentsForRebalance(k);
-            hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+            hybridCaptureRebalanceSnapshot(k, s);
             if (audit) metrics.rb_scan_ms += MSXgpu_wallTimeMs() - phaseStart;
-            if (count == 0 && total > 2 * guard)
+            if (s->coreCount == 0 && s->total > 2 * s->guard)
             {
                 phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
                 if (audit) HybridRebalanceStage = HYBRID_REBALANCE_EMPTY_INIT;
@@ -2129,6 +2279,7 @@ void MSXsegStorage_hybridRebalanceAll(void)
                 if (audit) metrics.rb_empty_init_ms +=
                     MSXgpu_wallTimeMs() - phaseStart;
                 if (err) { MSX.ErrCode = err; goto resident_done; }
+                hybridSnapshotAfterInitialization(s, p);
                 if (HybridRebalanceMetrics) ++HybridRebalanceMetrics->rebuilt_links;
             }
         }
@@ -2143,7 +2294,7 @@ void MSXsegStorage_hybridRebalanceAll(void)
         }
         for (k = 1; k <= Hybrid.nLinks; k++)
         {
-            err = hybridPromoteResidentExcess(k);
+            err = hybridPromoteResidentExcess(k, &Hybrid.rebalanceSnapshot[k]);
             if (err) { MSX.ErrCode = err; goto resident_done; }
         }
 resident_done:

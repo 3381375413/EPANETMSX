@@ -59,6 +59,10 @@ void MSXsegStorage_hybridAbortInitialImage(void);
 /* Observer-only rescan used when a resident runtime opens after hybridizeAll. */
 int  MSXsegStorage_hybridObserveAll(void);
 int  MSXsegStorage_hybridRemoveHead(int k, Pseg seg);
+/* Resident Rebalance captures one per-link FirstSeg -> prev topology image
+   at round start.  Demote planning/commit and ordinary promote consume that
+   image; the read-only audit seam below remains an independent reference
+   rescan and is not part of the normal path. */
 void MSXsegStorage_hybridRebalanceAll(void);
 /* A0 Rebalance detail hooks.  They are inert unless the detail demote group
    is active, so runtime fetch/flush callers need no profile-mode branches. */
