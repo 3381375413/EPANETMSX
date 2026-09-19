@@ -391,11 +391,13 @@ int MSXchem_react(double dt)
     }
     else
     {
+        int psegErr = 0;
 #pragma omp parallel
 {
         #pragma omp for private(k)
         for (k = 1; k <= MSX.Nobjects[LINK]; k++)
         {
+            int linkErr = 0;
             // --- skip non-pipe links
 
             if (MSX.Link[k].len == 0.0) continue;
@@ -408,12 +410,19 @@ int MSXchem_react(double dt)
              // --- compute pipe reactions
 
              if (MSXsegStorage_isPipeRingLink(k))
-                 errcode = evalPipeRingReactions(k, dt);
+                 linkErr = evalPipeRingReactions(k, dt);
              else
-                 errcode = evalPipeReactions(k, dt);
-            //if (errcode) return errcode;
+                 linkErr = evalPipeReactions(k, dt);
+            if (linkErr)
+            {
+#pragma omp critical(msx_pseg_react_error)
+                {
+                    if (psegErr == 0) psegErr = linkErr;
+                }
+            }
         }
 }
+        errcode = psegErr;
     }
     if (errcode) return errcode;
 
