@@ -39,7 +39,32 @@ static void MSXgpu_profileRecordTransfer(int direction,int scope,uint64_t bytes,
 typedef struct { uint32_t link,capacity,head,tail,count; int32_t orient; uint64_t epoch; } DDesc;
 typedef struct { uint32_t link; DDesc descriptor; } DDescStage;
 typedef struct { uint32_t link,row,generation,used,kind,payloadRow; uint64_t id; double v,h,hr,ur,dr; } Stage;
-struct MSXResidentGpu { uint32_t n,slots,owned,stride,activeCount; int device,uploaded,poisoned,activePrepared,completionEnqueued,diagnostic,aggregateValid; uint64_t stateVersion,aggregateVersion; uint64_t handoffH2DBytes,handoffH2DCalls,handoffD2HBytes,handoffD2HCalls,hydH2DBytes,hydH2DCalls; cudaStream_t stream; uint64_t *fetchSeen; uint64_t fetchStamp; uint32_t *cap,*base,*hu,*hg,*haPipe,*haRow,*haGen,*haNf,*haNj,*haNa,*haNr,*daPipe,*daRow,*daNf,*daNj,*daNa,*daNr,*dBase; int *haErr,*daErr,*dError; uint64_t *he,*hi,*haEpoch; DDesc *hd,*dd; DDescStage *hPatchDesc,*dPatchDesc; Stage *hPatch,*hGather,*dPatchStage,*dGatherStage; double *hPatchC,*hPatchL,*hGatherC,*hGatherL,*dPatchC,*dPatchL,*dGatherC,*dGatherL,*haVol,*haHyd,*hPipeHyd,*haH,*haLast,*haReacted,*daVol,*daHyd,*dPipeHyd,*daH,*daLast,*daReacted; uint32_t hydLayout; uint32_t *du,*dg; uint64_t *di; double *dv,*dh,*dhr,*dur,*ddr,*dc,*dl,*dmass; MSXResidentGpuReduction *dred,*hAggLink,*dAggLink, c,aggregate; double *hAggMass,*dAggMass,*aggregateMass; };
+struct MSXResidentGpu {
+    uint32_t n,slots,owned,stride,activeCount;
+    int device,uploaded,poisoned,activePrepared,completionEnqueued,diagnostic,aggregateValid;
+    /* B2 Hyd cache lifecycle: submitted is immutable while activePrepared;
+       applied is published only by a successful finish. */
+    int hydAppliedValid,hydPending;
+    uint64_t stateVersion,aggregateVersion;
+    uint64_t handoffH2DBytes,handoffH2DCalls,handoffD2HBytes,handoffD2HCalls;
+    uint64_t hydH2DBytes,hydH2DCalls,hydCandidateComparisons,hydUploads,hydSkips;
+    cudaStream_t stream;
+    uint64_t *fetchSeen; uint64_t fetchStamp;
+    uint32_t *cap,*base,*hu,*hg,*haPipe,*haRow,*haGen,*haNf,*haNj,*haNa,*haNr;
+    uint32_t *daPipe,*daRow,*daNf,*daNj,*daNa,*daNr,*dBase;
+    int *haErr,*daErr,*dError;
+    uint64_t *he,*hi,*haEpoch;
+    DDesc *hd,*dd; DDescStage *hPatchDesc,*dPatchDesc;
+    Stage *hPatch,*hGather,*dPatchStage,*dGatherStage;
+    double *hPatchC,*hPatchL,*hGatherC,*hGatherL,*dPatchC,*dPatchL,*dGatherC,*dGatherL;
+    double *haVol,*haHyd,*hCandidateHyd,*hSubmittedHyd,*haH,*haLast,*haReacted;
+    double *daVol,*daHyd,*dPipeHyd,*daH,*daLast,*daReacted;
+    uint32_t hydLayout;
+    uint32_t *du,*dg; uint64_t *di;
+    double *dv,*dh,*dhr,*dur,*ddr,*dc,*dl,*dmass;
+    MSXResidentGpuReduction *dred,*hAggLink,*dAggLink,c,aggregate;
+    double *hAggMass,*dAggMass,*aggregateMass;
+};
 static cudaError_t trackedCopyAsync(MSXResidentGpu *g,void *dst,const void *src,
                                     size_t bytes,cudaMemcpyKind kind,
                                     int direction,int scope)
@@ -133,6 +158,12 @@ static int copyScope(MSXResidentGpu *g,const void *dst,const void *src,
 typedef enum { V_OK,V_DESCRIPTOR,V_CAPACITY,V_GENERATION,V_EPOCH } VStatus;
 static int ck(cudaError_t e){return e==cudaSuccess;} static int mul(size_t a,size_t b,size_t*r){if(a&&b>SIZE_MAX/a)return 0;*r=a*b;return 1;} static int da(void**p,size_t n){return ck(cudaMalloc(p,n));}
 static int use(MSXResidentGpu*g){int now=-1;if(!g||!ck(cudaGetDevice(&now))||(!((now==g->device)||ck(cudaSetDevice(g->device)))))return 0;if(!g->stream&&!ck(cudaStreamCreateWithFlags(&g->stream,cudaStreamNonBlocking)))return 0;return 1;}
+static void invalidateHydCache(MSXResidentGpu *g)
+{
+    if (!g) return;
+    g->hydAppliedValid = 0;
+    g->hydPending = 0;
+}
 static MSXResidentStatus badgpu(MSXResidentGpu*g,MSXResidentStatus s)
 {
     if(g)
@@ -141,6 +172,7 @@ static MSXResidentStatus badgpu(MSXResidentGpu*g,MSXResidentStatus s)
            It prevents close/abort from freeing pinned or device buffers still
            referenced by work already accepted by the resident stream. */
         if(g->stream) (void)cudaStreamSynchronize(g->stream);
+        invalidateHydCache(g);
         g->c.cudaErrors++;
         if(!g->poisoned)g->c.cudaPoisons++;
         g->poisoned=1;g->activePrepared=0;g->completionEnqueued=0;
@@ -174,7 +206,7 @@ static void gone(MSXResidentGpu*g)
     freePinned(g->hGatherC);freePinned(g->hGatherL);
     freePinned(g->haPipe);freePinned(g->haRow);freePinned(g->haNf);
     freePinned(g->haNj);freePinned(g->haNa);freePinned(g->haNr);
-    freePinned(g->haErr);freePinned(g->haVol);freePinned(g->haHyd);freePinned(g->hPipeHyd);
+    freePinned(g->haErr);freePinned(g->haVol);freePinned(g->haHyd);free(g->hCandidateHyd);freePinned(g->hSubmittedHyd);
     freePinned(g->haLast);freePinned(g->haReacted);
     free(g->cap);free(g->base);free(g->hu);free(g->hg);free(g->he);free(g->hi);
     free(g->fetchSeen);free(g->haGen);free(g->haEpoch);free(g->haH);
@@ -200,10 +232,15 @@ if(!ck(cudaHostAlloc(&g->haPipe,(size_t)g->owned*sizeof(uint32_t),0))||
    !ck(cudaHostAlloc(&g->haErr,sizeof(int),0))||
    !ck(cudaHostAlloc(&g->haVol,(size_t)g->owned*sizeof(double),0))||
    !ck(cudaHostAlloc(&g->haHyd,(size_t)g->owned*MSX_RESIDENT_HYD_STRIDE*sizeof(double),0))||
-   !ck(cudaHostAlloc(&g->hPipeHyd,pipeHydBytes,0))||
+   !ck(cudaHostAlloc(&g->hSubmittedHyd,pipeHydBytes,0))||
    !ck(cudaHostAlloc(&g->haLast,(size_t)g->owned*sizeof(double),0))||
    !ck(cudaHostAlloc(&g->haReacted,(size_t)(g->n+1)*g->stride*sizeof(double),0)))
     goto mem;
+g->hCandidateHyd=(double*)calloc((size_t)(g->n+1)*MSX_RESIDENT_HYD_STRIDE,sizeof(double));
+if(!g->hCandidateHyd)goto mem;
+/* Every compared byte is initialized.  The separate valid bit still forces
+   the first reaction to upload even when the source table is all +0. */
+memset(g->hSubmittedHyd,0,pipeHydBytes);
 memset(g->haNf,0,(size_t)g->slots*sizeof(uint32_t));
 memset(g->haNj,0,(size_t)(g->owned>g->n?g->owned:g->n+1)*sizeof(uint32_t));
 g->haEpoch=(uint64_t*)calloc(g->owned,sizeof(uint64_t));
@@ -644,6 +681,26 @@ __global__ static void compactError(const int *src,uint32_t n,int *dst)
 }
 static int activeMember(const DDesc*d,uint32_t local){uint32_t delta;if(!d->count||local>=d->capacity)return 0;delta=d->orient>0?(local+d->capacity-d->head)%d->capacity:(d->head+d->capacity-local)%d->capacity;return delta<d->count;}
 static MSXResidentStatus activeInvalid(MSXResidentGpu*g,uint32_t n,MSXResidentStatus z){for(uint32_t i=0;i<n;i++)g->haNf[g->haRow[i]]=0;return z;}
+/* Build the complete candidate before touching the submitted pinned buffer.
+   Both arrays contain only initialized double objects, so memcmp preserves
+   signed zero and every NaN payload without a tolerance or padded struct. */
+static int stageHydCandidate(MSXResidentGpu *g, const double *source,
+                             size_t bytes)
+{
+    memcpy(g->hCandidateHyd, source, bytes);
+    g->hydCandidateComparisons++;
+    if (g->hydAppliedValid &&
+        memcmp(g->hCandidateHyd, g->hSubmittedHyd, bytes) == 0)
+    {
+        g->hydSkips++;
+        g->hydPending = 0;
+        return 0;
+    }
+    /* This is the only write to the pinned submitted table.  It occurs before
+       enqueue and never while the associated stream work is in flight. */
+    memcpy(g->hSubmittedHyd, g->hCandidateHyd, bytes);
+    return 1;
+}
 extern "C" MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu*g,const MSXResidentActiveBatch*b,MSXResidentGpuDeviceView*v,MSXResidentGpuReactResult*r)
 {
     uint32_t i,n;
@@ -711,7 +768,8 @@ extern "C" MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu*g,const
     v->streamHandle=(uint64_t)(uintptr_t)g->stream;
     v->itemCount=n; v->speciesStride=g->stride; v->hydStride=MSX_RESIDENT_HYD_STRIDE;
     v->hydLayout=MSX_RESIDENT_HYD_ACTIVE_MAJOR;
-    g->hydLayout=MSX_RESIDENT_HYD_ACTIVE_MAJOR; g->activeCount=n; g->activePrepared=1; g->completionEnqueued=0;
+    g->hydLayout=MSX_RESIDENT_HYD_ACTIVE_MAJOR; invalidateHydCache(g);
+    g->activeCount=n; g->activePrepared=1; g->completionEnqueued=0;
     return MSX_RESIDENT_OK;
 }
 extern "C" MSXResidentStatus MSXresidentGpu_getDeviceView(MSXResidentGpu*g,MSXResidentGpuDeviceView*v){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!v)return MSX_RESIDENT_ERR_ARGUMENT;memset(v,0,sizeof(*v));if(!g||g->poisoned)return MSX_RESIDENT_ERR_POISONED;if(!g->activePrepared)return MSX_RESIDENT_ERR_ARGUMENT;v->segPipe=(uint64_t)(uintptr_t)g->daPipe;v->segRow=(uint64_t)(uintptr_t)g->daRow;v->segVol=(uint64_t)(uintptr_t)g->daVol;v->hstep=(uint64_t)(uintptr_t)g->daH;v->c=(uint64_t)(uintptr_t)g->dc;v->lastc=(uint64_t)(uintptr_t)g->dl;v->hyd=(uint64_t)(uintptr_t)(g->hydLayout==MSX_RESIDENT_HYD_PIPE_MAJOR?g->dPipeHyd:g->daHyd);v->reacted=(uint64_t)(uintptr_t)g->daReacted;v->ros2Nfcn=(uint64_t)(uintptr_t)g->daNf;v->ros2Njac=(uint64_t)(uintptr_t)g->daNj;v->ros2Naccept=(uint64_t)(uintptr_t)g->daNa;v->ros2Nreject=(uint64_t)(uintptr_t)g->daNr;v->ros2LastHstep=(uint64_t)(uintptr_t)g->daLast;v->ros2Err=(uint64_t)(uintptr_t)g->daErr;v->streamHandle=(uint64_t)(uintptr_t)g->stream;v->itemCount=g->activeCount;v->speciesStride=g->stride;v->hydStride=MSX_RESIDENT_HYD_STRIDE;v->hydLayout=g->hydLayout;return MSX_RESIDENT_OK;}
@@ -748,14 +806,21 @@ extern "C" MSXResidentStatus MSXresidentGpu_prepareActiveHyd(MSXResidentGpu*g,co
         g->haEpoch[i]=x->descriptorEpoch; g->haVol[i]=x->volume;
     }
     for(i=0;i<n;i++)g->haNf[g->haRow[i]]=0;
-    /* The source is copied before the asynchronous H2D.  hPipeHyd stays
-       pinned and immutable until finish/abort drains this resident stream. */
-    memcpy(g->hPipeHyd,h->pipeHyd,hydBytes);
+    /* Candidate comparison is host-only.  Only a changed candidate is copied
+       into the pinned submitted table and sent to the device. */
+    int hydChanged = stageHydCandidate(g, h->pipeHyd, hydBytes);
     if(!ck(cudaMemsetAsync(g->dError,0,sizeof(int),g->stream))||
-       !ck(cudaMemsetAsync(g->daReacted,0,((size_t)g->n+1)*g->stride*sizeof(double),g->stream))||
-       !ck(trackedCopyAsync(g,g->dPipeHyd,g->hPipeHyd,hydBytes,cudaMemcpyHostToDevice,
-                            MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_HYD)))
+       !ck(cudaMemsetAsync(g->daReacted,0,((size_t)g->n+1)*g->stride*sizeof(double),g->stream)))
         return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);
+    if (hydChanged)
+    {
+        if (!ck(trackedCopyAsync(g,g->dPipeHyd,g->hSubmittedHyd,hydBytes,
+                                cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,
+                                MSX_PROFILE_TRANSFER_SCOPE_HYD)))
+            return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);
+        g->hydUploads++;
+        g->hydPending=1;
+    }
     if(n && (!ck(trackedCopyAsync(g,g->daPipe,g->haPipe,(size_t)n*sizeof(uint32_t),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_ACTIVE))||
              !ck(trackedCopyAsync(g,g->daRow,g->haRow,(size_t)n*sizeof(uint32_t),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_ACTIVE))||
              !ck(trackedCopyAsync(g,g->daVol,g->haVol,(size_t)n*sizeof(double),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_ACTIVE))||
@@ -843,7 +908,14 @@ static MSXResidentStatus finishActiveImpl(MSXResidentGpu*g,MSXResidentGpuReactRe
         r->ros2Error=err;r->ros2LastHstep=(g->diagnostic&&n)?g->haLast[n-1]:0.0;
         r->reacted=g->haReacted;r->reactedStride=g->stride;r->reactedLinkCount=g->n+1;}
     g->completionEnqueued=0;
-    if(err){g->poisoned=1;g->activePrepared=0;g->activeCount=0;return MSX_RESIDENT_ERR_GPU;}
+    if(err){invalidateHydCache(g);g->poisoned=1;g->activePrepared=0;g->activeCount=0;return MSX_RESIDENT_ERR_GPU;}
+    /* The stream has completed all kernels and completion copies.  Only now
+       may the submitted table become the applied cache version. */
+    if (g->hydPending)
+    {
+        g->hydAppliedValid=1;
+        g->hydPending=0;
+    }
     if(n){g->stateVersion++;g->aggregateValid=0;}
     g->activePrepared=0;g->activeCount=0;
     return MSX_RESIDENT_OK;
@@ -932,7 +1004,15 @@ extern "C" MSXResidentStatus MSXresidentGpu_getTransferStats(const MSXResidentGp
     out->d2hCalls = g->handoffD2HCalls;
     out->hydH2DBytes = g->hydH2DBytes;
     out->hydH2DCalls = g->hydH2DCalls;
+    out->hydCandidateComparisons = g->hydCandidateComparisons;
+    out->hydUploads = g->hydUploads;
+    out->hydSkips = g->hydSkips;
+    out->hydBytes = g->hydH2DBytes;
+    out->hydApiCalls = g->hydH2DCalls;
+    out->hydAppliedValid = g->hydAppliedValid;
+    out->hydPending = g->hydPending;
     return MSX_RESIDENT_OK;
 }
-extern "C" MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu*g){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(!g->activePrepared)return g->poisoned?MSX_RESIDENT_ERR_POISONED:MSX_RESIDENT_OK;if(!ck(cudaStreamSynchronize(g->stream)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);g->activePrepared=0;g->activeCount=0;g->completionEnqueued=0;g->poisoned=1;g->c.cudaPoisons++;return MSX_RESIDENT_OK;}
-extern "C" MSXResidentStatus MSXresidentGpu_poison(MSXResidentGpu*g){if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(g->activePrepared&&!ck(cudaStreamSynchronize(g->stream)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);g->activePrepared=0;g->activeCount=0;g->completionEnqueued=0;if(!g->poisoned){g->poisoned=1;g->c.cudaPoisons++;}g->aggregateValid=0;return MSX_RESIDENT_OK;}
+extern "C" MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu*g){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(!g->activePrepared)return g->poisoned?MSX_RESIDENT_ERR_POISONED:MSX_RESIDENT_OK;if(!ck(cudaStreamSynchronize(g->stream)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);invalidateHydCache(g);g->activePrepared=0;g->activeCount=0;g->completionEnqueued=0;g->poisoned=1;g->c.cudaPoisons++;return MSX_RESIDENT_OK;}
+extern "C" MSXResidentStatus MSXresidentGpu_invalidateHyd(MSXResidentGpu*g){if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(g->activePrepared)return MSX_RESIDENT_ERR_ARGUMENT;invalidateHydCache(g);return MSX_RESIDENT_OK;}
+extern "C" MSXResidentStatus MSXresidentGpu_poison(MSXResidentGpu*g){if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(g->activePrepared&&!ck(cudaStreamSynchronize(g->stream)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);invalidateHydCache(g);g->activePrepared=0;g->activeCount=0;g->completionEnqueued=0;if(!g->poisoned){g->poisoned=1;g->c.cudaPoisons++;}g->aggregateValid=0;return MSX_RESIDENT_OK;}

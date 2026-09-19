@@ -18,5 +18,6 @@ MSXResidentStatus MSXresidentGpu_finishActiveAfterWait(MSXResidentGpu*a,MSXResid
 MSXResidentStatus MSXresidentGpu_enqueueActiveCompletion(MSXResidentGpu*a){(void)a;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu*a,MSXResidentGpuActiveSyncOutput*b,uint32_t c){(void)a;(void)b;(void)c;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu*a){(void)a;return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_invalidateHyd(MSXResidentGpu*a){(void)a;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_poison(MSXResidentGpu*a){(void)a;return MSX_RESIDENT_DISABLED;}
 void MSXresidentGpu_close(MSXResidentGpu*a){(void)a;}

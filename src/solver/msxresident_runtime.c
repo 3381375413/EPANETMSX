@@ -232,6 +232,11 @@ int MSXresidentRuntime_afterHybridInit(void)
             return fail(MSX_RESIDENT_ERR_CAPACITY,"initial_cpu_commit");
         if ((s=MSXresident_commitInitialImage())!=MSX_RESIDENT_OK)
             return fail(s,"initial_metadata_commit");
+        /* MSXinit is a real model/reaction lifecycle boundary.  The device
+           Hyd table is not valid until the first post-init reaction submits
+           and finishes a complete pipe-major candidate. */
+        if ((s=MSXresidentGpu_invalidateHyd(R.gpu))!=MSX_RESIDENT_OK)
+            return fail(s,"initial_hyd_invalidate");
         if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_initial"))
             return MSX.ErrCode;
         R.resident=1; R.dispatchReady=1; R.lastStatus=MSX_RESIDENT_OK;
@@ -415,6 +420,26 @@ void MSXresidentRuntime_close(void)
            while a token still owns an active stream submission. */
         (void)MSXgpu_abortResidentCore(R.gpu,&R.flight.gpu);
         R.inFlight=0; R.dispatchReady=0; R.flight.inFlight=0;
+    }
+    /* Emit the B2 cache ledger before close/re-open invalidates the applied
+       version.  These are counters only; no diagnostic timing is introduced.
+       A close boundary must leave no pending submission. */
+    if (R.gpu)
+    {
+        MSXResidentGpuTransferStats hydStats;
+        if (MSXresidentGpu_getTransferStats(R.gpu, &hydStats) == MSX_RESIDENT_OK)
+            fprintf(stderr,
+                    "RESIDENT_HYD_CACHE,candidate_comparisons=%llu,uploads=%llu,skips=%llu,bytes=%llu,api_calls=%llu,applied_valid=%d,pending=%d\n",
+                    (unsigned long long)hydStats.hydCandidateComparisons,
+                    (unsigned long long)hydStats.hydUploads,
+                    (unsigned long long)hydStats.hydSkips,
+                    (unsigned long long)hydStats.hydBytes,
+                    (unsigned long long)hydStats.hydApiCalls,
+                    hydStats.hydAppliedValid, hydStats.hydPending);
+        /* Close/re-open is the remaining model-change boundary; invalidate
+           before releasing the resident buffers so no stale Hyd version can
+           be reused. */
+        (void)MSXresidentGpu_invalidateHyd(R.gpu);
     }
     /* Same CUDA context: destroy dependent program objects before its mirror. */
     MSXgpu_closeResidentPrograms();

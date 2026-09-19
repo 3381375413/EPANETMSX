@@ -27,7 +27,13 @@ typedef struct { uint64_t activeCount,checksumXor,checksumSum,staleGeneration,ep
    intentionally separate from logical rows/events and are used by the
    contract harness to prove that a multi-link selected batch is one H2D stage
    upload plus one metadata/concentration/last-concentration D2H triplet. */
-typedef struct { uint64_t h2dBytes,h2dCalls,d2hBytes,d2hCalls,hydH2DBytes,hydH2DCalls; } MSXResidentGpuTransferStats;
+typedef struct {
+    uint64_t h2dBytes,h2dCalls,d2hBytes,d2hCalls;
+    /* B2 resident pipe-Hyd traffic and exact-table comparison counters. */
+    uint64_t hydH2DBytes,hydH2DCalls;
+    uint64_t hydCandidateComparisons,hydUploads,hydSkips,hydBytes,hydApiCalls;
+    int hydAppliedValid,hydPending;
+} MSXResidentGpuTransferStats;
 /* Phase 3B deliberately exposes no CUDA headers.  ``globalRow`` is the
    fixed row in the published resident span, never a Pseg or ring index. */
 typedef struct { uint32_t linkIndex,globalRow,generation; uint64_t descriptorEpoch; double volume; const double *hyd; } MSXResidentActiveItem;
@@ -73,8 +79,9 @@ MSXResidentStatus MSXresidentGpu_reduceLink(MSXResidentGpu *, uint32_t linkIndex
    returned pointers stay valid until finish/close and share msxgpu's primary
    CUDA context.  msxgpu owns the ROS2/EQUIL/FORMULA launches. */
 MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu *, const MSXResidentActiveBatch *, MSXResidentGpuDeviceView *, MSXResidentGpuReactResult *);
-/* Resident path: copy one complete read-only pipe table to pinned host
-   storage, enqueue one full-table H2D, then enqueue active metadata. */
+/* Resident path: compare a complete read-only pipe table by double bit
+   pattern, enqueue one full-table H2D only when the applied version changed,
+   then enqueue active metadata on the same stream. */
 MSXResidentStatus MSXresidentGpu_prepareActiveHyd(MSXResidentGpu *, const MSXResidentActiveBatch *, const MSXResidentHydView *, MSXResidentGpuDeviceView *, MSXResidentGpuReactResult *);
 /* Selects whether finishActive returns optional per-active solver counters.
    Required hstep/error/quality state is retained in every mode. */
@@ -96,6 +103,9 @@ MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu *,
 /* Abort poisons the mirror and releases an in-flight active batch.  It is
    intentionally fail-closed: callers must reopen before another dispatch. */
 MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu *);
+/* Invalidate the applied pipe-Hyd version at an MSXinit/re-open boundary.
+   It is only legal while no active GPU batch is in flight. */
+MSXResidentStatus MSXresidentGpu_invalidateHyd(MSXResidentGpu *);
 /* Mark the device mirror unusable after a completed Driver program reports a
    chemistry error.  All later read/query/dispatch operations fail closed. */
 MSXResidentStatus MSXresidentGpu_poison(MSXResidentGpu *);
