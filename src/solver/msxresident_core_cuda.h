@@ -8,6 +8,11 @@
 /* C ABI row width for resident hydraulic values; MSX HydVar[0..9]. */
 #define MSX_RESIDENT_HYD_STRIDE 10
 
+/* Internal hydraulic-table layouts.  ACTIVE_MAJOR is retained only for the
+   legacy non-Resident/contract wrapper; Resident dispatch uses PIPE_MAJOR. */
+#define MSX_RESIDENT_HYD_ACTIVE_MAJOR 0u
+#define MSX_RESIDENT_HYD_PIPE_MAJOR   1u
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,11 +27,14 @@ typedef struct { uint64_t activeCount,checksumXor,checksumSum,staleGeneration,ep
    intentionally separate from logical rows/events and are used by the
    contract harness to prove that a multi-link selected batch is one H2D stage
    upload plus one metadata/concentration/last-concentration D2H triplet. */
-typedef struct { uint64_t h2dBytes,h2dCalls,d2hBytes,d2hCalls; } MSXResidentGpuTransferStats;
+typedef struct { uint64_t h2dBytes,h2dCalls,d2hBytes,d2hCalls,hydH2DBytes,hydH2DCalls; } MSXResidentGpuTransferStats;
 /* Phase 3B deliberately exposes no CUDA headers.  ``globalRow`` is the
    fixed row in the published resident span, never a Pseg or ring index. */
 typedef struct { uint32_t linkIndex,globalRow,generation; uint64_t descriptorEpoch; double volume; const double *hyd; } MSXResidentActiveItem;
 typedef struct { const MSXResidentActiveItem *item; uint32_t itemCount; } MSXResidentActiveBatch;
+/* Read-only source table supplied for a Resident reaction.  The caller must
+   initialize every (linkCount+1)*stride double before submit. */
+typedef struct { const double *pipeHyd; uint32_t linkCount,hydStride,hydLayout; } MSXResidentHydView;
 /* Non-destructive GPU-to-CPU mirror refresh for the just-completed active
    batch.  This never materializes a handoff or changes descriptor topology. */
 typedef struct { uint32_t linkIndex,globalRow,generation; uint64_t descriptorEpoch;
@@ -35,7 +43,7 @@ typedef struct { MSXResidentGpuActiveSyncRow *row; double *cOut,*lastcOut;
     uint32_t stride; } MSXResidentGpuActiveSyncOutput;
 /* All addresses are plain integer values so this ABI is usable by C callers
    without importing CUDA headers.  They belong to the primary CUDA context. */
-typedef struct { uint64_t segPipe,segRow,segVol,hstep,c,lastc,hyd,reacted,ros2Nfcn,ros2Njac,ros2Naccept,ros2Nreject,ros2LastHstep,ros2Err,streamHandle; uint32_t itemCount,speciesStride,hydStride; } MSXResidentGpuDeviceView;
+typedef struct { uint64_t segPipe,segRow,segVol,hstep,c,lastc,hyd,reacted,ros2Nfcn,ros2Njac,ros2Naccept,ros2Nreject,ros2LastHstep,ros2Err,streamHandle; uint32_t itemCount,speciesStride,hydStride,hydLayout; } MSXResidentGpuDeviceView;
 /* reacted points at resident-owned host memory after finishActive succeeds.
    It has reactedLinkCount rows of reactedStride doubles and stays valid until
    the next prepareActive/close.  Phase 3C owns applying it to MSX.Link[]. */
@@ -65,6 +73,9 @@ MSXResidentStatus MSXresidentGpu_reduceLink(MSXResidentGpu *, uint32_t linkIndex
    returned pointers stay valid until finish/close and share msxgpu's primary
    CUDA context.  msxgpu owns the ROS2/EQUIL/FORMULA launches. */
 MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu *, const MSXResidentActiveBatch *, MSXResidentGpuDeviceView *, MSXResidentGpuReactResult *);
+/* Resident path: copy one complete read-only pipe table to pinned host
+   storage, enqueue one full-table H2D, then enqueue active metadata. */
+MSXResidentStatus MSXresidentGpu_prepareActiveHyd(MSXResidentGpu *, const MSXResidentActiveBatch *, const MSXResidentHydView *, MSXResidentGpuDeviceView *, MSXResidentGpuReactResult *);
 /* Selects whether finishActive returns optional per-active solver counters.
    Required hstep/error/quality state is retained in every mode. */
 void MSXresidentGpu_setDiagnosticMode(MSXResidentGpu *, int enabled);

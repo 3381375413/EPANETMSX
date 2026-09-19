@@ -45,7 +45,7 @@ extern MSXproject MSX;
 #define GPU_MAX_SPECIES 64
 #define GPU_MAX_EQUIL   16
 #define GPU_MAX_STACK   128
-#define GPU_CACHE_VERSION "v22"
+#define GPU_CACHE_VERSION "v23_hydpipe_abi1"
 #define GPU_ROS2_MAX_RATE_SPECIES 16
 #define RK5_FAST_BUCKETS 6
 #define GPU_CACHE_MAX_BYTES (200LL * 1024LL * 1024LL)
@@ -1472,6 +1472,10 @@ int MSXgpu_reactResidentCore(MSXResidentGpu *gpu, const MSXResidentActiveBatch *
 int MSXgpu_submitResidentCore(MSXResidentGpu *gpu, const MSXResidentActiveBatch *batch,
                               double dt, MSXgpuResidentCoreToken *token)
 { (void)gpu; (void)batch; (void)dt; if(token) memset(token,0,sizeof(*token)); return ERR_GPU_NOT_ENABLED; }
+int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *gpu, const MSXResidentActiveBatch *batch,
+                                 const MSXResidentHydView *hyd, double dt,
+                                 MSXgpuResidentCoreToken *token)
+{ (void)gpu; (void)batch; (void)hyd; (void)dt; if(token) memset(token,0,sizeof(*token)); return ERR_GPU_NOT_ENABLED; }
 int MSXgpu_finishResidentCore(MSXResidentGpu *gpu, MSXgpuResidentCoreToken *token,
                               MSXResidentGpuReactResult *result)
 { (void)gpu; (void)token; if(result) memset(result,0,sizeof(*result)); return ERR_GPU_NOT_ENABLED; }
@@ -1915,7 +1919,9 @@ static uint64_t hashExpr(uint64_t h, MathExpr *expr)
 static uint64_t hashModelExpressions(void)
 {
     uint64_t h = 1469598103934665603ULL;
+    static const char hydAbi[] = "hyd-layout-active0-pipe1-generator1";
     int m;
+    h = fnv1aBytes(h, hydAbi, sizeof(hydAbi) - 1);
     h = fnv1aBytes(h, &MSX.Nobjects[SPECIES], sizeof(MSX.Nobjects[SPECIES]));
     h = fnv1aBytes(h, &MSX.Nobjects[TERM], sizeof(MSX.Nobjects[TERM]));
     for (m = 1; m <= MSX.Nobjects[TERM]; m++)
@@ -2455,6 +2461,57 @@ static int buildSpecializedCudaSource(char **source)
     return 0;
 }
 
+/* The interpreter and specialized source share one generated kernel ABI.
+   Keep the long literal fragments readable/unchanged, then apply the ABI
+   splice once to the final source.  This also covers the separately appended
+   ROS2 fragment and the specialized evaluator body. */
+static int sourceReplaceAll(const char *source, const char *needle,
+                            const char *replacement, char **out)
+{
+    const char *p, *q;
+    GpuSourceBuilder sb = {0};
+    size_t nlen;
+    if (!source || !needle || !replacement || !out) return ERR_GPU_UNSUPPORTED_FEATURE;
+    *out = NULL; nlen = strlen(needle); p = source;
+    while ((q = strstr(p, needle)) != NULL)
+    {
+        if (sbAppendN(&sb, p, (size_t)(q - p)) || sbAppend(&sb, replacement))
+        { sbFree(&sb); return ERR_MEMORY; }
+        p = q + nlen;
+    }
+    if (sbAppend(&sb, p)) { sbFree(&sb); return ERR_MEMORY; }
+    *out = sb.data;
+    return 0;
+}
+
+static int applyHydLayoutAbi(const char *source, char **out)
+{
+    static const struct { const char *from, *to; } edits[] = {
+        {"const double* hyd,int hStride,const Prog* prog",
+         "const double* hyd,int hStride,int hydLayout,const Prog* prog"},
+        {"const double* hyd,int hstride,const Prog* prog",
+         "const double* hyd,int hstride,int hydLayout,const Prog* prog"},
+        {",hyd,hStride,prog", ",hyd,hStride,hydLayout,prog"},
+        {"int hBase=sid*hStride;", "int hBase=(hydLayout==1?pipe:sid)*hStride;"},
+        {"hb=sid*hstride", "hb=(hydLayout==1?pk:sid)*hstride"}
+    };
+    char *current = NULL, *next = NULL;
+    size_t i;
+    int err;
+    if (!source || !out) return ERR_GPU_UNSUPPORTED_FEATURE;
+    current = gpuStrDup(source);
+    if (!current) return ERR_MEMORY;
+    for (i = 0; i < sizeof(edits)/sizeof(edits[0]); ++i)
+    {
+        err = sourceReplaceAll(current, edits[i].from, edits[i].to, &next);
+        free(current); current = NULL;
+        if (err) return err;
+        current = next; next = NULL;
+    }
+    *out = current;
+    return 0;
+}
+
 static int compileSourceToPtx(const char *source, const char *arch, const char *solverMacro,
                               const char *modeMacro, const char *cachePath, char **ptx, size_t *ptxSize)
 {
@@ -2611,6 +2668,7 @@ static int ensureModule(void)
     {
         char *specializedSource = NULL;
         char *ros2Source = NULL;
+        char *hydSource = NULL;
         const char *compileSource = GpuReactCudaSource;
         if (timing) timer = MSXgpu_wallTimeMs();
         if (MSX.GpuCompiler)
@@ -2633,7 +2691,9 @@ static int ensureModule(void)
             memcpy(ros2Source + baseLen, GpuRos2CudaSource, ros2Len + 1);
             compileSource = ros2Source;
         }
-        err = compileSourceToPtx(compileSource, arch, solverMacro, modeMacro, cachePath, &ptx, &ptxSize);
+        err = applyHydLayoutAbi(compileSource, &hydSource);
+        if (!err) err = compileSourceToPtx(hydSource, arch, solverMacro, modeMacro, cachePath, &ptx, &ptxSize);
+        free(hydSource);
         free(ros2Source);
         free(specializedSource);
         if (timing)
@@ -2876,15 +2936,16 @@ fail: MSXgpu_closeResidentPrograms(); return err;
 /* P3 lifecycle: prepare and launch on the Runtime-owned stream, then return
    before any device wait.  The Driver API consumes the same underlying stream
    handle exposed by the CUDA Runtime core. */
-int MSXgpu_submitResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBatch *batch,
-                              double dt, MSXgpuResidentCoreToken *token)
+int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *resident, const MSXResidentActiveBatch *batch,
+                                 const MSXResidentHydView *hyd,
+                                 double dt, MSXgpuResidentCoreToken *token)
 {
     MSXResidentGpuDeviceView view;
     MSXResidentStatus residentStatus;
     CUstream stream;
     int err = 0, nSpecies = MSX.Nobjects[SPECIES], nParams = MSX.Nobjects[PARAMETER];
     int nSeg, block = 128, grid, rateCount, eqCount, formulaCount;
-    int lastSpecies, lastTerm, lastParam, lastConst, hStride, paramStride;
+    int lastSpecies, lastTerm, lastParam, lastConst, hStride, hydLayout, paramStride;
     double tstep, areaUcf, lperFt3;
     void *ros2Args[40], *equilArgs[30], *formulaArgs[30];
     double prepareStart = 0.0, launchStart = 0.0;
@@ -2906,7 +2967,8 @@ int MSXgpu_submitResidentCore(MSXResidentGpu *resident, const MSXResidentActiveB
     MSXresidentGpu_setDiagnosticMode(resident,
         MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC));
     if (stage) prepareStart = MSXgpu_wallTimeMs();
-    residentStatus = MSXresidentGpu_prepareActive(resident, batch, &view, NULL);
+    residentStatus = hyd ? MSXresidentGpu_prepareActiveHyd(resident, batch, hyd, &view, NULL) :
+                           MSXresidentGpu_prepareActive(resident, batch, &view, NULL);
     if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_PREPARE,
                                       MSXgpu_wallTimeMs() - prepareStart);
     if (residentStatus != MSX_RESIDENT_OK)
@@ -2917,7 +2979,7 @@ int MSXgpu_submitResidentCore(MSXResidentGpu *resident, const MSXResidentActiveB
     rateCount = ResidentProgram.rateCount; eqCount = ResidentProgram.eqCount;
     formulaCount = ResidentProgram.formulaCount;
     if (view.speciesStride != (uint32_t)(nSpecies + 1) ||
-        view.hydStride != MAX_HYD_VARS)
+        view.hydStride != MAX_HYD_VARS || view.hydLayout > MSX_RESIDENT_HYD_PIPE_MAJOR)
     { err=ERR_GPU_UNSUPPORTED_FEATURE; goto submit_fail; }
     err=checkCu(cuMemsetD8Async(ResidentProgram.d_err,0,sizeof(GpuErrorHost),stream),ERR_GPU_KERNEL_LAUNCH_FAILED);
     if (err) goto submit_fail;
@@ -2930,7 +2992,7 @@ int MSXgpu_submitResidentCore(MSXResidentGpu *resident, const MSXResidentActiveB
         CUdeviceptr d_nf=(CUdeviceptr)view.ros2Nfcn,d_nj=(CUdeviceptr)view.ros2Njac;
         CUdeviceptr d_na=(CUdeviceptr)view.ros2Naccept,d_nr=(CUdeviceptr)view.ros2Nreject;
         CUdeviceptr d_lh=(CUdeviceptr)view.ros2LastHstep,d_re=(CUdeviceptr)view.ros2Err;
-        nSeg=(int)view.itemCount; hStride=(int)view.hydStride; paramStride=nParams+1;
+        nSeg=(int)view.itemCount; hStride=(int)view.hydStride; hydLayout=(int)view.hydLayout; paramStride=nParams+1;
         grid=(nSeg+block-1)/block; tstep=dt/MSX.Ucf[RATE_UNITS];
         areaUcf=MSX.Ucf[AREA_UNITS]; lperFt3=LperFT3;
         lastSpecies=lastIndex(SPECIES); lastTerm=lastIndex(TERM);
@@ -2942,26 +3004,26 @@ int MSXgpu_submitResidentCore(MSXResidentGpu *resident, const MSXResidentActiveB
         ros2Args[12]=&ResidentProgram.d_linkDiam; ros2Args[13]=&areaUcf; ros2Args[14]=&lperFt3;
         ros2Args[15]=&d_c; ros2Args[16]=&d_cOde; ros2Args[17]=&d_reacted;
         ros2Args[18]=&ResidentProgram.d_params; ros2Args[19]=&paramStride;
-        ros2Args[20]=&ResidentProgram.d_consts; ros2Args[21]=&d_hyd; ros2Args[22]=&hStride;
-        ros2Args[23]=&ResidentProgram.d_speciesProg; ros2Args[24]=&ResidentProgram.d_termProg;
-        ros2Args[25]=&ResidentProgram.d_instr; ros2Args[26]=&lastSpecies; ros2Args[27]=&lastTerm;
-        ros2Args[28]=&lastParam; ros2Args[29]=&lastConst; ros2Args[30]=&d_nf; ros2Args[31]=&d_nj;
-        ros2Args[32]=&d_na; ros2Args[33]=&d_nr; ros2Args[34]=&d_lh; ros2Args[35]=&d_re;
-        ros2Args[36]=&ResidentProgram.d_err;
+        ros2Args[20]=&ResidentProgram.d_consts; ros2Args[21]=&d_hyd; ros2Args[22]=&hStride; ros2Args[23]=&hydLayout;
+        ros2Args[24]=&ResidentProgram.d_speciesProg; ros2Args[25]=&ResidentProgram.d_termProg;
+        ros2Args[26]=&ResidentProgram.d_instr; ros2Args[27]=&lastSpecies; ros2Args[28]=&lastTerm;
+        ros2Args[29]=&lastParam; ros2Args[30]=&lastConst; ros2Args[31]=&d_nf; ros2Args[32]=&d_nj;
+        ros2Args[33]=&d_na; ros2Args[34]=&d_nr; ros2Args[35]=&d_lh; ros2Args[36]=&d_re;
+        ros2Args[37]=&ResidentProgram.d_err;
         equilArgs[0]=&nSeg; equilArgs[1]=&nSpecies; equilArgs[2]=&eqCount;
         equilArgs[3]=&d_segPipe; equilArgs[4]=&d_segRow; equilArgs[5]=&ResidentProgram.d_eqSpecies;
         equilArgs[6]=&d_c; equilArgs[7]=&ResidentProgram.d_params; equilArgs[8]=&paramStride;
-        equilArgs[9]=&ResidentProgram.d_consts; equilArgs[10]=&d_hyd; equilArgs[11]=&hStride;
-        equilArgs[12]=&ResidentProgram.d_speciesProg; equilArgs[13]=&ResidentProgram.d_termProg;
-        equilArgs[14]=&ResidentProgram.d_instr; equilArgs[15]=&lastSpecies; equilArgs[16]=&lastTerm;
-        equilArgs[17]=&lastParam; equilArgs[18]=&lastConst; equilArgs[19]=&ResidentProgram.d_err;
+        equilArgs[9]=&ResidentProgram.d_consts; equilArgs[10]=&d_hyd; equilArgs[11]=&hStride; equilArgs[12]=&hydLayout;
+        equilArgs[13]=&ResidentProgram.d_speciesProg; equilArgs[14]=&ResidentProgram.d_termProg;
+        equilArgs[15]=&ResidentProgram.d_instr; equilArgs[16]=&lastSpecies; equilArgs[17]=&lastTerm;
+        equilArgs[18]=&lastParam; equilArgs[19]=&lastConst; equilArgs[20]=&ResidentProgram.d_err;
         formulaArgs[0]=&nSeg; formulaArgs[1]=&nSpecies; formulaArgs[2]=&formulaCount;
         formulaArgs[3]=&d_segPipe; formulaArgs[4]=&d_segRow; formulaArgs[5]=&ResidentProgram.d_formulaSpecies;
         formulaArgs[6]=&d_c; formulaArgs[7]=&ResidentProgram.d_params; formulaArgs[8]=&paramStride;
-        formulaArgs[9]=&ResidentProgram.d_consts; formulaArgs[10]=&d_hyd; formulaArgs[11]=&hStride;
-        formulaArgs[12]=&ResidentProgram.d_speciesProg; formulaArgs[13]=&ResidentProgram.d_termProg;
-        formulaArgs[14]=&ResidentProgram.d_instr; formulaArgs[15]=&lastSpecies; formulaArgs[16]=&lastTerm;
-        formulaArgs[17]=&lastParam; formulaArgs[18]=&lastConst; formulaArgs[19]=&ResidentProgram.d_err;
+        formulaArgs[9]=&ResidentProgram.d_consts; formulaArgs[10]=&d_hyd; formulaArgs[11]=&hStride; formulaArgs[12]=&hydLayout;
+        formulaArgs[13]=&ResidentProgram.d_speciesProg; formulaArgs[14]=&ResidentProgram.d_termProg;
+        formulaArgs[15]=&ResidentProgram.d_instr; formulaArgs[16]=&lastSpecies; formulaArgs[17]=&lastTerm;
+        formulaArgs[18]=&lastParam; formulaArgs[19]=&lastConst; formulaArgs[20]=&ResidentProgram.d_err;
         if (detail) cuEventRecord(ResidentProgram.evStart[0], stream);
         err=checkCu(cuLaunchKernel(GpuModule.ros2Kernel,grid,1,1,block,1,1,0,stream,ros2Args,NULL),ERR_GPU_KERNEL_LAUNCH_FAILED);
         if (err) goto submit_fail;
@@ -2999,6 +3061,12 @@ submit_fail:
     MSXresidentGpu_abortActive(resident);
     setGpuError(err ? err : ERR_GPU_KERNEL_RUNTIME_ERROR,GPU_STAGE_NONE,-1,-1,-1,-1,-1,0.0);
     return err ? err : ERR_GPU_KERNEL_RUNTIME_ERROR;
+}
+
+int MSXgpu_submitResidentCore(MSXResidentGpu *resident, const MSXResidentActiveBatch *batch,
+                              double dt, MSXgpuResidentCoreToken *token)
+{
+    return MSXgpu_submitResidentCoreHyd(resident, batch, NULL, dt, token);
 }
 
 int MSXgpu_finishResidentCore(MSXResidentGpu *resident, MSXgpuResidentCoreToken *token,
@@ -3381,32 +3449,33 @@ int MSXgpu_reactPipeSegments(double dt)
         int lastParam = lastIndex(PARAMETER);
         int lastConst = lastIndex(CONSTANT);
         int hStride = MAX_HYD_VARS;
+        int hydLayout = MSX_RESIDENT_HYD_ACTIVE_MAJOR;
         int paramStride = nParams + 1;
         void *odeArgs[] = { &nSeg, &nSpecies, &rateCount, &tstep, &d_segPipe, &d_segRow, &d_segVol,
             &d_rateSpecies, &d_speciesType, &d_linkDiam, &areaUcf, &lperFt3, &d_c, &d_cOde, &d_reacted,
-            &d_params, &paramStride, &d_consts, &d_hyd, &hStride, &d_speciesProg, &d_termProg,
+            &d_params, &paramStride, &d_consts, &d_hyd, &hStride, &hydLayout, &d_speciesProg, &d_termProg,
             &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst, &d_err };
         void *rk5AlignArgs[] = { &nSeg, &nSpecies, &rateCount, &tstep, &d_segPipe, &d_segRow, &d_segVol, &d_hstep,
             &d_rateAtol, &d_rateRtol, &d_rateSpecies, &d_speciesType, &d_linkDiam, &areaUcf, &lperFt3,
-            &d_c, &d_cOde, &d_reacted, &d_params, &paramStride, &d_consts, &d_hyd, &hStride,
+            &d_c, &d_cOde, &d_reacted, &d_params, &paramStride, &d_consts, &d_hyd, &hStride, &hydLayout,
             &d_speciesProg, &d_termProg, &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst,
             &d_rk5Nfcn, &d_rk5Naccpt, &d_rk5Nrejct, &d_rk5LastHstep, &d_rk5Err, &d_err };
         void *rk5PipeWarpArgs[] = { &nActiveLinks, &d_activeLink, &d_pipeSegOffset, &d_pipeSegCount,
             &nSeg, &nSpecies, &rateCount, &tstep, &d_segPipe, &d_segRow, &d_segVol, &d_hstep,
             &d_rateAtol, &d_rateRtol, &d_rateSpecies, &d_speciesType, &d_linkDiam, &areaUcf, &lperFt3,
-            &d_c, &d_cOde, &d_reacted, &d_params, &paramStride, &d_consts, &d_hyd, &hStride,
+            &d_c, &d_cOde, &d_reacted, &d_params, &paramStride, &d_consts, &d_hyd, &hStride, &hydLayout,
             &d_speciesProg, &d_termProg, &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst,
             &d_rk5Nfcn, &d_rk5Naccpt, &d_rk5Nrejct, &d_rk5LastHstep, &d_rk5Err, &d_err };
         void *ros2Args[] = { &nSeg, &nSpecies, &rateCount, &tstep, &d_segPipe, &d_segRow, &d_segVol, &d_hstep,
             &d_rateAtol, &d_rateRtol, &d_rateSpecies, &d_speciesType, &d_linkDiam, &areaUcf, &lperFt3,
-            &d_c, &d_cOde, &d_reacted, &d_params, &paramStride, &d_consts, &d_hyd, &hStride,
+            &d_c, &d_cOde, &d_reacted, &d_params, &paramStride, &d_consts, &d_hyd, &hStride, &hydLayout,
             &d_speciesProg, &d_termProg, &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst,
             &d_ros2Nfcn, &d_ros2Njac, &d_ros2Naccept, &d_ros2Nreject, &d_ros2LastHstep, &d_ros2Err, &d_err };
         void *equilArgs[] = { &nSeg, &nSpecies, &eqCount, &d_segPipe, &d_segRow, &d_eqSpecies, &d_c, &d_params,
-            &paramStride, &d_consts, &d_hyd, &hStride, &d_speciesProg, &d_termProg,
+            &paramStride, &d_consts, &d_hyd, &hStride, &hydLayout, &d_speciesProg, &d_termProg,
             &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst, &d_err };
         void *formulaArgs[] = { &nSeg, &nSpecies, &formulaCount, &d_segPipe, &d_segRow, &d_formulaSpecies, &d_c,
-            &d_params, &paramStride, &d_consts, &d_hyd, &hStride, &d_speciesProg, &d_termProg,
+            &d_params, &paramStride, &d_consts, &d_hyd, &hStride, &hydLayout, &d_speciesProg, &d_termProg,
             &d_instr, &lastSpecies, &lastTerm, &lastParam, &lastConst, &d_err };
 
         if (detail)
@@ -3431,7 +3500,7 @@ int MSXgpu_reactPipeSegments(double dt)
                 CUdeviceptr b_segPipe, b_segVol, b_hstep, b_c, b_cOde, b_hyd;
                 CUdeviceptr b_rk5Nfcn, b_rk5Naccpt, b_rk5Nrejct, b_rk5LastHstep, b_rk5Err;
                 CUdeviceptr b_segRow;
-                void *rk5BucketArgs[36];
+                void *rk5BucketArgs[37];
                 if (count <= 0) continue;
                 bucketGrid = (count + block - 1) / block;
                 b_segPipe = d_segPipe + (size_t)start * sizeof(int);
@@ -3469,19 +3538,20 @@ int MSXgpu_reactPipeSegments(double dt)
                 rk5BucketArgs[20] = &d_consts;
                 rk5BucketArgs[21] = &b_hyd;
                 rk5BucketArgs[22] = &hStride;
-                rk5BucketArgs[23] = &d_speciesProg;
-                rk5BucketArgs[24] = &d_termProg;
-                rk5BucketArgs[25] = &d_instr;
-                rk5BucketArgs[26] = &lastSpecies;
-                rk5BucketArgs[27] = &lastTerm;
-                rk5BucketArgs[28] = &lastParam;
-                rk5BucketArgs[29] = &lastConst;
-                rk5BucketArgs[30] = &b_rk5Nfcn;
-                rk5BucketArgs[31] = &b_rk5Naccpt;
-                rk5BucketArgs[32] = &b_rk5Nrejct;
-                rk5BucketArgs[33] = &b_rk5LastHstep;
-                rk5BucketArgs[34] = &b_rk5Err;
-                rk5BucketArgs[35] = &d_err;
+                rk5BucketArgs[23] = &hydLayout;
+                rk5BucketArgs[24] = &d_speciesProg;
+                rk5BucketArgs[25] = &d_termProg;
+                rk5BucketArgs[26] = &d_instr;
+                rk5BucketArgs[27] = &lastSpecies;
+                rk5BucketArgs[28] = &lastTerm;
+                rk5BucketArgs[29] = &lastParam;
+                rk5BucketArgs[30] = &lastConst;
+                rk5BucketArgs[31] = &b_rk5Nfcn;
+                rk5BucketArgs[32] = &b_rk5Naccpt;
+                rk5BucketArgs[33] = &b_rk5Nrejct;
+                rk5BucketArgs[34] = &b_rk5LastHstep;
+                rk5BucketArgs[35] = &b_rk5Err;
+                rk5BucketArgs[36] = &d_err;
                 err = checkCu(cuLaunchKernel(GpuModule.rk5Kernel, bucketGrid, 1, 1, block, 1, 1, 0, 0,
                                              rk5BucketArgs, NULL),
                               ERR_GPU_KERNEL_LAUNCH_FAILED);

@@ -127,6 +127,9 @@ typedef struct {
 } MSXgpuResidentCoreToken;
 int MSXgpu_submitResidentCore(MSXResidentGpu *, const MSXResidentActiveBatch *,
                               double dt, MSXgpuResidentCoreToken *);
+int MSXgpu_submitResidentCoreHyd(MSXResidentGpu *, const MSXResidentActiveBatch *,
+                                 const MSXResidentHydView *, double dt,
+                                 MSXgpuResidentCoreToken *);
 int MSXgpu_finishResidentCore(MSXResidentGpu *, MSXgpuResidentCoreToken *,
                               MSXResidentGpuReactResult *);
 int MSXgpu_abortResidentCore(MSXResidentGpu *, MSXgpuResidentCoreToken *);
