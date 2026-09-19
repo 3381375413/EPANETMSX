@@ -50,12 +50,31 @@ MSXResidentStatus MSXresident_observePipe(uint32_t,const uint64_t*,const MSXResi
    advance descriptor epoch when the published ring topology changes. */
 MSXResidentStatus MSXresident_stageInsert(uint32_t,int,const MSXResidentPayload*,uint32_t*,uint32_t*);
 MSXResidentStatus MSXresident_stageRemove(uint32_t,uint32_t,uint32_t);
+/* Validate and commit endpoint removals as one allocation-free batch.  The
+   validator simulates the ring endpoints and patch/epoch capacity before any
+   row is cleared; commit is therefore non-fallible after successful validate. */
+MSXResidentStatus MSXresident_validateRemoveBatch(uint32_t,
+                                                  const MSXResidentHandoffItem *,
+                                                  uint32_t);
+MSXResidentStatus MSXresident_stageRemoveBatch(uint32_t,
+                                               const MSXResidentHandoffItem *,
+                                               uint32_t);
+/* Irrecoverable transaction failure: subsequent Resident operations fail
+   closed until the runtime is reopened. */
+void MSXresident_poison(void);
+/* Explicit audit seam: poison only the CPU concentration mirrors.  Resident
+   identity, scalar metadata, and GPU-owned payloads are untouched. */
+MSXResidentStatus MSXresident_auditPoisonCpuMirrors(void);
 MSXResidentStatus MSXresident_stageClear(uint32_t);
 MSXResidentStatus MSXresident_stageMeta(uint32_t,uint32_t,uint32_t,const MSXResidentPayload*);
 MSXResidentStatus MSXresident_stageReverse(uint32_t);
 MSXResidentStatus MSXresident_getSlotForParcel(uint32_t,uint64_t,uint32_t*,uint32_t*);
 MSXResidentStatus MSXresident_getSlotGeneration(uint32_t,uint32_t,uint32_t*);
 MSXResidentStatus MSXresident_getSlotPayload(uint32_t,uint32_t,uint32_t,MSXResidentPayload*);
+/* Read the stable identity tuple needed by selected GPU fetches.  This does
+   not expose the CPU concentration image as an authoritative value. */
+MSXResidentStatus MSXresident_getSlotIdentity(uint32_t,uint32_t,uint32_t*,
+                                               uint64_t*,uint64_t*);
 /* Updates only payload rows which still match the supplied active snapshot;
    it never changes descriptor topology or emits patches. */
 MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow *,

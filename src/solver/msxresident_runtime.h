@@ -21,6 +21,27 @@ int MSXresidentRuntime_completeHandoffs(void);
 MSXResidentStatus MSXresidentRuntime_reduce(double *massBySpecies,
                                             uint32_t massCount,
                                             MSXResidentGpuReduction *reduction);
+/* Flush pending Resident patches and return one link's GPU aggregate.  The
+   returned mass is c*volume in the Resident concentration/volume units; the
+   caller combines it with CPU Boundary rows at the same state version. */
+MSXResidentStatus MSXresidentRuntime_reduceLink(uint32_t linkIndex,
+                                                double *massBySpecies,
+                                                uint32_t massCount,
+                                                double *volume,
+                                                MSXResidentGpuReduction *reduction);
+/* Fetch one selected Resident row from the authoritative GPU image.  c/lastc
+   are caller-owned arrays of at least speciesStride entries. */
+MSXResidentStatus MSXresidentRuntime_fetchSlot(uint32_t linkIndex,
+                                               uint64_t parcelId,
+                                               double *c, double *lastc,
+                                               uint32_t stride,
+                                               MSXResidentPayload *payload);
+/* Fetch a caller-planned set of selected rows in one GPU gather.  c/lastc
+   contain count packed rows and results receives the matching metadata. */
+MSXResidentStatus MSXresidentRuntime_fetchBatch(
+    const MSXResidentHandoffItem *items, uint32_t count,
+    double *c, double *lastc, uint32_t stride,
+    MSXResidentHandoffResult *results);
 /* The quality loop calls this after post-transport Hybrid rebalance so the
    next pending patch batch is classified as demote/promote traffic. */
 void MSXresidentRuntime_markRebalance(void);

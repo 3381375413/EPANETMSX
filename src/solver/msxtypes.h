@@ -418,6 +418,7 @@ struct Sseg                            // PIPE SEGMENT OBJECT
     unsigned long long hybridId;       // logical water-parcel identity in Hybrid mode
     double    *privateC;               // private segment concentration storage
     double    *privateLastC;           // private previous-step concentration storage
+    int       hybridBoundaryPoolIndex; // fixed Hybrid Resident boundary slot, or -1
 };
 typedef struct Sseg *Pseg;
 

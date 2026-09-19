@@ -13,13 +13,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "msxsegment_storage.h"
 #include "msxresident_core.h"
+#if defined(EPANETMSX_CUDA_ENABLED)
+#include "msxresident_runtime.h"
+#endif
 #include "epanet2.h"
 #include "msxgpu.h"
 
 extern MSXproject MSX;
+
+typedef struct HybridDemoteRequest HybridDemoteRequest;
 
 typedef struct PipeRingStorage
 {
@@ -87,6 +93,18 @@ typedef struct HybridPipe
     int initialPrepared;
 } HybridPipe;
 
+struct HybridDemoteRequest
+{
+    int linkIndex;
+    int atHead;
+    int coreSlot;
+    uint64_t parcelId;
+    Pseg core;
+    Pseg boundary;
+    MSXResidentHandoffItem item;
+    MSXResidentHandoffResult result;
+};
+
 /* One token arena per link.  A quality step prepares no more than one
    materialization transaction for a link, while all links may be prepared
    concurrently as a batch. */
@@ -118,6 +136,22 @@ typedef struct HybridStorage
     double d2hMs;
     double unpackMs;
     double stepStartMs;
+    /* Post-transport demote workspaces are reserved with the Hybrid layout.
+       The quality loop only reuses these packed arrays; it never grows or
+       frees them per rebalance. */
+    HybridDemoteRequest *demoteRequest;
+    MSXResidentHandoffResult *demoteResult;
+    MSXResidentHandoffItem *demoteItem;
+    double *demoteC;
+    double *demoteLastC;
+    uint32_t demoteCapacity;
+    /* Dedicated CPU boundary arena.  Pseg objects in this pool are never
+       handed to the general FreeSeg list while Hybrid is resident. */
+    Pseg *demoteBoundary;
+    unsigned char *demoteBoundaryState; /* 0=free, 1=leased, 2=in CPU list */
+    uint32_t *demoteBoundaryNext;
+    uint32_t demoteBoundaryFreeHead;
+    uint32_t demoteBoundaryCapacity;
 } HybridStorage;
 
 static HybridStorage Hybrid = {0};
@@ -129,7 +163,9 @@ static int hybridPipeGuard(const HybridPipe *p)
 static int hybridNextSlot(const HybridPipe *p, int slot);
 static void hybridReplaceInList(int k, Pseg oldseg, Pseg newseg);
 static void hybridCopyBoundaryToSlot(int k, int slot, Pseg src);
+static void hybridMarkBoundaryCommitted(Pseg seg);
 extern void MSXqual_removeSeg(Pseg seg);
+extern Pseg MSXqual_getFreeSeg(double v, double c[]);
 
 /* Rebuild the fixed inverse mapping before publishing an observation.
    Resident retains rows for surviving IDs and assigns new IDs the lowest
@@ -366,8 +402,31 @@ static void hybridFreePipe(HybridPipe *p)
 static void hybridClear(void)
 {
     int k;
+    uint32_t i;
     if (Hybrid.pipe)
         for (k = 1; k <= Hybrid.nLinks; k++) hybridFreePipe(&Hybrid.pipe[k]);
+    /* Leased boundaries were never linked into CPU topology.  Return both
+       free and leased pool objects through the normal segment release hook;
+       committed objects remain in the caller-owned CPU list and are released
+       there after Hybrid is closed. */
+    if (Hybrid.demoteBoundary)
+        for (i = 0; i < Hybrid.demoteBoundaryCapacity; ++i)
+            if (Hybrid.demoteBoundary[i])
+            {
+                if (Hybrid.demoteBoundaryState[i] == 1)
+                    (void)MSXsegStorage_hybridReleaseBoundary(
+                        Hybrid.demoteBoundary[i]);
+                if (Hybrid.demoteBoundaryState[i] == 0)
+                    MSXqual_removeSeg(Hybrid.demoteBoundary[i]);
+            }
+    FREE(Hybrid.demoteBoundary);
+    FREE(Hybrid.demoteBoundaryState);
+    FREE(Hybrid.demoteBoundaryNext);
+    FREE(Hybrid.demoteRequest);
+    FREE(Hybrid.demoteResult);
+    FREE(Hybrid.demoteItem);
+    FREE(Hybrid.demoteC);
+    FREE(Hybrid.demoteLastC);
     FREE(Hybrid.pipe);
     memset(&Hybrid, 0, sizeof(Hybrid));
 }
@@ -664,6 +723,104 @@ int MSXsegStorage_hybridReserve(const MSXResidentLayout *layout)
     if (!layout || layout->nLinks != (uint32_t)Hybrid.nLinks || !layout->capacity ||
         !layout->guard)
         return ERR_PIPE_RING_CAPACITY;
+    /* A Resident row can become a CPU boundary through either handoff or
+       post-transport demote.  The exact total row count is the bounded
+       simultaneous demand; keeping one pool slot per row also makes a
+       handoff followed by demote allocation-free. */
+    uint32_t boundaryCapacity = layout->totalSlots;
+    if (Hybrid.demoteCapacity && Hybrid.demoteCapacity != layout->totalSlots)
+        return ERR_PIPE_RING_CAPACITY;
+    if (Hybrid.demoteBoundaryCapacity &&
+        Hybrid.demoteBoundaryCapacity != boundaryCapacity)
+        return ERR_PIPE_RING_CAPACITY;
+    if (!Hybrid.demoteCapacity)
+    {
+        size_t rows;
+        if (layout->totalSlots == 0 ||
+            layout->totalSlots > SIZE_MAX / sizeof(*Hybrid.demoteRequest) ||
+            layout->totalSlots > SIZE_MAX / sizeof(*Hybrid.demoteResult) ||
+            layout->totalSlots > SIZE_MAX / sizeof(*Hybrid.demoteItem) ||
+            boundaryCapacity > SIZE_MAX / sizeof(*Hybrid.demoteBoundary) ||
+            boundaryCapacity > SIZE_MAX / sizeof(*Hybrid.demoteBoundaryState) ||
+            boundaryCapacity > SIZE_MAX / sizeof(*Hybrid.demoteBoundaryNext) ||
+            (size_t)layout->totalSlots > SIZE_MAX / (size_t)Hybrid.stride)
+            return ERR_MEMORY;
+        rows = (size_t)layout->totalSlots * (size_t)Hybrid.stride;
+        if (rows > SIZE_MAX / sizeof(*Hybrid.demoteC)) return ERR_MEMORY;
+        Hybrid.demoteRequest = (HybridDemoteRequest *)calloc(
+            layout->totalSlots, sizeof(*Hybrid.demoteRequest));
+        Hybrid.demoteResult = (MSXResidentHandoffResult *)calloc(
+            layout->totalSlots, sizeof(*Hybrid.demoteResult));
+        Hybrid.demoteItem = (MSXResidentHandoffItem *)calloc(
+            layout->totalSlots, sizeof(*Hybrid.demoteItem));
+        Hybrid.demoteC = (double *)calloc(rows, sizeof(*Hybrid.demoteC));
+        Hybrid.demoteLastC = (double *)calloc(rows, sizeof(*Hybrid.demoteLastC));
+        Hybrid.demoteBoundary = (Pseg *)calloc(
+            boundaryCapacity, sizeof(*Hybrid.demoteBoundary));
+        Hybrid.demoteBoundaryState = (unsigned char *)calloc(
+            boundaryCapacity, sizeof(*Hybrid.demoteBoundaryState));
+        Hybrid.demoteBoundaryNext = (uint32_t *)malloc(
+            (size_t)boundaryCapacity * sizeof(*Hybrid.demoteBoundaryNext));
+        if (!Hybrid.demoteRequest || !Hybrid.demoteResult ||
+            !Hybrid.demoteItem || !Hybrid.demoteC || !Hybrid.demoteLastC ||
+            !Hybrid.demoteBoundary || !Hybrid.demoteBoundaryState ||
+            !Hybrid.demoteBoundaryNext)
+        {
+            FREE(Hybrid.demoteRequest);
+            FREE(Hybrid.demoteResult);
+            FREE(Hybrid.demoteItem);
+            FREE(Hybrid.demoteC);
+            FREE(Hybrid.demoteLastC);
+            FREE(Hybrid.demoteBoundary);
+            FREE(Hybrid.demoteBoundaryState);
+            FREE(Hybrid.demoteBoundaryNext);
+            Hybrid.demoteRequest = NULL;
+            Hybrid.demoteResult = NULL;
+            Hybrid.demoteItem = NULL;
+            Hybrid.demoteC = NULL;
+            Hybrid.demoteLastC = NULL;
+            Hybrid.demoteBoundary = NULL;
+            Hybrid.demoteBoundaryState = NULL;
+            Hybrid.demoteBoundaryNext = NULL;
+            return ERR_MEMORY;
+        }
+        for (uint32_t i = 0; i < boundaryCapacity; ++i)
+        {
+            Hybrid.demoteBoundaryNext[i] =
+                i + 1U < boundaryCapacity ? i + 1U : UINT32_MAX;
+            Hybrid.demoteBoundary[i] = MSXqual_getFreeSeg(0.0, MSX.C1);
+            if (!Hybrid.demoteBoundary[i])
+            {
+                while (i > 0)
+                {
+                    --i;
+                    MSXqual_removeSeg(Hybrid.demoteBoundary[i]);
+                    Hybrid.demoteBoundary[i] = NULL;
+                }
+                FREE(Hybrid.demoteRequest);
+                FREE(Hybrid.demoteResult);
+                FREE(Hybrid.demoteItem);
+                FREE(Hybrid.demoteC);
+                FREE(Hybrid.demoteLastC);
+                FREE(Hybrid.demoteBoundary);
+                FREE(Hybrid.demoteBoundaryState);
+                FREE(Hybrid.demoteBoundaryNext);
+                Hybrid.demoteRequest = NULL;
+                Hybrid.demoteResult = NULL;
+                Hybrid.demoteItem = NULL;
+                Hybrid.demoteC = NULL;
+                Hybrid.demoteLastC = NULL;
+                Hybrid.demoteBoundary = NULL;
+                Hybrid.demoteBoundaryState = NULL;
+                Hybrid.demoteBoundaryNext = NULL;
+                return ERR_MEMORY;
+            }
+            Hybrid.demoteBoundary[i]->hybridBoundaryPoolIndex = (int)i;
+        }
+        Hybrid.demoteBoundaryFreeHead = boundaryCapacity ? 0U : UINT32_MAX;
+        Hybrid.demoteCapacity = layout->totalSlots;
+        Hybrid.demoteBoundaryCapacity = boundaryCapacity;
+    }
     for (k = 1; k <= Hybrid.nLinks; k++)
     {
         HybridPipe *p = &Hybrid.pipe[k];
@@ -875,13 +1032,17 @@ int MSXsegStorage_hybridMaterializeResident(uint32_t linkIndex, uint32_t slot,
 {
     MSXResidentPayload payload;
     Pseg boundary;
+    int boundaryStatus;
     int m;
     if (!segment) return ERR_MEMORY;
     *segment = NULL;
     if (MSXresident_getSlotPayload(linkIndex, slot, generation, &payload) !=
         MSX_RESIDENT_OK) return ERR_PIPE_RING_CAPACITY;
-    boundary = MSXqual_getFreeSeg(0.0, (double *)payload.c);
-    if (!boundary) return ERR_MEMORY;
+    /* Resident handoff must consume a pre-reserved pool slot.  In particular,
+       do not fall through to MSX.FreeSeg/Alloc: that would make handoff
+       success depend on an unrelated general segment allocator. */
+    boundaryStatus = MSXsegStorage_hybridAcquireBoundary(&boundary);
+    if (boundaryStatus != 0) return boundaryStatus;
     boundary->v = payload.volume;
     boundary->hstep = payload.hstep;
     boundary->hresponse = payload.hresponse;
@@ -938,7 +1099,18 @@ void MSXsegStorage_hybridAbortPreparedResidentMaterialization(
     MSXHybridResidentMaterialization *token)
 {
     HybridResidentTx *t;
+    uint32_t i;
     if (!token || !(t = (HybridResidentTx *)token->opaque)) return;
+    /* A prepared boundary is still detached from CPU topology.  Return it to
+       the fixed pool directly; calling MSXqual_removeSeg after this would
+       expose the private pool object to the general FreeSeg list. */
+    for (i = 0; i < t->count; ++i)
+        if (t->boundary[i])
+        {
+            if (!MSXsegStorage_hybridReleaseBoundary(t->boundary[i]))
+                MSXqual_removeSeg(t->boundary[i]);
+            t->boundary[i] = NULL;
+        }
     t->active = FALSE;
     t->count = 0;
     token->opaque = NULL;
@@ -998,6 +1170,9 @@ void MSXsegStorage_hybridCommitPreparedResidentMaterialization(
                                   : (i ? t->boundary[i - 1] : t->down[i]);
         b->prev = t->boundarySide ? (i ? t->boundary[i - 1] : t->up[i])
                                   : (i + 1 < t->count ? t->boundary[i + 1] : t->up[i]);
+        /* The boundary now belongs to the CPU list.  Keep it marked
+           committed so a later MSXqual_removeSeg returns it to this pool. */
+        hybridMarkBoundaryCommitted(b);
         t->oldCore[i]->next = NULL; t->oldCore[i]->prev = NULL;
         t->oldCore[i]->inHybridCore = FALSE; t->oldCore[i]->ownerLink = 0;
         t->oldCore[i]->hybridId = 0;
@@ -1019,6 +1194,7 @@ void MSXsegStorage_hybridCommitPreparedResidentMaterialization(
     if (!t->pipe->count) t->pipe->head = t->pipe->tail = -1;
     else if (!t->boundarySide) t->pipe->head = t->nextEndpoint;
     else t->pipe->tail = t->nextEndpoint;
+    for (i = 0; i < t->count; ++i) t->boundary[i] = NULL;
     MSXsegStorage_hybridAbortPreparedResidentMaterialization(token);
 }
 
@@ -1124,7 +1300,7 @@ static int hybridDemote(int k, int atHead)
 {
     HybridPipe *p = &Hybrid.pipe[k];
     Pseg core, boundary;
-    int slot;
+    int slot, boundaryStatus;
     double timer = 0.0;
     int timing = MSXsegStorage_hybridTimingEnabled();
     int detail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
@@ -1132,14 +1308,48 @@ static int hybridDemote(int k, int atHead)
     if (p->count <= 0) return 0;
     slot = atHead ? p->head : p->tail;
     core = p->view[slot];
-    boundary = MSXqual_getFreeSeg(0.0, core->c);
-    if (!boundary) return ERR_MEMORY;
-    hybridCopySlotToBoundary(k, slot, boundary);
+    /* Resident Core concentration is not a CPU source of truth.  The seed is
+       overwritten by selected GPU fetch (or by the legacy copy path below). */
+    boundaryStatus = MSXsegStorage_hybridAcquireBoundary(&boundary);
+    if (boundaryStatus == MSX_RESIDENT_DISABLED)
+    {
+#if defined(EPANETMSX_CUDA_ENABLED)
+        if (MSXresidentRuntime_isResident()) return ERR_PIPE_RING_CAPACITY;
+#endif
+        boundary = MSXqual_getFreeSeg(0.0, MSX.C1);
+        if (!boundary) return ERR_MEMORY;
+    }
+    else if (boundaryStatus != 0)
+        return boundaryStatus;
+#if defined(EPANETMSX_CUDA_ENABLED)
+    if (MSXresidentRuntime_isResident())
+    {
+        MSXResidentPayload latest;
+        MSXResidentStatus status = MSXresidentRuntime_fetchSlot(
+            (uint32_t)k, core->hybridId, boundary->c, boundary->lastc,
+            (uint32_t)Hybrid.stride, &latest);
+        if (status != MSX_RESIDENT_OK)
+        {
+            MSXqual_removeSeg(boundary);
+            MSX.ErrCode = ERR_GPU_KERNEL_RUNTIME_ERROR;
+            return MSX.ErrCode;
+        }
+        boundary->v = latest.volume;
+        boundary->hstep = latest.hstep;
+        boundary->hresponse = latest.hresponse;
+        boundary->uresponse = latest.uresponse;
+        boundary->dresponse = latest.dresponse;
+        boundary->hybridId = latest.parcelId;
+    }
+    else
+#endif
+        hybridCopySlotToBoundary(k, slot, boundary);
     if (hybridResidentRemove(k, slot))
     {
         MSXqual_removeSeg(boundary);
         return ERR_PIPE_RING_CAPACITY;
     }
+    hybridMarkBoundaryCommitted(boundary);
     hybridReplaceInList(k, core, boundary);
     core->inHybridCore = FALSE;
     core->ownerLink = 0;
@@ -1244,6 +1454,301 @@ static int hybridRebalanceLink(int k)
     return 0;
 }
 
+#if defined(EPANETMSX_CUDA_ENABLED)
+/* Once a post-transport demote batch has been fetched and validated, only
+   bounded list/mapping stores remain.  Resident removal is prevalidated for
+   every request before the first CPU topology mutation. */
+static int hybridValidateDemoteRequest(const HybridDemoteRequest *r)
+{
+    HybridPipe *p;
+    int residentSlot;
+    uint32_t generation;
+    uint64_t parcelId, epoch;
+    if (!r || !r->core || !r->boundary || r->linkIndex <= 0 ||
+        r->linkIndex > Hybrid.nLinks) return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[r->linkIndex];
+    if (r->coreSlot < 0 || r->coreSlot >= p->cap ||
+        !p->used[r->coreSlot] || p->view[r->coreSlot] != r->core ||
+        !p->residentSlot || !p->coreSlotForResident)
+        return ERR_PIPE_RING_CAPACITY;
+    residentSlot = p->residentSlot[r->coreSlot];
+    if (residentSlot < 0 || residentSlot >= p->cap ||
+        p->coreSlotForResident[residentSlot] != r->coreSlot)
+        return ERR_PIPE_RING_CAPACITY;
+    if (MSXresident_getSlotIdentity((uint32_t)r->linkIndex,
+                                    (uint32_t)residentSlot, &generation,
+                                    &parcelId, &epoch) != MSX_RESIDENT_OK ||
+        generation != r->item.generation || parcelId != r->parcelId ||
+        epoch != r->item.pipeEpoch)
+        return ERR_PIPE_RING_CAPACITY;
+    if (r->result.linkIndex != (uint32_t)r->linkIndex ||
+        r->result.slot != (uint32_t)residentSlot ||
+        r->result.generation != r->item.generation ||
+        r->result.pipeEpoch != r->item.pipeEpoch ||
+        r->result.payload.parcelId != r->parcelId ||
+        !r->result.payload.c || !r->result.payload.lastc)
+        return ERR_PIPE_RING_CAPACITY;
+    return 0;
+}
+
+static int hybridCommitDemoteRequest(HybridDemoteRequest *r)
+{
+    HybridPipe *p;
+    int residentSlot;
+    /* Resident removals are committed by one prevalidated batch per link
+       before this CPU topology commit.  This function is intentionally only
+       bounded pointer/list bookkeeping and has no fallible Resident call. */
+    if (!r || !r->core || !r->boundary || r->linkIndex <= 0 ||
+        r->linkIndex > Hybrid.nLinks) return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[r->linkIndex];
+    residentSlot = p->residentSlot[r->coreSlot];
+    r->boundary->v = r->result.payload.volume;
+    r->boundary->hstep = r->result.payload.hstep;
+    r->boundary->hresponse = r->result.payload.hresponse;
+    r->boundary->uresponse = r->result.payload.uresponse;
+    r->boundary->dresponse = r->result.payload.dresponse;
+    memcpy(r->boundary->c, r->result.payload.c,
+           (size_t)Hybrid.stride * sizeof(double));
+    memcpy(r->boundary->lastc, r->result.payload.lastc,
+           (size_t)Hybrid.stride * sizeof(double));
+    r->boundary->hybridId = r->result.payload.parcelId;
+    hybridMarkBoundaryCommitted(r->boundary);
+    p->residentSlot[r->coreSlot] = -1;
+    p->coreSlotForResident[residentSlot] = -1;
+    hybridReplaceInList(r->linkIndex, r->core, r->boundary);
+    r->core->inHybridCore = FALSE;
+    r->core->ownerLink = 0;
+    r->core->hybridId = 0;
+    p->used[r->coreSlot] = FALSE;
+    if (p->count == 1)
+    {
+        p->count = 0;
+        p->head = p->tail = -1;
+    }
+    else
+    {
+        p->count--;
+        if (r->atHead) p->head = hybridNextSlot(p, r->coreSlot);
+        else p->tail = hybridPrevSlot(p, r->coreSlot);
+    }
+    return 0;
+}
+
+static void hybridFreeDemoteBatch(HybridDemoteRequest *request,
+                                  uint32_t count, double *c, double *lastc,
+                                  MSXResidentHandoffResult *result,
+                                  MSXResidentHandoffItem *item)
+{
+    uint32_t i;
+    (void)c; (void)lastc; (void)result; (void)item;
+    if (request)
+        for (i = 0; i < count; i++)
+            if (request[i].boundary)
+            {
+                Pseg boundary = request[i].boundary;
+                request[i].boundary = NULL;
+                MSXqual_removeSeg(boundary);
+            }
+}
+
+/* Plan all endpoint demotions without changing CPU topology, fetch every
+   selected Resident row in one gather, then validate and commit the full
+   batch.  This is deliberately separate from hybridDemote(), which remains
+   the small pre-transport endpoint materializer. */
+static int hybridDemoteResidentBatch(void)
+{
+    HybridDemoteRequest *request = Hybrid.demoteRequest;
+    MSXResidentHandoffResult *result = Hybrid.demoteResult;
+    MSXResidentHandoffItem *item = Hybrid.demoteItem;
+    double *c = Hybrid.demoteC, *lastc = Hybrid.demoteLastC;
+    uint32_t capacity = Hybrid.demoteCapacity;
+    uint32_t count = 0, pos = 0, i, begin, end;
+    int link;
+    MSXResidentStatus status;
+    double timer = MSXgpu_wallTimeMs();
+
+    for (i = 1; i <= (uint32_t)Hybrid.nLinks; i++)
+    {
+        HybridPipe *p = &Hybrid.pipe[i];
+        Pseg firstCore, lastCore;
+        int down, up, ncore;
+        int guard = hybridPipeGuard(p);
+        hybridFindCore(p, (int)i, &firstCore, &lastCore, &down, &up, &ncore);
+        if (ncore > 0)
+        {
+            int remaining = ncore;
+            while (remaining > 0 && down < guard)
+            { count++; remaining--; down++; }
+            while (remaining > 0 && up < guard)
+            { count++; remaining--; up++; }
+        }
+    }
+    if (!count) return 0;
+    if (!request || !result || !item || !c || !lastc || count > capacity)
+        return ERR_MEMORY;
+    /* Requests are reusable arena records.  Clear only this batch's range;
+       cleanup below guarantees no boundary from an older batch remains live. */
+    memset(request, 0, (size_t)count * sizeof(*request));
+
+    for (i = 1; i <= (uint32_t)Hybrid.nLinks; i++)
+    {
+        HybridPipe *p = &Hybrid.pipe[i];
+        Pseg firstCore, lastCore;
+        int down, up, ncore, remaining, head, tail, guard;
+        uint64_t parcelId;
+        hybridFindCore(p, (int)i, &firstCore, &lastCore, &down, &up, &ncore);
+        guard = hybridPipeGuard(p);
+        remaining = ncore;
+        head = p->head;
+        tail = p->tail;
+        while (remaining > 0 && down < guard)
+        {
+            HybridDemoteRequest *r = &request[pos++];
+            r->linkIndex = (int)i; r->atHead = TRUE; r->coreSlot = head;
+            r->core = p->view[head];
+            head = hybridNextSlot(p, head);
+            remaining--; down++;
+            if (!r->core || !p->residentSlot ||
+                p->residentSlot[r->coreSlot] < 0)
+            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+            r->item.linkIndex = i;
+            r->item.slot = (uint32_t)p->residentSlot[r->coreSlot];
+            r->item.boundarySide = 0;
+            if (MSXresident_getSlotIdentity(i, r->item.slot,
+                                            &r->item.generation,
+                                            &parcelId,
+                                            &r->item.pipeEpoch) != MSX_RESIDENT_OK)
+            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+            r->parcelId = parcelId;
+            r->item.requestedVolume = 0.0;
+            if (MSXsegStorage_hybridAcquireBoundary(&r->boundary) != 0)
+            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_MEMORY; }
+        }
+        while (remaining > 0 && up < guard)
+        {
+            HybridDemoteRequest *r = &request[pos++];
+            r->linkIndex = (int)i; r->atHead = FALSE; r->coreSlot = tail;
+            r->core = p->view[tail];
+            tail = hybridPrevSlot(p, tail);
+            remaining--; up++;
+            if (!r->core || !p->residentSlot ||
+                p->residentSlot[r->coreSlot] < 0)
+            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+            r->item.linkIndex = i;
+            r->item.slot = (uint32_t)p->residentSlot[r->coreSlot];
+            r->item.boundarySide = 1;
+            if (MSXresident_getSlotIdentity(i, r->item.slot,
+                                            &r->item.generation,
+                                            &parcelId,
+                                            &r->item.pipeEpoch) != MSX_RESIDENT_OK)
+            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+            r->parcelId = parcelId;
+            r->item.requestedVolume = 0.0;
+            if (MSXsegStorage_hybridAcquireBoundary(&r->boundary) != 0)
+            { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_MEMORY; }
+        }
+    }
+    if (pos != count)
+    { hybridFreeDemoteBatch(request, pos, c, lastc, result, item); return ERR_PIPE_RING_CAPACITY; }
+    for (i = 0; i < count; i++) item[i] = request[i].item;
+    status = MSXresidentRuntime_fetchBatch(item, count, c, lastc,
+                                           (uint32_t)Hybrid.stride,
+                                           result);
+    if (status != MSX_RESIDENT_OK)
+    {
+        hybridFreeDemoteBatch(request, count, c, lastc, result, item);
+        return ERR_GPU_KERNEL_RUNTIME_ERROR;
+    }
+    for (i = 0; i < count; i++)
+    {
+        request[i].result = result[i];
+        if (hybridValidateDemoteRequest(&request[i]))
+        {
+            hybridFreeDemoteBatch(request, count, c, lastc, result, item);
+            return ERR_GPU_KERNEL_RUNTIME_ERROR;
+        }
+    }
+    /* Every link is prevalidated against its complete projected endpoint
+       sequence before any Resident row is cleared.  The packed request arena
+       is built link-contiguously above, so no temporary index allocation is
+       needed here. */
+    for (begin = 0; begin < count; begin = end)
+    {
+        link = request[begin].linkIndex;
+        end = begin + 1;
+        while (end < count && request[end].linkIndex == link) ++end;
+        status = MSXresident_validateRemoveBatch((uint32_t)link,
+                                                  item + begin,
+                                                  end - begin);
+        if (status != MSX_RESIDENT_OK)
+        {
+            hybridFreeDemoteBatch(request, count, c, lastc, result, item);
+            return ERR_GPU_KERNEL_RUNTIME_ERROR;
+        }
+    }
+    /* The Core batch API repeats its cheap preflight and then performs only
+       non-fallible bounded stores.  An unexpected failure poisons Resident;
+       CPU topology is not advanced and the caller stops the quality step. */
+    for (begin = 0; begin < count; begin = end)
+    {
+        link = request[begin].linkIndex;
+        end = begin + 1;
+        while (end < count && request[end].linkIndex == link) ++end;
+        status = MSXresident_stageRemoveBatch((uint32_t)link,
+                                               item + begin,
+                                               end - begin);
+        if (status != MSX_RESIDENT_OK)
+        {
+            MSXresident_poison();
+            HybridResidentStatus = status;
+            hybridFreeDemoteBatch(request, count, c, lastc, result, item);
+            return ERR_GPU_KERNEL_RUNTIME_ERROR;
+        }
+    }
+    for (i = 0; i < count; i++)
+        if (hybridCommitDemoteRequest(&request[i]))
+        {
+            MSXresident_poison();
+            HybridResidentStatus = MSX_RESIDENT_ERR_POISONED;
+            hybridFreeDemoteBatch(request, count, c, lastc, result, item);
+            return ERR_PIPE_RING_CAPACITY;
+        }
+        else
+            request[i].boundary = NULL;
+    hybridFreeDemoteBatch(request, count, c, lastc, result, item);
+    if (MSXsegStorage_hybridTimingEnabled())
+        MSXsegStorage_hybridTimingAddHandoff(MSXgpu_wallTimeMs() - timer);
+    if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE))
+        MSXgpu_profileRecordDemote(count, MSXgpu_wallTimeMs() - timer);
+    return 0;
+}
+
+static int hybridPromoteResidentExcess(int k)
+{
+    HybridPipe *p = &Hybrid.pipe[k];
+    Pseg firstCore, lastCore, seg;
+    int down, up, count, guard = hybridPipeGuard(p), err;
+    hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+    while (count > 0 && down > guard)
+    {
+        seg = firstCore->next;
+        if (!seg || seg->inHybridCore) break;
+        err = hybridPromote(k, seg, TRUE);
+        if (err) return err;
+        firstCore = p->view[p->head]; count++; down--;
+    }
+    while (count > 0 && up > guard)
+    {
+        seg = lastCore->prev;
+        if (!seg || seg->inHybridCore) break;
+        err = hybridPromote(k, seg, FALSE);
+        if (err) return err;
+        lastCore = p->view[p->tail]; count++; up--;
+    }
+    return 0;
+}
+#endif
+
 int MSXsegStorage_hybridizeAll(void)
 {
     int k, err;
@@ -1339,11 +1844,64 @@ void MSXsegStorage_hybridRebalanceAll(void)
 {
     int k, err;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return;
+#if defined(EPANETMSX_CUDA_ENABLED)
+    if (MSXresidentRuntime_isResident())
+    {
+        /* Initialization contains only fallible promote commits.  Complete
+           those first, then collect every post-transport demote before any
+           CPU topology mutation or selected GPU fetch. */
+        for (k = 1; k <= Hybrid.nLinks; k++)
+        {
+            HybridPipe *p = &Hybrid.pipe[k];
+            Pseg firstCore, lastCore;
+            int down, up, count, total = 0, guard = hybridPipeGuard(p);
+            Pseg seg;
+            for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev) total++;
+            hybridFindCore(p, k, &firstCore, &lastCore, &down, &up, &count);
+            if (count == 0 && total > 2 * guard)
+            {
+                err = hybridInitializeLink(k);
+                if (err) { MSX.ErrCode = err; return; }
+            }
+        }
+        err = hybridDemoteResidentBatch();
+        if (err) { MSX.ErrCode = err; return; }
+        for (k = 1; k <= Hybrid.nLinks; k++)
+        {
+            err = hybridPromoteResidentExcess(k);
+            if (err) { MSX.ErrCode = err; return; }
+        }
+        return;
+    }
+#endif
     for (k = 1; k <= Hybrid.nLinks; k++)
     {
         err = hybridRebalanceLink(k);
         if (err) { MSX.ErrCode = err; return; }
     }
+}
+
+int MSXsegStorage_hybridEnsureEndpointBoundary(int k, int boundarySide)
+{
+    if (!MSXsegStorage_isHybridLink(k) ||
+        (boundarySide != 0 && boundarySide != 1)) return 0;
+    if (boundarySide == 0)
+    {
+        while (MSX.FirstSeg[k] && MSX.FirstSeg[k]->inHybridCore)
+        {
+            int z = hybridDemote(k, TRUE);
+            if (z) { MSX.ErrCode = z; return z; }
+        }
+    }
+    else
+    {
+        while (MSX.LastSeg[k] && MSX.LastSeg[k]->inHybridCore)
+        {
+            int z = hybridDemote(k, FALSE);
+            if (z) { MSX.ErrCode = z; return z; }
+        }
+    }
+    return 0;
 }
 
 int MSXsegStorage_hybridAfterListReorder(int k)
@@ -1666,6 +2224,41 @@ void MSXsegStorage_hybridSyncAllScalars(void)
     }
 }
 
+int MSXsegStorage_hybridAuditPoisonCoreMirrors(void)
+{
+    int k, pos, slot, m;
+    HybridPipe *p;
+    if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return 0;
+    /* Audit-only walk: dense Core rows are the only CPU concentrations that
+       must be proven unused by Resident consumers.  Boundary rows are left
+       intact because they remain an intentional CPU source of truth. */
+    for (k = 1; k <= Hybrid.nLinks; ++k)
+    {
+        p = &Hybrid.pipe[k];
+        slot = p->head;
+        for (pos = 0; pos < p->count; ++pos)
+        {
+            if (p->used[slot])
+            {
+                size_t row = (size_t)slot * (size_t)Hybrid.stride;
+                Pseg seg = p->view[slot];
+                for (m = 1; m <= MSX.Nobjects[SPECIES]; ++m)
+                {
+                    p->c[row + m] = NAN;
+                    p->lastc[row + m] = NAN;
+                    if (seg && seg->c && seg->lastc)
+                    {
+                        seg->c[m] = NAN;
+                        seg->lastc[m] = NAN;
+                    }
+                }
+            }
+            slot = hybridNextSlot(p, slot);
+        }
+    }
+    return 0;
+}
+
 static size_t totalSlots(void)
 {
     return (size_t)(Ring.nLinks + 1) * (size_t)Ring.cap;
@@ -1727,6 +2320,65 @@ static void pointSegToPrivate(Pseg seg)
     seg->ownerLink = 0;
     seg->ringSlot = -1;
     seg->ringIndex = -1;
+}
+
+int MSXsegStorage_hybridAcquireBoundary(Pseg *segment)
+{
+    uint32_t i;
+    Pseg seg;
+    if (!segment) return ERR_MEMORY;
+    *segment = NULL;
+    if (!Hybrid.opened || !Hybrid.demoteBoundaryCapacity ||
+        !Hybrid.demoteBoundaryNext)
+        return MSX_RESIDENT_DISABLED;
+    i = Hybrid.demoteBoundaryFreeHead;
+    if (i == UINT32_MAX) return ERR_PIPE_RING_CAPACITY;
+    if (i >= Hybrid.demoteBoundaryCapacity ||
+        Hybrid.demoteBoundaryState[i] != 0)
+        return ERR_PIPE_RING_CAPACITY;
+    seg = Hybrid.demoteBoundary[i];
+    if (!seg || !seg->privateC || !seg->privateLastC) return ERR_MEMORY;
+    Hybrid.demoteBoundaryFreeHead = Hybrid.demoteBoundaryNext[i];
+    pointSegToPrivate(seg);
+    memset(seg->privateC, 0, (size_t)Hybrid.stride * sizeof(double));
+    memset(seg->privateLastC, 0, (size_t)Hybrid.stride * sizeof(double));
+    seg->prev = seg->next = NULL;
+    seg->hybridId = 0;
+    seg->hybridBoundaryPoolIndex = (int)i;
+    Hybrid.demoteBoundaryState[i] = 1;
+    *segment = seg;
+    return 0;
+}
+
+int MSXsegStorage_hybridReleaseBoundary(Pseg segment)
+{
+    int i;
+    if (!segment || !Hybrid.demoteBoundary) return 0;
+    i = segment->hybridBoundaryPoolIndex;
+    if (i < 0 || (uint32_t)i >= Hybrid.demoteBoundaryCapacity ||
+        Hybrid.demoteBoundary[i] != segment ||
+        (Hybrid.demoteBoundaryState[i] != 1 &&
+         Hybrid.demoteBoundaryState[i] != 2) ||
+        !Hybrid.demoteBoundaryNext) return 0;
+    Hybrid.demoteBoundaryState[i] = 0;
+    Hybrid.demoteBoundaryNext[i] = Hybrid.demoteBoundaryFreeHead;
+    Hybrid.demoteBoundaryFreeHead = (uint32_t)i;
+    pointSegToPrivate(segment);
+    segment->prev = segment->next = NULL;
+    segment->hybridId = 0;
+    segment->hybridBoundaryPoolIndex = -1;
+    return 1;
+}
+
+static void hybridMarkBoundaryCommitted(Pseg seg)
+{
+    int i;
+    if (!seg || !Hybrid.demoteBoundary) return;
+    i = seg->hybridBoundaryPoolIndex;
+    if (i < 0 || (uint32_t)i >= Hybrid.demoteBoundaryCapacity ||
+        Hybrid.demoteBoundary[i] != seg) return;
+    if (Hybrid.demoteBoundaryState[i] == 1)
+        Hybrid.demoteBoundaryState[i] = 2;
 }
 
 static void copySegToSlot(int k, int slot, Pseg seg)
@@ -2061,6 +2713,7 @@ int MSXsegStorage_preparePrivate(Pseg seg)
     seg->hybridSlot = -1;
     seg->inHybridCore = FALSE;
     seg->hybridId = 0;
+    seg->hybridBoundaryPoolIndex = -1;
     return 0;
 }
 

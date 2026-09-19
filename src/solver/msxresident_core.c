@@ -25,7 +25,7 @@ typedef struct { MSXResidentPipeDesc d; uint32_t guard; unsigned char *used; uin
 /* One reusable transaction arena is owned by each resident link.  Runtime
    prepares at most one transaction per link before the all-link validation. */
 typedef struct { MSXResidentHandoffPlan plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *result; Pseg *boundary; double *c,*lastc; uint32_t count,capacity,patchReserve; int active; MSXHybridResidentMaterialization storage; } Tx;
-typedef struct { int open,strict,initialStaging,initialCommitted; MSXResidentMode mode; uint32_t nlinks,stride,rowWidth; size_t slots; char hash[65]; Pipe *p; uint32_t *dirty,*capacity,*base,*guard; MSXResidentDescriptorPatch *desc,*initialDesc; MSXResidentSlotPatch *slot,*initialSlot; MSXResidentHandoffItem *hand; Tx *tx; uint32_t ndesc,nslot,nh; MSXResidentStats stat; } State;
+typedef struct { int open,strict,initialStaging,initialCommitted,poisoned; MSXResidentMode mode; uint32_t nlinks,stride,rowWidth; size_t slots; char hash[65]; Pipe *p; uint32_t *dirty,*capacity,*base,*guard; MSXResidentDescriptorPatch *desc,*initialDesc; MSXResidentSlotPatch *slot,*initialSlot; MSXResidentHandoffItem *hand; Tx *tx; uint32_t ndesc,nslot,nh; MSXResidentStats stat; } State;
 static State S={0};
 static int mul(size_t a,size_t b,size_t*o){if(a&&b>SIZE_MAX/a)return 0;*o=a*b;return 1;}
 static void txreset(Tx *t);
@@ -41,7 +41,7 @@ static MSXResidentStatus validatecsv(const char *path,int guard,const char *hash
   if(!fgets(line,sizeof(line),f)||strcmp(line,"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n")&&strcmp(line,"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\r\n")){fclose(f);return MSX_RESIDENT_ERR_CSV;}
   while(fgets(line,sizeof(line),f)){e=strpbrk(line,"\r\n");if(!e||(*e=='\r'&&e[1]!='\n')||e[1+(*e=='\r')]){fclose(f);return MSX_RESIDENT_ERR_CSV;}*e=0;if(!csv(line,&k,id,&cap,&core,&burst,&g,h)||k!=row+1||!k||k>n||!cap||core>cap||(g!=2&&g!=4)||cap>(uint32_t)MSX.MaxSegments){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(guard&&g<(uint32_t)guard){fclose(f);return MSX_RESIDENT_ERR_GUARD;}want[0]=0;if(ENgetlinkid((int)k,want)||strcmp(id,want)){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(!row)strcpy(first,h);else if(strcmp(first,h)){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(hash&&hashcmp(h,hash)){fclose(f);return MSX_RESIDENT_ERR_CSV;}row++;}
   if(ferror(f)||row!=n){fclose(f);return MSX_RESIDENT_ERR_CSV;}fclose(f);return MSX_RESIDENT_OK; }
-static MSXResidentStatus pipeok(uint32_t k,Pipe**p){if(!S.open)return MSX_RESIDENT_DISABLED;if(!k||k>S.nlinks)return MSX_RESIDENT_ERR_ARGUMENT;*p=&S.p[k];return MSX_RESIDENT_OK;}
+static MSXResidentStatus pipeok(uint32_t k,Pipe**p){if(!S.open)return MSX_RESIDENT_DISABLED;if(S.poisoned)return MSX_RESIDENT_ERR_POISONED;if(!k||k>S.nlinks)return MSX_RESIDENT_ERR_ARGUMENT;*p=&S.p[k];return MSX_RESIDENT_OK;}
 /* slot layout is [5 scalar + stride c][5 scalar + stride lastc]. */
 static double*crow(Pipe*p,uint32_t s){return p->row+(size_t)s*2*S.rowWidth;}
 static double*lrow(Pipe*p,uint32_t s){return crow(p,s)+S.rowWidth;}
@@ -232,6 +232,95 @@ MSXResidentStatus MSXresident_stageRemove(uint32_t k,uint32_t s,uint32_t generat
     markslot(k, s, 0, MSX_RESIDENT_PATCH_INVALIDATE); markdesc(k);
     return MSX_RESIDENT_OK;
 }
+static MSXResidentStatus validateRemoveBatchInternal(uint32_t k,
+                                                     const MSXResidentHandoffItem *items,
+                                                     uint32_t count,
+                                                     Pipe **out)
+{
+    Pipe *p; MSXResidentStatus z; uint32_t i, needed = 0;
+    uint32_t head, tail, remaining;
+    if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
+    if (count && !items) return MSX_RESIDENT_ERR_ARGUMENT;
+    z = pipeok(k, &p); if (z) return z;
+    if (out) *out = p;
+    if (!count) return MSX_RESIDENT_OK;
+    if (count > p->d.count || S.nslot > S.slots)
+        return MSX_RESIDENT_ERR_CAPACITY;
+    if ((uint64_t)count > UINT64_MAX - p->d.epoch)
+        return MSX_RESIDENT_ERR_OVERFLOW;
+    if (S.dirty[k] == NONE && S.ndesc >= S.nlinks)
+        return MSX_RESIDENT_ERR_CAPACITY;
+    head = p->d.head; tail = p->d.tail; remaining = p->d.count;
+    for (i = 0; i < count; ++i)
+    {
+        uint32_t s = items[i].slot;
+        int side;
+        if (items[i].linkIndex != k || s >= p->d.capacity ||
+            !p->used[s] || p->gen[s] != items[i].generation ||
+            items[i].pipeEpoch != p->d.epoch)
+            return MSX_RESIDENT_ERR_GENERATION;
+        if (!remaining) return MSX_RESIDENT_ERR_ARGUMENT;
+        if (s == head) side = 0;
+        else if (s == tail) side = 1;
+        else return MSX_RESIDENT_ERR_ARGUMENT;
+        if (p->patch[s] == NONE) ++needed;
+        if (remaining == 1) head = tail = NONE;
+        else if (!side) head = nextslot(p, head, p->d.orient);
+        else tail = prevslot(p, tail, p->d.orient);
+        --remaining;
+    }
+    if (needed > S.slots - S.nslot) return MSX_RESIDENT_ERR_CAPACITY;
+    return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_validateRemoveBatch(
+    uint32_t k, const MSXResidentHandoffItem *items, uint32_t count)
+{ return validateRemoveBatchInternal(k, items, count, NULL); }
+MSXResidentStatus MSXresident_stageRemoveBatch(
+    uint32_t k, const MSXResidentHandoffItem *items, uint32_t count)
+{
+    Pipe *p; MSXResidentStatus z; uint32_t i, head, tail, remaining;
+    z = validateRemoveBatchInternal(k, items, count, &p);
+    if (z || S.mode == MSX_RESIDENT_OFF || !count) return z;
+    head = p->d.head; tail = p->d.tail; remaining = p->d.count;
+    for (i = 0; i < count; ++i)
+    {
+        uint32_t s = items[i].slot;
+        int side;
+        if (s == head) side = 0;
+        else if (s == tail) side = 1;
+        else return MSX_RESIDENT_ERR_ARGUMENT;
+        p->used[s] = 0; p->id[s] = 0;
+        memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+        if (remaining == 1) head = tail = NONE;
+        else if (!side) head = nextslot(p, head, p->d.orient);
+        else tail = prevslot(p, tail, p->d.orient);
+        --remaining;
+        markslot(k, s, 0, MSX_RESIDENT_PATCH_INVALIDATE);
+    }
+    p->d.head = head; p->d.tail = tail; p->d.count = remaining;
+    p->d.epoch += count; markdesc(k);
+    return MSX_RESIDENT_OK;
+}
+void MSXresident_poison(void) { if (S.open) S.poisoned = 1; }
+
+MSXResidentStatus MSXresident_auditPoisonCpuMirrors(void)
+{
+    uint32_t k, s, m;
+    if (!S.open) return MSX_RESIDENT_DISABLED;
+    /* This is intentionally an explicit audit-only walk.  Production runs
+       never call it unless the runtime audit environment switch is enabled. */
+    for (k = 1; k <= S.nlinks; ++k)
+        for (s = 0; s < S.p[k].d.capacity; ++s)
+            if (S.p[k].used[s])
+            {
+                double *c = crow(&S.p[k], s) + 5;
+                double *lastc = lrow(&S.p[k], s) + 5;
+                for (m = 0; m < S.stride; ++m)
+                    c[m] = lastc[m] = NAN;
+            }
+    return MSX_RESIDENT_OK;
+}
+
 MSXResidentStatus MSXresident_stageClear(uint32_t k)
 {
     Pipe *p; MSXResidentStatus z; uint32_t s, used = 0, reserve = 0;
@@ -309,6 +398,23 @@ MSXResidentStatus MSXresident_getSlotGeneration(uint32_t k,uint32_t s,uint32_t *
     if (s >= p->d.capacity || !p->used[s]) return MSX_RESIDENT_ERR_GENERATION;
     *generationOut = p->gen[s]; return MSX_RESIDENT_OK;
 }
+MSXResidentStatus MSXresident_getSlotIdentity(uint32_t k,uint32_t s,
+                                               uint32_t *generationOut,
+                                               uint64_t *parcelIdOut,
+                                               uint64_t *epochOut)
+{
+    Pipe *p; MSXResidentStatus z;
+    z = pipeok(k, &p); if (z) return z;
+    if (s >= p->d.capacity || !p->used[s])
+    {
+        S.stat.generationFailures++;
+        return MSX_RESIDENT_ERR_GENERATION;
+    }
+    if (generationOut) *generationOut = p->gen[s];
+    if (parcelIdOut) *parcelIdOut = p->id[s];
+    if (epochOut) *epochOut = p->d.epoch;
+    return MSX_RESIDENT_OK;
+}
 MSXResidentStatus MSXresident_getSlotPayload(uint32_t k,uint32_t s,uint32_t g,MSXResidentPayload*x){Pipe*p;MSXResidentStatus z;if(!x)return MSX_RESIDENT_ERR_ARGUMENT;z=pipeok(k,&p);if(z)return z;if(s>=p->d.capacity||!p->used[s]||p->gen[s]!=g){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}getpayload(p,s,x);return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow*r,const MSXResidentPayload*x,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if((!r||!x)&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].globalRow!=S.base[r[i].linkIndex]+r[i].slot||r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].descriptorEpoch||p->id[r[i].slot]!=r[i].parcelId||!x[i].c||!x[i].lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=x[i].volume;q[1]=x[i].hstep;q[2]=x[i].hresponse;q[3]=x[i].uresponse;q[4]=x[i].dresponse;for(m=0;m<S.stride;m++){q[5+m]=x[i].c[m];lrow(p,r[i].slot)[5+m]=x[i].lastc[m];}}}return MSX_RESIDENT_OK;}
 uint64_t MSXresident_testAllocationCount(void){return ResidentAllocationCount;}
@@ -344,9 +450,14 @@ static void txreset(Tx *t)
 {
     uint32_t i;
     if (!t) return;
-    if (t->boundary) for (i = 0; i < t->count; i++)
+    /* Once storage preparation published its token, storage owns abort
+       cleanup and returns detached boundaries to the fixed pool.  Before
+       that point (for example, a later materialize row failed), the Core
+       transaction still owns the partially acquired boundaries. */
+    if (t->storage.opaque)
+        MSXsegStorage_hybridAbortPreparedResidentMaterialization(&t->storage);
+    else if (t->boundary) for (i = 0; i < t->count; i++)
         if (t->boundary[i]) MSXqual_removeSeg(t->boundary[i]);
-    MSXsegStorage_hybridAbortPreparedResidentMaterialization(&t->storage);
     if (t->boundary) memset(t->boundary, 0, (size_t)t->capacity * sizeof(*t->boundary));
     t->count = t->patchReserve = 0;
     t->active = 0;

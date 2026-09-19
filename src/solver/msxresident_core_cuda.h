@@ -18,6 +18,11 @@ typedef struct { uint32_t nLinks,totalSlots,speciesStride; const uint32_t *capac
    cOut/lastcOut contain itemCount rows with this caller-provided stride. */
 typedef struct { MSXResidentHandoffResult *meta; double *cOut,*lastcOut; uint32_t stride; } MSXResidentGpuFetchOutput;
 typedef struct { uint64_t activeCount,checksumXor,checksumSum,staleGeneration,epochMismatch,descriptorReject,capacityOverflow,fallbacks,handoffCount,capacityReject,generationReject,epochStale,fetchStale,cudaErrors,cudaPoisons; double activeVolume; uint32_t nanCount,infCount,errorCount,firstErrorSlot; } MSXResidentGpuReduction;
+/* Exact CUDA API copies made by a resident handoff fetch.  These counters are
+   intentionally separate from logical rows/events and are used by the
+   contract harness to prove that a multi-link selected batch is one H2D stage
+   upload plus one metadata/concentration/last-concentration D2H triplet. */
+typedef struct { uint64_t h2dBytes,h2dCalls,d2hBytes,d2hCalls; } MSXResidentGpuTransferStats;
 /* Phase 3B deliberately exposes no CUDA headers.  ``globalRow`` is the
    fixed row in the published resident span, never a Pseg or ring index. */
 typedef struct { uint32_t linkIndex,globalRow,generation; uint64_t descriptorEpoch; double volume; const double *hyd; } MSXResidentActiveItem;
@@ -44,8 +49,16 @@ MSXResidentStatus MSXresidentGpu_fetchHandoffs(MSXResidentGpu *, const MSXReside
    Items may belong to different links and boundary plans; the caller keeps
    the flat order when preparing per-link CPU transactions. */
 MSXResidentStatus MSXresidentGpu_fetchHandoffBatch(MSXResidentGpu *, const MSXResidentHandoffItem *, uint32_t, MSXResidentGpuFetchOutput *);
+MSXResidentStatus MSXresidentGpu_getTransferStats(const MSXResidentGpu *, MSXResidentGpuTransferStats *);
 /* massBySpecies has speciesStride entries (including index zero) supplied by caller. */
 MSXResidentStatus MSXresidentGpu_reduce(MSXResidentGpu *, double *massBySpecies, uint32_t massCount, MSXResidentGpuReduction *);
+/* Return one link's aggregate c*volume and volume from the same cached
+   reduction snapshot used by MSXresidentGpu_reduce. */
+MSXResidentStatus MSXresidentGpu_reduceLink(MSXResidentGpu *, uint32_t linkIndex,
+                                             double *massBySpecies,
+                                             uint32_t massCount,
+                                             double *volume,
+                                             MSXResidentGpuReduction *);
 /* Device 0 runtime primary context is established by open; Phase 3C calls
    MSXgpu_prepareResidentContext before open so driver and runtime share it.
    Preflight is all-or-nothing: no device write occurs on any reject.  The

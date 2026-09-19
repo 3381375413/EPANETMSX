@@ -18,6 +18,7 @@ typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; 
     double *c,*lastc; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
     uint32_t *offset; uint32_t itemCap, itemCount;
     double handoffPlanMs;
+    int auditPoisonCpuMirrors, auditAggregateFail;
     char status[96], resolvedCapacity[MAXFNAME]; } Runtime;
 static Runtime R;
 
@@ -50,6 +51,26 @@ static int fail(MSXResidentStatus s, const char *where)
    inert unless explicitly set by a test process. */
 static int initialFault(const char *point)
 { const char *v=getenv("MSX_RESIDENT_INIT_FAIL"); return v && point && !_stricmp(v,point); }
+/* The explicit audit seams are resolved once at Resident startup.  With no
+   switch, neither poison walks nor aggregate-failure branches are entered. */
+static int auditPoisonRequested(void)
+{ const char *v = getenv("MSX_RESIDENT_AUDIT_POISON_CPU_MIRRORS"); return v && !strcmp(v, "1"); }
+static int auditAggregateMode(void)
+{
+    const char *v = getenv("MSX_RESIDENT_AUDIT_FAIL_AGGREGATE");
+    if (!v) return 0;
+    if (!_stricmp(v, "link")) return 1;
+    if (!_stricmp(v, "total")) return 2;
+    return 0;
+}
+static int auditPoisonMirrors(const char *stage)
+{
+    MSXResidentStatus s = MSXresident_auditPoisonCpuMirrors();
+    if (s != MSX_RESIDENT_OK) return fail(s, stage);
+    if (MSXsegStorage_hybridAuditPoisonCoreMirrors())
+        return fail(MSX_RESIDENT_ERR_TRANSFER, stage);
+    return 0;
+}
 static int hasWall(void)
 { int m; for (m=1;m<=MSX.Nobjects[SPECIES];m++) if (MSX.Species[m].type == WALL) return 1; return 0; }
 static int absolutePath(const char *p)
@@ -115,6 +136,8 @@ int MSXresidentRuntime_preHybridInit(void)
     MSXResidentPatchBatch b; MSXResidentGpuOpen o; char actual[65];
     if (MSX.GpuCoreMode == MSX_RESIDENT_OFF) return 0;
     if (R.opened) return 0;
+    R.auditPoisonCpuMirrors = auditPoisonRequested();
+    R.auditAggregateFail = auditAggregateMode();
     if (!MSX.InpFileName[0]) return fail(MSX_RESIDENT_ERR_PATH,"missing_inp_path");
     if (!resolveCapacityPath(R.resolvedCapacity,MSX.GpuCoreCapacityFile,MSX.MsxFile.name))
         return fail(MSX_RESIDENT_ERR_PATH,"capacity_path");
@@ -175,6 +198,8 @@ int MSXresidentRuntime_afterHybridInit(void)
             return fail(MSX_RESIDENT_ERR_CAPACITY,"initial_cpu_commit");
         if ((s=MSXresident_commitInitialImage())!=MSX_RESIDENT_OK)
             return fail(s,"initial_metadata_commit");
+        if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_initial"))
+            return MSX.ErrCode;
         R.resident=1; R.dispatchReady=1; R.lastStatus=MSX_RESIDENT_OK;
         strcpy(R.status,"resident-react-ready-handoff-pending");
         return 0;
@@ -226,6 +251,11 @@ MSXResidentStatus MSXresidentRuntime_reduce(double *massBySpecies,
     if (!R.resident || !R.gpu) return MSX_RESIDENT_DISABLED;
     if (!massBySpecies || !reduction || massCount < R.stride)
         return MSX_RESIDENT_ERR_ARGUMENT;
+    if (R.auditAggregateFail == 2)
+    {
+        fail(MSX_RESIDENT_ERR_TRANSFER, "audit_aggregate_total");
+        return MSX_RESIDENT_ERR_TRANSFER;
+    }
     /* A transport step may have published a new Core/boundary split without
        reaching the outer flush point (notably the final quality step).  The
        consumer must never read a pre-patch aggregate. */
@@ -233,6 +263,95 @@ MSXResidentStatus MSXresidentRuntime_reduce(double *massBySpecies,
     s = MSXresidentGpu_reduce(R.gpu, massBySpecies, massCount, reduction);
     if (s != MSX_RESIDENT_OK) {
         fail(s, "aggregate_reduce");
+        return s;
+    }
+    return MSX_RESIDENT_OK;
+}
+
+MSXResidentStatus MSXresidentRuntime_reduceLink(uint32_t linkIndex,
+                                                double *massBySpecies,
+                                                uint32_t massCount,
+                                                double *volume,
+                                                MSXResidentGpuReduction *reduction)
+{
+    MSXResidentStatus s;
+    if (!R.resident || !R.gpu) return MSX_RESIDENT_DISABLED;
+    if (!massBySpecies || !volume || !reduction || massCount < R.stride ||
+        linkIndex == 0 || linkIndex > (uint32_t)MSX.Nobjects[LINK])
+        return MSX_RESIDENT_ERR_ARGUMENT;
+    if (R.auditAggregateFail == 1)
+    {
+        fail(MSX_RESIDENT_ERR_TRANSFER, "audit_aggregate_link");
+        return MSX_RESIDENT_ERR_TRANSFER;
+    }
+    if (MSXresidentRuntime_flushPatches()) return R.lastStatus;
+    s = MSXresidentGpu_reduceLink(R.gpu, linkIndex, massBySpecies,
+                                  massCount, volume, reduction);
+    if (s != MSX_RESIDENT_OK)
+    {
+        fail(s, "aggregate_link");
+        return s;
+    }
+    return MSX_RESIDENT_OK;
+}
+
+MSXResidentStatus MSXresidentRuntime_fetchSlot(uint32_t linkIndex,
+                                               uint64_t parcelId,
+                                               double *c, double *lastc,
+                                               uint32_t stride,
+                                               MSXResidentPayload *payload)
+{
+    MSXResidentStatus s;
+    MSXResidentHandoffResult result;
+    MSXResidentHandoffItem item;
+    uint32_t slot, generation;
+    uint64_t epoch;
+
+    if (!R.resident || !R.gpu) return MSX_RESIDENT_DISABLED;
+    if (!parcelId || !c || !lastc || !payload || stride < R.stride ||
+        linkIndex == 0 || linkIndex > (uint32_t)MSX.Nobjects[LINK])
+        return MSX_RESIDENT_ERR_ARGUMENT;
+    if (MSXresidentRuntime_flushPatches()) return R.lastStatus;
+    s = MSXresident_getSlotForParcel(linkIndex, parcelId, &slot, &generation);
+    if (s != MSX_RESIDENT_OK) return s;
+    s = MSXresident_getSlotIdentity(linkIndex, slot, &generation, NULL, &epoch);
+    if (s != MSX_RESIDENT_OK) return s;
+    memset(&item, 0, sizeof(item));
+    item.linkIndex = linkIndex;
+    item.slot = slot;
+    item.generation = generation;
+    item.pipeEpoch = epoch;
+    memset(&result, 0, sizeof(result));
+    s = MSXresidentRuntime_fetchBatch(&item, 1, c, lastc, stride, &result);
+    if (s != MSX_RESIDENT_OK) return s;
+    *payload = result.payload;
+    payload->c = c;
+    payload->lastc = lastc;
+    return MSX_RESIDENT_OK;
+}
+
+MSXResidentStatus MSXresidentRuntime_fetchBatch(
+    const MSXResidentHandoffItem *items, uint32_t count,
+    double *c, double *lastc, uint32_t stride,
+    MSXResidentHandoffResult *results)
+{
+    MSXResidentStatus s;
+    MSXResidentGpuFetchOutput f;
+
+    if (!R.resident || !R.gpu) return MSX_RESIDENT_DISABLED;
+    if ((!items && count) || (!c && count) || (!lastc && count) ||
+        (!results && count) || stride < R.stride || count > R.itemCap)
+        return MSX_RESIDENT_ERR_ARGUMENT;
+    if (MSXresidentRuntime_flushPatches()) return R.lastStatus;
+    memset(&f, 0, sizeof(f));
+    f.meta = results;
+    f.cOut = c;
+    f.lastcOut = lastc;
+    f.stride = stride;
+    s = MSXresidentGpu_fetchHandoffBatch(R.gpu, items, count, &f);
+    if (s != MSX_RESIDENT_OK)
+    {
+        fail(s, count > 1 ? "selected_fetch_batch" : "selected_fetch");
         return s;
     }
     return MSX_RESIDENT_OK;
@@ -273,7 +392,17 @@ static double handoffDisplacement(int k, double q, double dt, int *wholePipe)
     }
     return aq * dt;
 }
-static double boundaryVolume(int k){double v=0;Pseg s=MSX.FirstSeg[k];while(s&&!MSXsegStorage_isHybridCoreSegment(s)){v+=s->v;s=s->prev;}return v;}
+static double boundaryVolume(int k, uint32_t side)
+{
+    double v = 0.0;
+    Pseg s = side ? MSX.LastSeg[k] : MSX.FirstSeg[k];
+    while (s && !MSXsegStorage_isHybridCoreSegment(s))
+    {
+        v += s->v;
+        s = side ? s->next : s->prev;
+    }
+    return v;
+}
 static int materializePlan(int k, MSXResidentHandoffPlan *p)
 {
     MSXResidentGpuFetchOutput f;
@@ -344,26 +473,44 @@ int MSXresidentRuntime_beginStep(double dt)
     memset(R.fallback, 0, (size_t)MSX.Nobjects[LINK] + 1);
     memset(R.tx, 0, ((size_t)MSX.Nobjects[LINK] + 1) * sizeof(*R.tx));
     if (MSXresidentRuntime_flushPatches()) return MSX.ErrCode;
+    /* The transport consumers require both physical endpoints to be CPU
+       Boundary-readable.  Resolve short-Core/zero-flow/reverse cases before
+       building the handoff plan, then publish any staged demotions once. */
+    for (k = 1; k <= (uint32_t)MSX.Nobjects[LINK]; k++)
+    {
+        if (!MSXsegStorage_isHybridLink((int)k)) continue;
+        if (MSXsegStorage_hybridEnsureEndpointBoundary((int)k, 0) ||
+            MSXsegStorage_hybridEnsureEndpointBoundary((int)k, 1))
+            return MSX.ErrCode ? MSX.ErrCode :
+                   ERR_GPU_KERNEL_RUNTIME_ERROR;
+    }
+    if (MSXresidentRuntime_flushPatches()) return MSX.ErrCode;
     handoffDetail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF);
     if (handoffDetail) planTimer = MSXgpu_wallTimeMs();
     for (k = 1; k <= (uint32_t)MSX.Nobjects[LINK]; k++)
     {
         int wholePipe;
+        /* The segment list is re-oriented by flowdirchanged() before this
+           hook, so FirstSeg is always the transport-leading endpoint.  The
+           resident ring follows that same physical order; choosing by the
+           sign of Q here would hand off the trailing endpoint on reverse
+           flow and leave a Core row exposed to evalnodeinflow(). */
+        uint32_t side = 0u;
         double displacement = handoffDisplacement((int)k, MSX.Q[k], dt, &wholePipe);
         R.offset[k] = off;
         z = wholePipe ?
-            MSXresident_planAllHandoffInto(k, 0, R.item + off, R.itemCap - off, &R.plan[k]) :
-            MSXresident_planHandoffInto(k, displacement, 1.0, 0,
-                                        boundaryVolume((int)k), MSX.GpuStrict,
+            MSXresident_planAllHandoffInto(k, side, R.item + off, R.itemCap - off, &R.plan[k]) :
+            MSXresident_planHandoffInto(k, displacement, 1.0, side,
+                                        boundaryVolume((int)k, side), MSX.GpuStrict,
                                         R.item + off, R.itemCap - off, &R.plan[k]);
         /* A request can consume the complete resident Core before it reaches
            LINKVOL because the two CPU boundary bands are not resident. */
         if (z == MSX_RESIDENT_ERR_CAPACITY)
-            z = MSXresident_planAllHandoffInto(k, 0, R.item + off,
+            z = MSXresident_planAllHandoffInto(k, side, R.item + off,
                                                R.itemCap - off, &R.plan[k]);
         if (z == MSX_RESIDENT_FALLBACK_WHOLE_LINK)
         {
-            z = MSXresident_planAllHandoffInto(k, 0, R.item + off,
+            z = MSXresident_planAllHandoffInto(k, side, R.item + off,
                                                R.itemCap - off, &R.plan[k]);
             if (z != MSX_RESIDENT_OK) return fail(z, "fallback_plan_all");
             R.fallback[k] = 1;
@@ -497,6 +644,15 @@ int MSXresidentRuntime_reactCore(double dt)
         MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_IDENTITY_FILTER, filterMs);
         MSX.GpuTimingRecord.resident_enumerate_filter_ms += filterMs;
     }
+    /* Resident enumeration is the complete published active image.  In a
+       Hybrid resident step every enumerated row must map to its exact dense
+       Core slot; silently dropping an identity would make that parcel skip
+       GPU reaction and violate the one-reaction-per-row invariant. */
+    if (active != n)
+    {
+        R.dispatchReady = 0;
+        return fail(MSX_RESIDENT_ERR_GENERATION, "active_identity_filter");
+    }
     memset(&out,0,sizeof(out));
     if (stage)
         MSX.GpuTimingRecord.resident_active_rows += active;
@@ -539,6 +695,8 @@ int MSXresidentRuntime_reactCore(double dt)
     }
     if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_DENSE_APPLY,
                                       MSXgpu_wallTimeMs()-phaseStart);
+    if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_dense_apply"))
+        return MSX.ErrCode;
     if(!out.reacted || out.reactedStride<(uint32_t)MSX.Nobjects[SPECIES]+1 || out.reactedLinkCount<(uint32_t)MSX.Nobjects[LINK]+1){R.dispatchReady=0;return fail(MSX_RESIDENT_ERR_TRANSFER,"react_result");}
     phaseStart = stage ? MSXgpu_wallTimeMs() : 0.0;
     for(i=1;i<=MSX.Nobjects[LINK];i++) for(m=1;m<=MSX.Nobjects[SPECIES];m++) MSX.Link[i].reacted[m]+=out.reacted[(size_t)i*out.reactedStride+m];

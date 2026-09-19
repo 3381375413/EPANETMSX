@@ -5,6 +5,9 @@
 #include <math.h>
 #include <limits.h>
 #include "msxresident_core_cuda.h"
+/* Keep the implementation body private so the exported wrapper can reject
+   duplicate endpoint selections before any CUDA staging or synchronization. */
+#define MSXresidentGpu_fetchHandoffBatch MSXresidentGpu_fetchHandoffBatch_impl
 extern "C" void MSXgpu_profileRecordAggregate(uint64_t queries,uint64_t cacheHits,uint64_t rebuilds);
 #if defined(EPANETMSX_CUDA_ENABLED)
 extern "C" int MSXgpu_profileDetailEnabled(void);
@@ -36,14 +39,28 @@ static void MSXgpu_profileRecordTransfer(int direction,int scope,uint64_t bytes,
 typedef struct { uint32_t link,capacity,head,tail,count; int32_t orient; uint64_t epoch; } DDesc;
 typedef struct { uint32_t link; DDesc descriptor; } DDescStage;
 typedef struct { uint32_t link,row,generation,used,kind,payloadRow; uint64_t id; double v,h,hr,ur,dr; } Stage;
-struct MSXResidentGpu { uint32_t n,slots,owned,stride,activeCount; int device,uploaded,poisoned,activePrepared,diagnostic,aggregateValid; uint64_t stateVersion,aggregateVersion; uint32_t *cap,*base,*hu,*hg,*haPipe,*haRow,*haGen,*haNf,*haNj,*haNa,*haNr,*daPipe,*daRow,*daNf,*daNj,*daNa,*daNr,*dBase; int *haErr,*daErr,*dError; uint64_t *he,*hi,*haEpoch; DDesc *hd,*dd; DDescStage *hPatchDesc,*dPatchDesc; Stage *hPatch,*hGather,*dPatchStage,*dGatherStage; double *hPatchC,*hPatchL,*hGatherC,*hGatherL,*dPatchC,*dPatchL,*dGatherC,*dGatherL,*haVol,*haHyd,*haH,*haLast,*haReacted,*daVol,*daHyd,*daH,*daLast,*daReacted; uint32_t *du,*dg; uint64_t *di; double *dv,*dh,*dhr,*dur,*ddr,*dc,*dl,*dmass; MSXResidentGpuReduction *dred,*hAggLink,*dAggLink, c,aggregate; double *hAggMass,*dAggMass,*aggregateMass; };
-static cudaError_t trackedCopy(void *dst,const void *src,size_t bytes,
-                               cudaMemcpyKind kind,int direction,int scope)
+struct MSXResidentGpu { uint32_t n,slots,owned,stride,activeCount; int device,uploaded,poisoned,activePrepared,diagnostic,aggregateValid; uint64_t stateVersion,aggregateVersion; uint64_t handoffH2DBytes,handoffH2DCalls,handoffD2HBytes,handoffD2HCalls; uint64_t *fetchSeen; uint64_t fetchStamp; uint32_t *cap,*base,*hu,*hg,*haPipe,*haRow,*haGen,*haNf,*haNj,*haNa,*haNr,*daPipe,*daRow,*daNf,*daNj,*daNa,*daNr,*dBase; int *haErr,*daErr,*dError; uint64_t *he,*hi,*haEpoch; DDesc *hd,*dd; DDescStage *hPatchDesc,*dPatchDesc; Stage *hPatch,*hGather,*dPatchStage,*dGatherStage; double *hPatchC,*hPatchL,*hGatherC,*hGatherL,*dPatchC,*dPatchL,*dGatherC,*dGatherL,*haVol,*haHyd,*haH,*haLast,*haReacted,*daVol,*daHyd,*daH,*daLast,*daReacted; uint32_t *du,*dg; uint64_t *di; double *dv,*dh,*dhr,*dur,*ddr,*dc,*dl,*dmass; MSXResidentGpuReduction *dred,*hAggLink,*dAggLink, c,aggregate; double *hAggMass,*dAggMass,*aggregateMass; };
+static cudaError_t trackedCopy(MSXResidentGpu *g,void *dst,const void *src,
+                               size_t bytes,cudaMemcpyKind kind,int direction,
+                               int scope)
 {
     double start = 0.0;
     int timed = MSXgpu_profileDetailEnabled();
     if (timed) start = MSXgpu_wallTimeMs();
     cudaError_t e = cudaMemcpy(dst,src,bytes,kind);
+    if (g && scope == MSX_PROFILE_TRANSFER_SCOPE_HANDOFF)
+    {
+        if (direction == MSX_PROFILE_TRANSFER_H2D)
+        {
+            g->handoffH2DBytes += (uint64_t)bytes;
+            g->handoffH2DCalls++;
+        }
+        else if (direction == MSX_PROFILE_TRANSFER_D2H)
+        {
+            g->handoffD2HBytes += (uint64_t)bytes;
+            g->handoffD2HCalls++;
+        }
+    }
     if (timed)
         MSXgpu_profileRecordTransfer(direction,scope,(uint64_t)bytes,
                                      MSXgpu_wallTimeMs()-start);
@@ -82,16 +99,16 @@ static int copyScope(MSXResidentGpu *g,const void *dst,const void *src,
     return MSX_PROFILE_TRANSFER_SCOPE_OTHER;
 }
 #define cudaMemcpy(dst,src,bytes,kind) \
-    trackedCopy((dst),(src),(bytes),(kind), \
+    trackedCopy((MSXResidentGpu *)g,(dst),(src),(bytes),(kind), \
         ((kind) == cudaMemcpyHostToDevice ? MSX_PROFILE_TRANSFER_H2D : MSX_PROFILE_TRANSFER_D2H), \
         copyScope((MSXResidentGpu *)g,(dst),(src),(kind)) )
 typedef enum { V_OK,V_DESCRIPTOR,V_CAPACITY,V_GENERATION,V_EPOCH } VStatus;
 static int ck(cudaError_t e){return e==cudaSuccess;} static int mul(size_t a,size_t b,size_t*r){if(a&&b>SIZE_MAX/a)return 0;*r=a*b;return 1;} static int da(void**p,size_t n){return ck(cudaMalloc(p,n));}
 static int use(MSXResidentGpu*g){int now=-1;return g&&ck(cudaGetDevice(&now))&&((now==g->device)||ck(cudaSetDevice(g->device)));}
 static MSXResidentStatus badgpu(MSXResidentGpu*g,MSXResidentStatus s){if(g){g->c.cudaErrors++;if(!g->poisoned)g->c.cudaPoisons++;g->poisoned=1;g->activePrepared=0;}return s;}
-static void gone(MSXResidentGpu*g){if(!g)return;cudaFree(g->dd);cudaFree(g->dPatchDesc);cudaFree(g->dPatchStage);cudaFree(g->dGatherStage);cudaFree(g->dPatchC);cudaFree(g->dPatchL);cudaFree(g->dGatherC);cudaFree(g->dGatherL);cudaFree(g->du);cudaFree(g->dg);cudaFree(g->di);cudaFree(g->dv);cudaFree(g->dh);cudaFree(g->dhr);cudaFree(g->dur);cudaFree(g->ddr);cudaFree(g->dc);cudaFree(g->dl);cudaFree(g->dmass);cudaFree(g->dred);cudaFree(g->dAggLink);cudaFree(g->dAggMass);cudaFree(g->dBase);cudaFree(g->dError);cudaFree(g->daPipe);cudaFree(g->daRow);cudaFree(g->daVol);cudaFree(g->daHyd);cudaFree(g->daH);cudaFree(g->daNf);cudaFree(g->daNj);cudaFree(g->daNa);cudaFree(g->daNr);cudaFree(g->daErr);cudaFree(g->daLast);cudaFree(g->daReacted);cudaFreeHost(g->hd);cudaFreeHost(g->hPatchDesc);cudaFreeHost(g->hPatch);cudaFreeHost(g->hGather);cudaFreeHost(g->hPatchC);cudaFreeHost(g->hPatchL);cudaFreeHost(g->hGatherC);cudaFreeHost(g->hGatherL);free(g->cap);free(g->base);free(g->hu);free(g->hg);free(g->he);free(g->hi);free(g->haPipe);free(g->haRow);free(g->haGen);free(g->haNf);free(g->haNj);free(g->haNa);free(g->haNr);free(g->haErr);free(g->haEpoch);free(g->haVol);free(g->haHyd);free(g->haH);free(g->haLast);free(g->haReacted);free(g->hAggLink);free(g->hAggMass);free(g->aggregateMass);free(g);}
+static void gone(MSXResidentGpu*g){if(!g)return;cudaFree(g->dd);cudaFree(g->dPatchDesc);cudaFree(g->dPatchStage);cudaFree(g->dGatherStage);cudaFree(g->dPatchC);cudaFree(g->dPatchL);cudaFree(g->dGatherC);cudaFree(g->dGatherL);cudaFree(g->du);cudaFree(g->dg);cudaFree(g->di);cudaFree(g->dv);cudaFree(g->dh);cudaFree(g->dhr);cudaFree(g->dur);cudaFree(g->ddr);cudaFree(g->dc);cudaFree(g->dl);cudaFree(g->dmass);cudaFree(g->dred);cudaFree(g->dAggLink);cudaFree(g->dAggMass);cudaFree(g->dBase);cudaFree(g->dError);cudaFree(g->daPipe);cudaFree(g->daRow);cudaFree(g->daVol);cudaFree(g->daHyd);cudaFree(g->daH);cudaFree(g->daNf);cudaFree(g->daNj);cudaFree(g->daNa);cudaFree(g->daNr);cudaFree(g->daErr);cudaFree(g->daLast);cudaFree(g->daReacted);cudaFreeHost(g->hd);cudaFreeHost(g->hPatchDesc);cudaFreeHost(g->hPatch);cudaFreeHost(g->hGather);cudaFreeHost(g->hPatchC);cudaFreeHost(g->hPatchL);cudaFreeHost(g->hGatherC);cudaFreeHost(g->hGatherL);free(g->cap);free(g->base);free(g->hu);free(g->hg);free(g->he);free(g->hi);free(g->fetchSeen);free(g->haPipe);free(g->haRow);free(g->haGen);free(g->haNf);free(g->haNj);free(g->haNa);free(g->haNr);free(g->haErr);free(g->haEpoch);free(g->haVol);free(g->haHyd);free(g->haH);free(g->haLast);free(g->haReacted);free(g->hAggLink);free(g->hAggMass);free(g->aggregateMass);free(g);}
 extern "C" int MSXresidentGpu_isEnabled(void){return 1;}
-extern "C" MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen*o,MSXResidentGpu**out){MSXResidentGpu*g;size_t lb,rb,owned=0;if(!out||*out||!o||!o->nLinks||!o->totalSlots||!o->speciesStride||!o->capacity||!o->base)return MSX_RESIDENT_ERR_ARGUMENT;if(!ck(cudaSetDevice(0))||!ck(cudaFree(0)))return MSX_RESIDENT_ERR_GPU;if(!mul((size_t)o->nLinks+1,sizeof(uint32_t),&lb)||!mul((size_t)o->totalSlots,o->speciesStride,&rb)||!mul(rb,sizeof(double),&rb))return MSX_RESIDENT_ERR_OVERFLOW;for(uint32_t k=1;k<=o->nLinks;k++){if(!o->capacity[k]||o->base[k]>o->totalSlots||o->capacity[k]>o->totalSlots-o->base[k]||owned>o->totalSlots-o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;owned+=o->capacity[k];for(uint32_t q=1;q<k;q++)if(o->base[k]<o->base[q]+o->capacity[q]&&o->base[q]<o->base[k]+o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;}g=(MSXResidentGpu*)calloc(1,sizeof(*g));if(!g)return MSX_RESIDENT_ERR_MEMORY;g->device=0;g->n=o->nLinks;g->slots=o->totalSlots;g->owned=(uint32_t)owned;g->stride=o->speciesStride;g->cap=(uint32_t*)calloc(g->n+1,sizeof(uint32_t));g->base=(uint32_t*)calloc(g->n+1,sizeof(uint32_t));g->hu=(uint32_t*)calloc(g->slots,sizeof(uint32_t));g->hg=(uint32_t*)calloc(g->slots,sizeof(uint32_t));g->he=(uint64_t*)calloc(g->n+1,sizeof(uint64_t));g->hi=(uint64_t*)calloc(g->slots,sizeof(uint64_t));if(!g->cap||!g->base||!g->hu||!g->hg||!g->he||!g->hi)goto mem;memcpy(g->cap,o->capacity,lb);memcpy(g->base,o->base,lb);if(!ck(cudaHostAlloc(&g->hd,((size_t)g->n+1)*sizeof(DDesc),0))||!ck(cudaHostAlloc(&g->hPatch,(size_t)g->slots*sizeof(Stage),0))||!ck(cudaHostAlloc(&g->hGather,(size_t)g->slots*sizeof(Stage),0))||!ck(cudaHostAlloc(&g->hPatchC,rb,0))||!ck(cudaHostAlloc(&g->hPatchL,rb,0))||!ck(cudaHostAlloc(&g->hGatherC,rb,0))||!ck(cudaHostAlloc(&g->hGatherL,rb,0)))goto mem;
+extern "C" MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen*o,MSXResidentGpu**out){MSXResidentGpu*g;size_t lb,rb,owned=0;if(!out||*out||!o||!o->nLinks||!o->totalSlots||!o->speciesStride||!o->capacity||!o->base)return MSX_RESIDENT_ERR_ARGUMENT;if(!ck(cudaSetDevice(0))||!ck(cudaFree(0)))return MSX_RESIDENT_ERR_GPU;if(!mul((size_t)o->nLinks+1,sizeof(uint32_t),&lb)||!mul((size_t)o->totalSlots,o->speciesStride,&rb)||!mul(rb,sizeof(double),&rb))return MSX_RESIDENT_ERR_OVERFLOW;for(uint32_t k=1;k<=o->nLinks;k++){if(!o->capacity[k]||o->base[k]>o->totalSlots||o->capacity[k]>o->totalSlots-o->base[k]||owned>o->totalSlots-o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;owned+=o->capacity[k];for(uint32_t q=1;q<k;q++)if(o->base[k]<o->base[q]+o->capacity[q]&&o->base[q]<o->base[k]+o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;}g=(MSXResidentGpu*)calloc(1,sizeof(*g));if(!g)return MSX_RESIDENT_ERR_MEMORY;g->device=0;g->n=o->nLinks;g->slots=o->totalSlots;g->owned=(uint32_t)owned;g->stride=o->speciesStride;g->cap=(uint32_t*)calloc(g->n+1,sizeof(uint32_t));g->base=(uint32_t*)calloc(g->n+1,sizeof(uint32_t));g->hu=(uint32_t*)calloc(g->slots,sizeof(uint32_t));g->hg=(uint32_t*)calloc(g->slots,sizeof(uint32_t));g->he=(uint64_t*)calloc(g->n+1,sizeof(uint64_t));g->hi=(uint64_t*)calloc(g->slots,sizeof(uint64_t));g->fetchSeen=(uint64_t*)calloc(g->slots,sizeof(uint64_t));if(!g->cap||!g->base||!g->hu||!g->hg||!g->he||!g->hi||!g->fetchSeen)goto mem;memcpy(g->cap,o->capacity,lb);memcpy(g->base,o->base,lb);if(!ck(cudaHostAlloc(&g->hd,((size_t)g->n+1)*sizeof(DDesc),0))||!ck(cudaHostAlloc(&g->hPatch,(size_t)g->slots*sizeof(Stage),0))||!ck(cudaHostAlloc(&g->hGather,(size_t)g->slots*sizeof(Stage),0))||!ck(cudaHostAlloc(&g->hPatchC,rb,0))||!ck(cudaHostAlloc(&g->hPatchL,rb,0))||!ck(cudaHostAlloc(&g->hGatherC,rb,0))||!ck(cudaHostAlloc(&g->hGatherL,rb,0)))goto mem;
 if(!ck(cudaHostAlloc(&g->hPatchDesc,(size_t)g->n*sizeof(DDescStage),0)))goto mem;
 #define A(x,n) if(!da((void**)&g->x,n))goto mem
 A(dPatchDesc,(size_t)g->n*sizeof(DDescStage));
@@ -359,15 +376,15 @@ static MSXResidentStatus patch(MSXResidentGpu*g,const MSXResidentPatchBatch*b,in
         }
     }
     if (b->slotCount &&
-        !ck(trackedCopy(g->dPatchStage,g->hPatch,(size_t)b->slotCount*sizeof(Stage),
+        !ck(trackedCopy(g,g->dPatchStage,g->hPatch,(size_t)b->slotCount*sizeof(Stage),
                         cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,
                         MSX_PROFILE_TRANSFER_SCOPE_PATCH_STAGE)))
         return badgpu(g, MSX_RESIDENT_ERR_TRANSFER);
     if (payloadCount &&
-        (!ck(trackedCopy(g->dPatchC,g->hPatchC,(size_t)payloadCount*g->stride*sizeof(double),
+        (!ck(trackedCopy(g,g->dPatchC,g->hPatchC,(size_t)payloadCount*g->stride*sizeof(double),
                          cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,
                          MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD)) ||
-         !ck(trackedCopy(g->dPatchL,g->hPatchL,(size_t)payloadCount*g->stride*sizeof(double),
+         !ck(trackedCopy(g,g->dPatchL,g->hPatchL,(size_t)payloadCount*g->stride*sizeof(double),
                          cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,
                          MSX_PROFILE_TRANSFER_SCOPE_PATCH_PAYLOAD))))
         return badgpu(g, MSX_RESIDENT_ERR_TRANSFER);
@@ -380,7 +397,7 @@ static MSXResidentStatus patch(MSXResidentGpu*g,const MSXResidentPatchBatch*b,in
             return badgpu(g, MSX_RESIDENT_ERR_GPU);
     }
     if (b->descriptorCount &&
-        !ck(trackedCopy(g->dPatchDesc, g->hPatchDesc,
+        !ck(trackedCopy(g,g->dPatchDesc, g->hPatchDesc,
                         (size_t)b->descriptorCount * sizeof(DDescStage),
                         cudaMemcpyHostToDevice, MSX_PROFILE_TRANSFER_H2D,
                         MSX_PROFILE_TRANSFER_SCOPE_PATCH_DESCRIPTOR)))
@@ -407,6 +424,7 @@ extern "C" MSXResidentStatus MSXresidentGpu_fetchHandoffBatch(MSXResidentGpu*g,c
 extern "C" MSXResidentStatus MSXresidentGpu_fetchHandoffs(MSXResidentGpu*g,const MSXResidentHandoffPlan*p,MSXResidentGpuFetchOutput*out,uint32_t n){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g||g->poisoned)return MSX_RESIDENT_ERR_POISONED;if(!p||!out||n!=p->itemCount||(!p->item&&n)||(!out->meta&&n)||(!out->cOut&&n)||(!out->lastcOut&&n)||out->stride<g->stride||!g->uploaded)return MSX_RESIDENT_ERR_ARGUMENT;for(uint32_t i=0;i<n;i++){const MSXResidentHandoffItem*x=&p->item[i];if(x->linkIndex!=p->linkIndex||x->boundarySide!=p->boundarySide||x->pipeEpoch!=p->pipeEpoch){g->c.fetchStale++;return MSX_RESIDENT_ERR_GENERATION;}}return MSXresidentGpu_fetchHandoffBatch(g,p->item,n,out);}
 static MSXResidentStatus aggregateCurrent(MSXResidentGpu*g,double*m,uint32_t count,MSXResidentGpuReduction*r){MSXResidentGpuReduction z;uint32_t k,j;if(g->aggregateValid&&g->aggregateVersion==g->stateVersion){memcpy(m,g->aggregateMass,(size_t)g->stride*sizeof(double));*r=g->aggregate;MSXgpu_profileRecordAggregate(1,1,0);return MSX_RESIDENT_OK;}memset(&z,0,sizeof(z));memset(g->aggregateMass,0,(size_t)g->stride*sizeof(double));z.firstErrorSlot=UINT_MAX;if(!ck(cudaMemset(g->dAggMass,0,((size_t)g->n+1)*g->stride*sizeof(double))))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);redLink<<<g->n,MSX_RESIDENT_RED_THREADS,MSX_RESIDENT_RED_THREADS*(sizeof(MSXResidentGpuReduction)+MSX_RESIDENT_MASS_TILE*sizeof(double))>>>(g->n,g->stride,g->dd,g->dBase,g->du,g->di,g->dg,g->dv,g->dc,g->dAggLink,g->dAggMass);if(!ck(cudaGetLastError())||!ck(cudaDeviceSynchronize())||!ck(cudaMemcpy(g->hAggLink,g->dAggLink,((size_t)g->n+1)*sizeof(MSXResidentGpuReduction),cudaMemcpyDeviceToHost))||!ck(cudaMemcpy(g->hAggMass,g->dAggMass,((size_t)g->n+1)*g->stride*sizeof(double),cudaMemcpyDeviceToHost)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);for(k=1;k<=g->n;k++){MSXResidentGpuReduction*q=&g->hAggLink[k];z.activeCount+=q->activeCount;z.activeVolume+=q->activeVolume;z.checksumXor^=q->checksumXor;z.checksumSum+=q->checksumSum;z.nanCount+=q->nanCount;z.infCount+=q->infCount;z.errorCount+=q->errorCount;if(q->firstErrorSlot!=UINT_MAX&&(z.firstErrorSlot==UINT_MAX||q->firstErrorSlot<z.firstErrorSlot))z.firstErrorSlot=q->firstErrorSlot;for(j=0;j<g->stride;j++)g->aggregateMass[j]+=g->hAggMass[(size_t)k*g->stride+j];}z.staleGeneration=g->c.staleGeneration;z.epochMismatch=g->c.epochMismatch;z.descriptorReject=g->c.descriptorReject;z.capacityOverflow=g->c.capacityOverflow;z.fallbacks=g->c.fallbacks;z.handoffCount=g->c.handoffCount;z.capacityReject=g->c.capacityReject;z.generationReject=g->c.generationReject;z.epochStale=g->c.epochStale;z.fetchStale=g->c.fetchStale;z.cudaErrors=g->c.cudaErrors;z.cudaPoisons=g->c.cudaPoisons;g->aggregate=z;g->aggregateVersion=g->stateVersion;g->aggregateValid=1;memcpy(m,g->aggregateMass,(size_t)g->stride*sizeof(double));*r=z;MSXgpu_profileRecordAggregate(1,0,1);return MSX_RESIDENT_OK;}
 extern "C" MSXResidentStatus MSXresidentGpu_reduce(MSXResidentGpu*g,double*m,uint32_t count,MSXResidentGpuReduction*r){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g||g->poisoned)return MSX_RESIDENT_ERR_POISONED;if(!m||!r||count<g->stride||!g->uploaded)return MSX_RESIDENT_ERR_ARGUMENT;return aggregateCurrent(g,m,count,r);}extern "C" void MSXresidentGpu_close(MSXResidentGpu*g){if(g)cudaSetDevice(g->device);gone(g);}
+extern "C" MSXResidentStatus MSXresidentGpu_reduceLink(MSXResidentGpu*g,uint32_t link,double*m,uint32_t count,double*volume,MSXResidentGpuReduction*r){MSXResidentGpuReduction total;MSXResidentStatus status;if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g||g->poisoned)return MSX_RESIDENT_ERR_POISONED;if(!m||!volume||!r||link<1||link>g->n||count<g->stride||!g->uploaded)return MSX_RESIDENT_ERR_ARGUMENT;status=aggregateCurrent(g,g->aggregateMass,g->stride,&total);if(status!=MSX_RESIDENT_OK)return status;memcpy(m,g->hAggMass+(size_t)link*g->stride,(size_t)g->stride*sizeof(double));*volume=g->hAggLink[link].activeVolume;*r=g->hAggLink[link];r->staleGeneration=g->c.staleGeneration;r->epochMismatch=g->c.epochMismatch;r->descriptorReject=g->c.descriptorReject;r->capacityOverflow=g->c.capacityOverflow;r->fallbacks=g->c.fallbacks;r->handoffCount=g->c.handoffCount;r->capacityReject=g->c.capacityReject;r->generationReject=g->c.generationReject;r->epochStale=g->c.epochStale;r->fetchStale=g->c.fetchStale;r->cudaErrors=g->c.cudaErrors;r->cudaPoisons=g->c.cudaPoisons;return MSX_RESIDENT_OK;}
 __global__ static void activeGather(const uint32_t *row,uint32_t n,const double *src,double *dst){uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dst[i]=src[row[i]];}
 __global__ static void activeScatter(const uint32_t *row,uint32_t n,const double *src,double *dst){uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dst[row[i]]=src[i];}
 /* Error propagation is a required completion result, not optional
@@ -432,14 +450,14 @@ extern "C" MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu*g,MSXResid
         {g->c.staleGeneration++;return MSX_RESIDENT_ERR_GENERATION;}
         g->hGather[i]={k,row,g->haGen[i],1,0,0,0,0,0,0};
     }
-    if(n&&!ck(trackedCopy(g->dGatherStage,g->hGather,(size_t)n*sizeof(Stage),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);
+    if(n&&!ck(trackedCopy(g,g->dGatherStage,g->hGather,(size_t)n*sizeof(Stage),cudaMemcpyHostToDevice,MSX_PROFILE_TRANSFER_H2D,MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);
     if(n)
     {
         gather<<<(n+255)/256,256>>>(g->dGatherStage,n,g->stride,g->du,g->dg,g->di,g->dv,g->dh,g->dhr,g->dur,g->ddr,g->dc,g->dl,g->dGatherStage,g->dGatherC,g->dGatherL);
         if(!ck(cudaGetLastError())||!ck(cudaDeviceSynchronize())||
-           !ck(trackedCopy(g->hGather,g->dGatherStage,(size_t)n*sizeof(Stage),cudaMemcpyDeviceToHost,MSX_PROFILE_TRANSFER_D2H,MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC))||
-           !ck(trackedCopy(g->hGatherC,g->dGatherC,(size_t)n*g->stride*sizeof(double),cudaMemcpyDeviceToHost,MSX_PROFILE_TRANSFER_D2H,MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC))||
-           !ck(trackedCopy(g->hGatherL,g->dGatherL,(size_t)n*g->stride*sizeof(double),cudaMemcpyDeviceToHost,MSX_PROFILE_TRANSFER_D2H,MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);
+           !ck(trackedCopy(g,g->hGather,g->dGatherStage,(size_t)n*sizeof(Stage),cudaMemcpyDeviceToHost,MSX_PROFILE_TRANSFER_D2H,MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC))||
+           !ck(trackedCopy(g,g->hGatherC,g->dGatherC,(size_t)n*g->stride*sizeof(double),cudaMemcpyDeviceToHost,MSX_PROFILE_TRANSFER_D2H,MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC))||
+           !ck(trackedCopy(g,g->hGatherL,g->dGatherL,(size_t)n*g->stride*sizeof(double),cudaMemcpyDeviceToHost,MSX_PROFILE_TRANSFER_D2H,MSX_PROFILE_TRANSFER_SCOPE_FULL_SYNC)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);
     }
     for(i=0;i<n;i++)
     {
@@ -449,6 +467,55 @@ extern "C" MSXResidentStatus MSXresidentGpu_syncActive(MSXResidentGpu*g,MSXResid
         memcpy(out->cOut+(size_t)i*out->stride,g->hGatherC+(size_t)i*g->stride,g->stride*sizeof(double));
         memcpy(out->lastcOut+(size_t)i*out->stride,g->hGatherL+(size_t)i*g->stride,g->stride*sizeof(double));
     }
+    return MSX_RESIDENT_OK;
+}
+#undef MSXresidentGpu_fetchHandoffBatch
+/* Validate duplicate global rows without comparing every pair.  The stamp
+   table is sized once with the resident pool and re-used for each batch, so
+   normal batches are O(n) and old marks never need a full-capacity clear. */
+static int duplicateFetchItem(MSXResidentGpu *g,
+                              const MSXResidentHandoffItem *items,
+                              uint32_t n)
+{
+    uint64_t stamp;
+    uint32_t i;
+    if (!g || (!items && n) || !g->fetchSeen) return 0;
+    stamp = ++g->fetchStamp;
+    if (!stamp)
+    {
+        memset(g->fetchSeen, 0, (size_t)g->slots * sizeof(*g->fetchSeen));
+        stamp = ++g->fetchStamp;
+    }
+    for (i = 0; i < n; ++i)
+    {
+        const MSXResidentHandoffItem *item = &items[i];
+        uint32_t row;
+        /* Leave bounds, side, epoch, generation, and payload validation to
+           the implementation body so invalid input keeps its old status. */
+        if (item->linkIndex < 1 || item->linkIndex > g->n ||
+            item->slot >= g->cap[item->linkIndex])
+            continue;
+        row = g->base[item->linkIndex] + item->slot;
+        if (g->fetchSeen[row] == stamp) return 1;
+        g->fetchSeen[row] = stamp;
+    }
+    return 0;
+}
+extern "C" MSXResidentStatus MSXresidentGpu_fetchHandoffBatch(
+    MSXResidentGpu *g, const MSXResidentHandoffItem *items, uint32_t n,
+    MSXResidentGpuFetchOutput *out)
+{
+    if (g && duplicateFetchItem(g, items, n)) return MSX_RESIDENT_ERR_ARGUMENT;
+    return MSXresidentGpu_fetchHandoffBatch_impl(g, items, n, out);
+}
+extern "C" MSXResidentStatus MSXresidentGpu_getTransferStats(const MSXResidentGpu *g,
+                                                              MSXResidentGpuTransferStats *out)
+{
+    if (!g || !out) return MSX_RESIDENT_ERR_ARGUMENT;
+    out->h2dBytes = g->handoffH2DBytes;
+    out->h2dCalls = g->handoffH2DCalls;
+    out->d2hBytes = g->handoffD2HBytes;
+    out->d2hCalls = g->handoffD2HCalls;
     return MSX_RESIDENT_OK;
 }
 extern "C" MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu*g){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(!g->activePrepared)return g->poisoned?MSX_RESIDENT_ERR_POISONED:MSX_RESIDENT_OK;return badgpu(g,MSX_RESIDENT_ERR_GPU);}

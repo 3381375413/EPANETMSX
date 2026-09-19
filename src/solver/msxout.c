@@ -31,6 +31,7 @@ static long  LinkBytesPerPeriod;       // Bytes per time period used by all link
 //--------------------
 double MSXqual_getNodeQual(int j, int m);
 double MSXqual_getLinkQual(int k, int m);
+int MSXqual_getLinkQualChecked(int k, int m, double *value);
 
 //  Exported functions
 //--------------------
@@ -165,7 +166,10 @@ int MSXout_saveResults()
     {
         for (j=1; j<=MSX.Nobjects[LINK]; j++)
         {
-            x = (REAL4)MSXqual_getLinkQual(j, m);
+            double value;
+            int status = MSXqual_getLinkQualChecked(j, m, &value);
+            if (status) return status;
+            x = (REAL4)value;
             fwrite(&x, sizeof(REAL4), 1, MSX.TmpOutFile.file);
         }
     }

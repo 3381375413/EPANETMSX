@@ -79,6 +79,7 @@ int    MSXqual_step(double *t, double *tleft);
 int    MSXqual_close(void);
 double MSXqual_getNodeQual(int j, int m);
 double MSXqual_getLinkQual(int k, int m);
+int    MSXqual_getLinkQualChecked(int k, int m, double *value);
 int    MSXqual_isSame(double c1[], double c2[]);
 void   MSXqual_removeSeg(Pseg seg);
 Pseg   MSXqual_getFreeSeg(double v, double c[]);
@@ -104,11 +105,12 @@ static void   removeAllSegs(int k);
 static void topological_transport(double dt);
 static void findnodequal(int n, double volin, double* massin, double volout, double tstep);
 static void noflowqual(int n);
+static int addNoflowEndpoint(int k, Pseg seg, double *sum);
 static void evalnodeinflow(int, double, double*, double*);
 static void evalnodeoutflow(int k, double* upnodequal, double tstep);
 static int sortNodes();
 static int selectnonstacknode(int numsorted, int* indegree);
-static void findstoredmass(double* mass);
+static int findstoredmass(double* mass);
 
 static void   evalHydVariables(int k);
 
@@ -603,7 +605,13 @@ int MSXqual_step(double *t, double *tleft)
     {
         double finalMassStart = profileStage ? MSXgpu_wallTimeMs() : 0.0;
         MSXsegStorage_syncAllPsegMirrors();
-        findstoredmass(MSX.MassBalance.final);
+        CALL(errcode, findstoredmass(MSX.MassBalance.final));
+        if (errcode)
+        {
+            finishQualityApiProfile(profileStage, qualityApiStart,
+                                    qualityApiExclusive);
+            return errcode;
+        }
         for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
         {
             sreacted = 0.0;
@@ -684,7 +692,7 @@ double  MSXqual_getNodeQual(int j, int m)
 
 //=============================================================================
 
-double  MSXqual_getLinkQual(int k, int m)
+int MSXqual_getLinkQualChecked(int k, int m, double *value)
 /*
 **   Purpose:
 **     computes average quality in link k.
@@ -694,7 +702,7 @@ double  MSXqual_getLinkQual(int k, int m)
 **     m = species index.
 **
 **   Returns:
-**     WQ value of link.
+**     zero on success or an explicit Resident/GPU error.
 */
 {
     double  vsum = 0.0,
@@ -705,6 +713,12 @@ double  MSXqual_getLinkQual(int k, int m)
     int     pos,
             n,
             slot;
+
+    if (!value) return ERR_INVALID_OBJECT_PARAMS;
+    *value = 0.0;
+    if (k < 1 || k > MSX.Nobjects[LINK] ||
+        m < 1 || m > MSX.Nobjects[SPECIES])
+        return ERR_INVALID_OBJECT_INDEX;
 
     if (MSXsegStorage_isPipeRingLink(k))
     {
@@ -718,27 +732,77 @@ double  MSXqual_getLinkQual(int k, int m)
             vsum += *v;
             msum += c[m] * (*v);
         }
-        if (vsum > 0.0) return(msum/vsum);
+        if (vsum > 0.0)
+        {
+            *value = msum / vsum;
+            return 0;
+        }
         else
         {
-            return (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
-                    MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
+            *value = (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
+                      MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
+            return 0;
         }
+    }
+
+    /* Resident Core Pseg views are topology mirrors only.  Combine the GPU
+       aggregate with CPU Boundary rows at the same flushed state version. */
+    if (MSXresidentRuntime_isResident() && MSXsegStorage_isHybridLink(k))
+    {
+        double *residentMass = (double *)calloc(
+            (size_t)MSX.Nobjects[SPECIES] + 1, sizeof(double));
+        double residentVolume = 0.0;
+        MSXResidentGpuReduction reduction;
+        MSXResidentStatus status;
+        if (!residentMass) return ERR_MEMORY;
+        status = MSXresidentRuntime_reduceLink(
+            (uint32_t)k, residentMass,
+            (uint32_t)MSX.Nobjects[SPECIES] + 1, &residentVolume,
+            &reduction);
+        if (status != MSX_RESIDENT_OK)
+        {
+            free(residentMass);
+            return MSX.ErrCode ? MSX.ErrCode : ERR_GPU_KERNEL_RUNTIME_ERROR;
+        }
+        vsum += residentVolume;
+        msum += residentMass[m];
+        free(residentMass);
     }
 
     seg = MSX.FirstSeg[k];
     while (seg != NULL)
     {
-        vsum += seg->v;
-        msum += (seg->c[m])*(seg->v);
+        if (!MSXresidentRuntime_isResident() ||
+            !MSXsegStorage_isHybridCoreSegment(seg))
+        {
+            vsum += seg->v;
+            msum += (seg->c[m])*(seg->v);
+        }
         seg = seg->prev;
     }
-    if (vsum > 0.0) return(msum/vsum);
+    if (vsum > 0.0)
+    {
+        *value = msum / vsum;
+        return 0;
+    }
     else
     {
-        return (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
-                MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
+        *value = (MSXqual_getNodeQual(MSX.Link[k].n1, m) +
+                  MSXqual_getNodeQual(MSX.Link[k].n2, m)) / 2.0;
+        return 0;
     }
+}
+
+double MSXqual_getLinkQual(int k, int m)
+{
+    double value = 0.0;
+    int status = MSXqual_getLinkQualChecked(k, m, &value);
+    if (status)
+    {
+        MSX.ErrCode = status;
+        return 0.0;
+    }
+    return value;
 }
 
 //=============================================================================
@@ -1137,7 +1201,10 @@ void  initSegs()
     }
     MSX.ErrCode = MSXresidentRuntime_afterHybridInit();
     if (MSX.ErrCode) return;
-    findstoredmass(MSX.MassBalance.initial);    // initial mass
+    {
+        int massError = findstoredmass(MSX.MassBalance.initial);
+        if (massError) MSX.ErrCode = massError;
+    }
 }
 
 //=============================================================================
@@ -1931,6 +1998,15 @@ void evalnodeoutflow(int k, double * upnodequal, double tstep)
 
     if (seg)
     {
+        if (MSXresidentRuntime_isResident() &&
+            MSXsegStorage_isHybridCoreSegment(seg))
+        {
+            /* Handoff planning must leave a CPU Boundary at every transport
+               endpoint.  Never consume a stale Resident Core mirror. */
+            MSX.ErrCode = ERR_GPU_KERNEL_RUNTIME_ERROR;
+            MSXqual_removeSeg(MSX.NewSeg[k]);
+            return;
+        }
         if (!MSXqual_isSame(seg->c, upnodequal) && MSX.Link[k].nsegs < MSX.MaxSegments)
         {
             useNewSeg = 1;
@@ -2046,6 +2122,19 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
     {
         seg = MSX.FirstSeg[k];
         if (!seg) break;
+
+        if (MSXresidentRuntime_isResident() &&
+            MSXsegStorage_isHybridCoreSegment(seg))
+        {
+            /* A Resident Core row is GPU-owned until an explicit handoff;
+               treating its CPU mirror as transport input would corrupt mass. */
+            snprintf(MSX.Msg, MAXLINE,
+                     "RESIDENT_CORE_TRANSPORT_INFLOW link=%d slot=%d id=%llu.",
+                     k, seg->hybridSlot,
+                     (unsigned long long)seg->hybridId);
+            MSX.ErrCode = ERR_GPU_KERNEL_RUNTIME_ERROR;
+            return;
+        }
 
         // ... volume transported from first segment is smaller of
         //     remaining flow volume & segment volume
@@ -2373,8 +2462,7 @@ void  noflowqual(int n)
         {
             Pseg endseg = MSXsegStorage_isPipeRingLink(k) ?
                           MSXsegStorage_pipePeekHead(k) : MSX.FirstSeg[k];
-            for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
-                MSX.Node[n].c[m] += endseg->c[m];
+            if (addNoflowEndpoint(k, endseg, MSX.Node[n].c)) return;
             kount++;
         }
 
@@ -2386,8 +2474,7 @@ void  noflowqual(int n)
         {
             Pseg endseg = MSXsegStorage_isPipeRingLink(k) ?
                           MSXsegStorage_pipePeekTail(k) : MSX.LastSeg[k];
-            for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
-                MSX.Node[n].c[m] += endseg->c[m];
+            if (addNoflowEndpoint(k, endseg, MSX.Node[n].c)) return;
             kount++;
         }
     }
@@ -2396,7 +2483,33 @@ void  noflowqual(int n)
             MSX.Node[n].c[m] = MSX.Node[n].c[m] / (double)kount;
 }
 
-void findstoredmass(double * mass)
+static int addNoflowEndpoint(int k, Pseg seg, double *sum)
+{
+    const double *quality;
+    MSXResidentPayload latest;
+    MSXResidentStatus status;
+    if (!seg || !sum) return ERR_INVALID_OBJECT_PARAMS;
+    quality = seg->c;
+    if (MSXresidentRuntime_isResident() &&
+        MSXsegStorage_isHybridCoreSegment(seg))
+    {
+        status = MSXresidentRuntime_fetchSlot(
+            (uint32_t)k, seg->hybridId, MSX.C1, MSX.MassIn,
+            (uint32_t)MSX.Nobjects[SPECIES] + 1, &latest);
+        if (status != MSX_RESIDENT_OK)
+        {
+            MSX.ErrCode = MSX.ErrCode ? MSX.ErrCode :
+                          ERR_GPU_KERNEL_RUNTIME_ERROR;
+            return MSX.ErrCode;
+        }
+        quality = MSX.C1;
+    }
+    for (int m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+        sum[m] += quality[m];
+    return 0;
+}
+
+int findstoredmass(double * mass)
 /*
 **--------------------------------------------------------------
 **   Input:   none
@@ -2417,9 +2530,8 @@ void findstoredmass(double * mass)
     int residentAggregate = FALSE;
 
     /* Resident Core rows are no longer authoritative CPU-owned segment
-       storage.  Ask the runtime for one fixed-order GPU aggregate and only
-       scan the CPU Boundary rows below; if the query cannot be completed,
-       retain the legacy full CPU scan as the correctness fallback. */
+       storage.  Require one aggregate snapshot, then query each hybrid link
+       from that same cached snapshot so WALL species keep their area units. */
     if (MSXresidentRuntime_isResident())
     {
         residentMass = (double *)calloc((size_t)MSX.Nobjects[SPECIES] + 1,
@@ -2431,8 +2543,9 @@ void findstoredmass(double * mass)
             residentAggregate = TRUE;
         else
         {
+            int error = MSX.ErrCode ? MSX.ErrCode : ERR_GPU_KERNEL_RUNTIME_ERROR;
             free(residentMass);
-            residentMass = NULL;
+            return error;
         }
     }
 
@@ -2444,6 +2557,29 @@ void findstoredmass(double * mass)
     // Mass residing in each pipe
     for (k = 1; k <= MSX.Nobjects[LINK]; k++)
     {
+        if (residentAggregate && MSXsegStorage_isHybridLink(k))
+        {
+            MSXResidentGpuReduction linkReduction;
+            double linkVolume = 0.0;
+            MSXResidentStatus status = MSXresidentRuntime_reduceLink(
+                (uint32_t)k, residentMass,
+                (uint32_t)MSX.Nobjects[SPECIES] + 1, &linkVolume,
+                &linkReduction);
+            if (status != MSX_RESIDENT_OK)
+            {
+                free(residentMass);
+                return MSX.ErrCode ? MSX.ErrCode :
+                       ERR_GPU_KERNEL_RUNTIME_ERROR;
+            }
+            for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+            {
+                if (MSX.Species[m].type == BULK)
+                    mass[m] += residentMass[m] * LperFT3;
+                else
+                    mass[m] += residentMass[m] * 4.0 /
+                               MSX.Link[k].diam * MSX.Ucf[AREA_UNITS];
+            }
+        }
         if (MSXsegStorage_isPipeRingLink(k))
         {
             n = MSXsegStorage_pipeCount(k);
@@ -2484,12 +2620,7 @@ void findstoredmass(double * mass)
         }
     }
 
-    if (residentAggregate)
-    {
-        for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
-            mass[m] += residentMass[m] * LperFT3;
-        free(residentMass);
-    }
+    if (residentAggregate) free(residentMass);
 
     // Mass residing in each tank
     for (i = 1; i <= MSX.Nobjects[TANK]; i++)
@@ -2513,6 +2644,7 @@ void findstoredmass(double * mass)
             }
         }
     }
+    return 0;
 }
 
 void MSXqual_reversesegs(int k)
@@ -2562,6 +2694,11 @@ void MSXqual_removeSeg(Pseg seg)
 */
 {
     if ( seg == NULL ) return;
+    /* Resident Hybrid demote boundaries are owned by the fixed boundary
+       arena.  Returning one to that arena is distinct from exposing it to
+       the general FreeSeg pool, which could otherwise exhaust the reserved
+       demote capacity during a steady-state quality run. */
+    if (MSXsegStorage_hybridReleaseBoundary(seg)) return;
     /* A Hybrid Core view is owned by the dense slot allocator, not the
        segment pool.  Complete downstream consumption is handled through
        MSXsegStorage_hybridRemoveHead(). */

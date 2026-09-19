@@ -49,6 +49,7 @@ int    MSXqual_step(double *t, double *tleft);
 int    MSXqual_close(void);
 double MSXqual_getNodeQual(int j, int m);
 double MSXqual_getLinkQual(int k, int m);
+int MSXqual_getLinkQualChecked(int k, int m, double *value);
 int    MSXrpt_write(void);
 int    MSXfile_save(FILE *f);
 
@@ -780,7 +781,7 @@ int  MSXDLLEXPORT  MSXgetqual(int type, int index, int species, double *value)
     else if ( type == MSX_LINK )
     {
         if ( index < 1 || index > MSX.Nobjects[LINK] ) return ERR_INVALID_OBJECT_INDEX;
-        *value = MSXqual_getLinkQual(index, species);
+        return MSXqual_getLinkQualChecked(index, species, value);
     }
     else return ERR_INVALID_OBJECT_TYPE;
     return 0;

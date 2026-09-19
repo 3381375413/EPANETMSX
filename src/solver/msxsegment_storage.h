@@ -60,6 +60,17 @@ void MSXsegStorage_hybridAbortInitialImage(void);
 int  MSXsegStorage_hybridObserveAll(void);
 int  MSXsegStorage_hybridRemoveHead(int k, Pseg seg);
 void MSXsegStorage_hybridRebalanceAll(void);
+/* Make the selected physical endpoint CPU-readable before transport.  This
+   may stage a single Resident demotion and returns a mapped error before any
+   endpoint consumer can observe a stale Core mirror. */
+int  MSXsegStorage_hybridEnsureEndpointBoundary(int k, int boundarySide);
+/* Resident Hybrid demote boundaries are reserved at Hybrid reserve time.
+   A returned segment remains owned by the pool until the CPU list removes it;
+   this prevents the general MSX.FreeSeg allocator from consuming the pool. */
+int  MSXsegStorage_hybridAcquireBoundary(Pseg *segment);
+int  MSXsegStorage_hybridReleaseBoundary(Pseg segment);
+/* Explicit audit seam: poison only dense Hybrid Core c/lastc mirrors. */
+int  MSXsegStorage_hybridAuditPoisonCoreMirrors(void);
 int MSXsegStorage_hybridAfterListReorder(int k);
 void MSXsegStorage_hybridClear(int k);
 int  MSXsegStorage_hybridCoreCount(int k);
