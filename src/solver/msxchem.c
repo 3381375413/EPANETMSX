@@ -23,6 +23,7 @@
 #include "msxsegment_storage.h"
 #include "msxsegment_profile.h"
 #include "msxresident_runtime.h"
+#include "msxresident_boundary_mode.h"
 
 //  External variables
 //--------------------
@@ -62,7 +63,6 @@ static double HydVar[MAX_HYD_VARS];    // Values of hydraulic variables
 static double *F;                      // Function values                      
 static double *ChemC1;
 
-static int ResidentBoundaryScanModeState = -1;
 static int ResidentBoundaryAuditState = -1;
 static int ResidentBoundaryAuditWritten = 0;
 static uint64_t ResidentBoundarySpanHits = 0;
@@ -114,7 +114,7 @@ static int    isValidNumber(double x);                                         /
 
 static void residentBoundaryAuditReset(void)
 {
-    ResidentBoundaryScanModeState = -1;
+    MSXresidentBoundaryModeReset();
     ResidentBoundaryAuditState = -1;
     ResidentBoundaryAuditWritten = 0;
     ResidentBoundarySpanHits = 0;
@@ -137,29 +137,6 @@ static int residentBoundaryAuditEnabled(void)
                       _stricmp(value, "ON") == 0);
     }
     return ResidentBoundaryAuditState;
-}
-
-static int residentBoundaryScanMode(void)
-{
-    const char *value;
-    if (ResidentBoundaryScanModeState >= 0)
-        return ResidentBoundaryScanModeState;
-    ResidentBoundaryScanModeState = MSX_RESIDENT_BOUNDARY_SCAN_FULL;
-    value = getenv("MSX_RESIDENT_BOUNDARY_SCAN_MODE");
-    if (value && _stricmp(value, "SPAN") == 0)
-        ResidentBoundaryScanModeState = MSX_RESIDENT_BOUNDARY_SCAN_SPAN;
-    else if (value && _stricmp(value, "FULL") == 0)
-        ResidentBoundaryScanModeState = MSX_RESIDENT_BOUNDARY_SCAN_FULL;
-    else if (!value)
-    {
-        /* The S04 scan selector is accepted as a convenience for paired
-           Resident runs.  The dedicated boundary variable still wins. */
-        value = getenv("MSX_RESIDENT_SCAN_MODE");
-        if (value && (_stricmp(value, "SPAN_OMP8") == 0 ||
-                      _stricmp(value, "SPAN_SERIAL") == 0))
-            ResidentBoundaryScanModeState = MSX_RESIDENT_BOUNDARY_SCAN_SPAN;
-    }
-    return ResidentBoundaryScanModeState;
 }
 
 static void residentBoundaryAuditAdd(uint64_t spanHits, uint64_t noCore,
@@ -207,8 +184,7 @@ static void residentBoundaryAuditWrite(void)
     if (!f) return;
     fprintf(f, "phase=resident_boundary_reaction\n");
     fprintf(f, "actual_mode=%s\n",
-            residentBoundaryScanMode() == MSX_RESIDENT_BOUNDARY_SCAN_SPAN ?
-            "SPAN" : "FULL");
+            MSXresidentBoundaryModeName(MSXresidentBoundaryMode()));
     fprintf(f, "span_hits=%llu\n",
             (unsigned long long)ResidentBoundarySpanHits);
     fprintf(f, "span_no_core=%llu\n",
@@ -253,7 +229,7 @@ int  MSXchem_open()
     /* Parse the optional audit/mode selectors before the chemistry team is
        entered; reaction workers only read the cached values. */
     (void)residentBoundaryAuditEnabled();
-    (void)residentBoundaryScanMode();
+    (void)MSXresidentBoundaryMode();
 
     // --- allocate memory
 
@@ -1063,7 +1039,7 @@ static int evalPipeHybridBoundaryReactions(int k, double dt)
 {
     MSXResidentBoundaryScanResult scan;
     int errcode = MSXsegStorage_visitHybridBoundarySegments(
-        k, residentBoundaryScanMode(), dt, residentBoundaryReactionVisitor,
+        k, MSXresidentBoundaryMode(), dt, residentBoundaryReactionVisitor,
         NULL, &scan);
     MSXsegProfile_reactVisitsForLink(k, (int)scan.visits);
     residentBoundaryAuditAdd((uint64_t)scan.spanHit,

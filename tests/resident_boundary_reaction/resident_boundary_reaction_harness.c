@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "msxsegment_storage.h"
+#include "msxresident_boundary_mode.h"
 #include "msxgpu.h"
 #include "msxtypes.h"
 
@@ -258,8 +259,38 @@ static void checkInvalidAndFallback(void)
     compareBoundaryOrder(2);
 }
 
+static void checkBoundaryModeSelection(void)
+{
+    /* Generic rebalance mode must never select the chemistry boundary mode. */
+    _putenv_s("MSX_RESIDENT_SCAN_MODE", "SPAN_OMP8");
+    _putenv_s("MSX_RESIDENT_BOUNDARY_SCAN_MODE", "");
+    MSXresidentBoundaryModeReset();
+    CHECK(MSXresidentBoundaryMode() == MSX_RESIDENT_BOUNDARY_SCAN_FULL);
+
+    _putenv_s("MSX_RESIDENT_BOUNDARY_SCAN_MODE", "SPAN");
+    MSXresidentBoundaryModeReset();
+    CHECK(MSXresidentBoundaryMode() == MSX_RESIDENT_BOUNDARY_SCAN_SPAN);
+    CHECK(MSXresidentBoundaryMode() == MSX_RESIDENT_BOUNDARY_SCAN_SPAN);
+
+    /* Cached mode remains stable until the next chemistry lifetime reset. */
+    _putenv_s("MSX_RESIDENT_BOUNDARY_SCAN_MODE", "FULL");
+    CHECK(MSXresidentBoundaryMode() == MSX_RESIDENT_BOUNDARY_SCAN_SPAN);
+    MSXresidentBoundaryModeReset();
+    CHECK(MSXresidentBoundaryMode() == MSX_RESIDENT_BOUNDARY_SCAN_FULL);
+
+    /* A reopen/reset observes a newly selected dedicated mode. */
+    _putenv_s("MSX_RESIDENT_BOUNDARY_SCAN_MODE", "SPAN");
+    MSXresidentBoundaryModeReset();
+    CHECK(MSXresidentBoundaryMode() == MSX_RESIDENT_BOUNDARY_SCAN_SPAN);
+    _putenv_s("MSX_RESIDENT_SCAN_MODE", "FULL_OMP8");
+    _putenv_s("MSX_RESIDENT_BOUNDARY_SCAN_MODE", "");
+    MSXresidentBoundaryModeReset();
+    CHECK(MSXresidentBoundaryMode() == MSX_RESIDENT_BOUNDARY_SCAN_FULL);
+}
+
 int main(void)
 {
+    checkBoundaryModeSelection();
     CHECK(buildFixture());
     checkEndpoints(1); /* no Core */
     checkEndpoints(2); /* multi-Core, non-power-of-two capacity */

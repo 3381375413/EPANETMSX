@@ -3,6 +3,7 @@ project(resident_boundary_reaction C)
 
 add_executable(resident_boundary_reaction_harness
   resident_boundary_reaction_harness.c
+  ../../src/solver/msxresident_boundary_mode.c
   ../../src/solver/msxresident_core.c
   ../../src/solver/msxresident_hash.c
   ../../src/solver/msxsegment_storage.c)
