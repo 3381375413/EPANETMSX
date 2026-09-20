@@ -45,7 +45,7 @@ extern MSXproject MSX;
 #define GPU_MAX_SPECIES 64
 #define GPU_MAX_EQUIL   16
 #define GPU_MAX_STACK   128
-#define GPU_CACHE_VERSION "v25_ros2_joint_rate_hydpipe_abi2"
+#define GPU_CACHE_VERSION "v26_ros2_analytic_rate_jacobian_hydpipe_abi3"
 #define GPU_ROS2_MAX_RATE_SPECIES 16
 #define RK5_FAST_BUCKETS 6
 #define GPU_CACHE_MAX_BYTES (200LL * 1024LL * 1024LL)
@@ -64,6 +64,8 @@ typedef struct
 {
     int valid;
     int compiler;
+    int solver;
+    int rateJacobianEligible;
     uint64_t cacheKey;
     GpuSpecializedDimensions dims;
 } GpuModelBinding;
@@ -1653,6 +1655,7 @@ typedef struct
     int solver;
     int rk5Mode;
     int compiler;
+    int rateJacobianMode;
     uint64_t cacheKey;
 } GpuModuleState;
 
@@ -1959,6 +1962,145 @@ static uint64_t hashExpr(uint64_t h, MathExpr *expr)
     return h;
 }
 
+typedef struct
+{
+    int literal;
+    double value;
+} GpuEligibilityValue;
+
+/* X01 deliberately accepts only the smooth RATE subset needed by the
+   production ROS2 model.  A literal flag is propagated through arithmetic so
+   a denominator is accepted only when its finite, non-zero value is provable
+   at source-generation time.  TERM references are expanded for this check;
+   cycles and excessive nesting are rejected rather than treated as values. */
+static int eligibleRateExpr(MathExpr *expr, int depth, unsigned char *visiting,
+                            GpuEligibilityValue *result)
+{
+    GpuEligibilityValue stack[GPU_MAX_STACK + 2];
+    int sp = 0;
+    MathExpr *node = expr;
+    int lastSpecies = lastIndex(SPECIES);
+    int lastTerm = lastIndex(TERM);
+
+    if (!result || depth > MSX.Nobjects[TERM] + 1) return 0;
+    memset(result, 0, sizeof(*result));
+    if (!expr)
+    {
+        result->literal = 1;
+        result->value = 0.0;
+        return 1;
+    }
+    memset(stack, 0, sizeof(stack));
+    while (node)
+    {
+        GpuEligibilityValue a, b, r;
+        if (sp >= GPU_MAX_STACK) return 0;
+        memset(&r, 0, sizeof(r));
+        switch (node->opcode)
+        {
+        case 3: case 4: case 5:
+            if (sp < 2) return 0;
+            a = stack[--sp];
+            b = stack[--sp];
+            r.literal = a.literal && b.literal;
+            if (r.literal)
+            {
+                if (node->opcode == 3) r.value = b.value + a.value;
+                else if (node->opcode == 4) r.value = b.value - a.value;
+                else r.value = b.value * a.value;
+                if (!isfinite(r.value)) return 0;
+            }
+            stack[sp++] = r;
+            break;
+        case 6:
+            if (sp < 2) return 0;
+            a = stack[--sp];
+            b = stack[--sp];
+            if (!a.literal || !isfinite(a.value) || a.value == 0.0)
+                return 0;
+            r.literal = b.literal;
+            if (r.literal)
+            {
+                r.value = b.value / a.value;
+                if (!isfinite(r.value)) return 0;
+            }
+            stack[sp++] = r;
+            break;
+        case 7:
+            if (!isfinite(node->fvalue)) return 0;
+            r.literal = 1;
+            r.value = node->fvalue;
+            stack[sp++] = r;
+            break;
+        case 8:
+            if (node->ivar <= lastSpecies || node->ivar > lastTerm)
+            {
+                /* Species, parameter, constant and hydraulic references are
+                   runtime variables and are smooth inputs to this subset. */
+                r.literal = 0;
+                r.value = 0.0;
+                stack[sp++] = r;
+                break;
+            }
+            {
+                int tid = node->ivar - lastSpecies;
+                if (tid < 1 || tid > MSX.Nobjects[TERM] || !visiting || visiting[tid])
+                    return 0;
+                visiting[tid] = 1;
+                if (!eligibleRateExpr(MSX.Term[tid].expr, depth + 1,
+                                      visiting, &r))
+                {
+                    visiting[tid] = 0;
+                    return 0;
+                }
+                visiting[tid] = 0;
+                stack[sp++] = r;
+            }
+            break;
+        case 9:
+            if (sp < 1) return 0;
+            r = stack[sp - 1];
+            if (r.literal)
+            {
+                r.value = -r.value;
+                if (!isfinite(r.value)) return 0;
+            }
+            stack[sp - 1] = r;
+            break;
+        default:
+            return 0;
+        }
+        node = node->next;
+    }
+    if (sp != 1) return 0;
+    *result = stack[0];
+    return 1;
+}
+
+static int specializedRos2RateJacobianEligible(void)
+{
+    unsigned char *visiting;
+    GpuEligibilityValue value;
+    int m;
+    int eligible = 1;
+
+    if (MSX.GpuSolver != ROS2 || MSX.Nobjects[TERM] < 0)
+        return 0;
+    visiting = (unsigned char*)calloc((size_t)MSX.Nobjects[TERM] + 1, 1);
+    if (!visiting) return 0;
+    for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+    {
+        if (MSX.Species[m].pipeExprType != RATE) continue;
+        if (!eligibleRateExpr(MSX.Species[m].pipeExpr, 0, visiting, &value))
+        {
+            eligible = 0;
+            break;
+        }
+    }
+    free(visiting);
+    return eligible;
+}
+
 static int collectSpecializedDimensions(GpuSpecializedDimensions *dims)
 {
     int m;
@@ -1987,12 +2129,13 @@ static int collectSpecializedDimensions(GpuSpecializedDimensions *dims)
 static uint64_t hashModelExpressions(void)
 {
     uint64_t h = 1469598103934665603ULL;
-    static const char generatorAbi[] = "specialized-model-dims-v2-joint-rate-kernel-abi2";
+    static const char generatorAbi[] = "specialized-model-dims-v3-analytic-rate-jacobian-kernel-abi3";
     GpuSpecializedDimensions dims;
     int m;
     int rateOrdinal = 0;
     int equilOrdinal = 0;
     int formulaOrdinal = 0;
+    int rateJacobianEligible;
 
     h = fnv1aBytes(h, generatorAbi, sizeof(generatorAbi) - 1);
     if (collectSpecializedDimensions(&dims))
@@ -2005,6 +2148,9 @@ static uint64_t hashModelExpressions(void)
     h = fnv1aBytes(h, &dims.nRate, sizeof(dims.nRate));
     h = fnv1aBytes(h, &dims.nEquil, sizeof(dims.nEquil));
     h = fnv1aBytes(h, &dims.nFormula, sizeof(dims.nFormula));
+    h = fnv1aBytes(h, &MSX.GpuSolver, sizeof(MSX.GpuSolver));
+    rateJacobianEligible = specializedRos2RateJacobianEligible();
+    h = fnv1aBytes(h, &rateJacobianEligible, sizeof(rateJacobianEligible));
     h = fnv1aBytes(h, &MSX.Nobjects[TERM], sizeof(MSX.Nobjects[TERM]));
     for (m = 1; m <= MSX.Nobjects[TERM]; m++)
         h = hashExpr(h, MSX.Term[m].expr);
@@ -2050,7 +2196,10 @@ static int cacheGpuModelBinding(void)
     }
     memset(&GpuModel, 0, sizeof(GpuModel));
     GpuModel.compiler = compiler;
+    GpuModel.solver = MSX.GpuSolver;
     GpuModel.dims = dims;
+    GpuModel.rateJacobianEligible = compiler &&
+        specializedRos2RateJacobianEligible();
     GpuModel.cacheKey = compiler ? hashModelExpressions() : 0;
     GpuModel.valid = 1;
     return 0;
@@ -2713,7 +2862,60 @@ static int appendSpecializedRos2EvalRates(GpuSourceBuilder *sb)
     return sbAppend(sb, "}\n");
 }
 
-static int spliceSpecializedRos2EvalRates(const char *source, char **out)
+static int appendSpecializedRos2EvalJacobian(GpuSourceBuilder *sb)
+{
+    int m;
+    int row = 0;
+    int err;
+
+    if (!sb) return ERR_GPU_UNSUPPORTED_FEATURE;
+    err = sbAppend(sb,
+        "__device__ void ros2_eval_rates_jacobian(int n,const int* rs,double* c,int pipe,const double* params,int pStride,const double* constants,const double* hyd,int hBase,const Prog* prog,const Prog* termProg,const Instr* instr,int lastSpecies,int lastTerm,int lastParam,int lastConst,double* jac,int jacStride,int* analyticOk){(void)n;(void)rs;(void)prog;(void)termProg;(void)instr;(void)lastSpecies;(void)lastTerm;(void)lastParam;(void)lastConst;*analyticOk=1;\n");
+    if (err) return err;
+    for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+    {
+        int col = 0;
+        if (MSX.Species[m].pipeExprType != RATE) continue;
+        row++;
+        {
+            int species;
+            for (species = 1; species <= MSX.Nobjects[SPECIES]; species++)
+            {
+                GpuExprPair pair;
+                if (MSX.Species[species].pipeExprType != RATE) continue;
+                ++col;
+                err = emitCudaExprPair(MSX.Species[m].pipeExpr, species,
+                                       0, &pair);
+                if (err) return err;
+                err = sbAppendFmt(sb,
+                    "{ double d=(%s); if(!isfinite(d))*analyticOk=0; jac[%d*jacStride+%d]=(isfinite(d)?d:0.0); }\n",
+                    pair.deriv, row, col);
+                free(pair.value);
+                free(pair.deriv);
+                if (err) return err;
+            }
+        }
+    }
+    return sbAppend(sb, "}\n");
+}
+
+static int spliceSpecializedRos2Jacobian(const char *source, char **out)
+{
+    static const char needle[] =
+        "if(!reject){for(int col=1;col<=nr;col++){int m=rs[col],i;double tmp=y[m];y[m]=tmp+eps;ros2_eval_rates(nr,rs,y,pk,par,pstride,con,hyd,hb,prog,term,instr,ls,lt,lp,lc,fp);y[m]=tmp==0.0?tmp:tmp-eps;double e2=tmp==0.0?eps:2.0*eps;ros2_eval_rates(nr,rs,y,pk,par,pstride,con,hyd,hb,prog,term,instr,ls,lt,lp,lc,fm);for(i=1;i<=nr;i++)a[i][col]=(fp[i]-fm[i])/e2;y[m]=tmp;}jc++;f+=2*nr;gh0=0.0;}";
+    static const char replacement[] =
+        "if(!reject){int analyticOk=1;ros2_eval_rates_jacobian(nr,rs,y,pk,par,pstride,con,hyd,hb,prog,term,instr,ls,lt,lp,lc,&a[0][0],nr+1,&analyticOk);if(!analyticOk){re[sid]=-1;set_err(ge,513,1,sid,pk,rs[1],rs[1],ac,0.0);return;}jc++;gh0=0.0;}";
+
+    {
+        const char *first = source ? strstr(source, needle) : NULL;
+        if (!source || !out || !first || strstr(first + 1, needle))
+            return ERR_GPU_UNSUPPORTED_FEATURE;
+    }
+    return sourceReplaceAll(source, needle, replacement, out);
+}
+
+static int spliceSpecializedRos2EvalRates(const char *source, int analytic,
+                                          char **out)
 {
     const char *start;
     const char *end;
@@ -2724,10 +2926,15 @@ static int spliceSpecializedRos2EvalRates(const char *source, char **out)
     *out = NULL;
     start = strstr(source, "__device__ void ros2_eval_rates(");
     if (!start) return ERR_GPU_UNSUPPORTED_FEATURE;
+    if (strstr(start + 1, "__device__ void ros2_eval_rates("))
+        return ERR_GPU_UNSUPPORTED_FEATURE;
     end = strstr(start, "__device__ int ros2_lu_factor(");
     if (!end) return ERR_GPU_UNSUPPORTED_FEATURE;
+    if (strstr(end + 1, "__device__ int ros2_lu_factor("))
+        return ERR_GPU_UNSUPPORTED_FEATURE;
     err = sbAppendN(&sb, source, (size_t)(start - source));
     if (!err) err = appendSpecializedRos2EvalRates(&sb);
+    if (!err && analytic) err = appendSpecializedRos2EvalJacobian(&sb);
     if (!err) err = sbAppend(&sb, end);
     if (err)
     {
@@ -2740,6 +2947,7 @@ static int spliceSpecializedRos2EvalRates(const char *source, char **out)
 
 static int specializeRos2CudaSource(const char *source,
                                     const GpuSpecializedDimensions *dims,
+                                    int analytic,
                                     char **out)
 {
     static const char *stateArrays[] = { "old", "y", "yn" };
@@ -2767,9 +2975,17 @@ static int specializeRos2CudaSource(const char *source,
     if (err) return err;
     current = next;
     next = NULL;
-    err = spliceSpecializedRos2EvalRates(current, &next);
+    err = spliceSpecializedRos2EvalRates(current, analytic, &next);
     free(current);
     if (err) return err;
+    if (analytic)
+    {
+        current = next;
+        next = NULL;
+        err = spliceSpecializedRos2Jacobian(current, &next);
+        free(current);
+        if (err) return err;
+    }
     *out = next;
     return 0;
 }
@@ -2847,6 +3063,10 @@ static void writeSpecializedMetadata(const char *cachePath, uint64_t cacheKey,
     if (MSX.GpuSolver == ROS2)
     {
         fprintf(f, "rate_evaluator=joint_fixed_outputs\n");
+        fprintf(f, "rate_jacobian_mode=%s\n",
+                GpuModule.rateJacobianMode ? "analytic" : "finite_difference");
+        fprintf(f, "rate_jacobian_eligibility=%s\n",
+                GpuModel.rateJacobianEligible ? "eligible" : "fd_ineligible");
         fprintf(f, "rate_ordinal,species_index\n");
         rateOrdinal = 0;
         for (m = 1; m <= dims->nSpecies; m++)
@@ -2986,10 +3206,12 @@ static int ensureModule(void)
     uint64_t cacheKey = 0;
     int haveSpecializedDims = 0;
     int requestedCompiler;
+    int analyticMode;
     int liveCompiler = MSX.GpuCompiler ? 1 : 0;
 
     memset(&specializedDims, 0, sizeof(specializedDims));
-    if (!GpuModel.valid || GpuModel.compiler != liveCompiler)
+    if (!GpuModel.valid || GpuModel.compiler != liveCompiler ||
+        GpuModel.solver != MSX.GpuSolver)
     {
         err = cacheGpuModelBinding();
         if (err) return err;
@@ -3001,9 +3223,12 @@ static int ensureModule(void)
         specializedDims = GpuModel.dims;
         haveSpecializedDims = 1;
     }
+    analyticMode = requestedCompiler && MSX.GpuSolver == ROS2 &&
+                   GpuModel.rateJacobianEligible;
     if (GpuModule.ready && GpuModule.solver == MSX.GpuSolver &&
         (MSX.GpuSolver != RK5 || GpuModule.rk5Mode == MSX.GpuRk5Mode) &&
         GpuModule.compiler == requestedCompiler &&
+        GpuModule.rateJacobianMode == analyticMode &&
         GpuModule.cacheKey == cacheKey) return 0;
     if (GpuModule.ready)
     {
@@ -3099,7 +3324,7 @@ static int ensureModule(void)
             if (requestedCompiler)
             {
                 err = specializeRos2CudaSource(GpuRos2CudaSource, &specializedDims,
-                                               &specializedRos2);
+                                               analyticMode, &specializedRos2);
                 if (err)
                 {
                     free(specializedSource);
@@ -3182,6 +3407,7 @@ static int ensureModule(void)
     GpuModule.solver = MSX.GpuSolver;
     GpuModule.rk5Mode = MSX.GpuRk5Mode;
     GpuModule.compiler = requestedCompiler;
+    GpuModule.rateJacobianMode = analyticMode;
     GpuModule.cacheKey = cacheKey;
     if (haveSpecializedDims)
         writeSpecializedMetadata(cachePath, cacheKey, &specializedDims);
