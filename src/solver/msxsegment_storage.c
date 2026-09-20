@@ -1430,12 +1430,13 @@ static void hybridFindCore(HybridPipe *p, int k, Pseg *firstCore,
     }
 }
 
-/* Capture the authoritative CPU topology once for a Resident Rebalance
-   round.  This deliberately does not call hybridFindCore: the latter remains
-   the legacy/non-Resident and audit rescan seam. */
-static void hybridCaptureRebalanceSnapshot(int k, RebalanceSnapshot *s)
+/* Read the authoritative CPU topology once for a Resident Rebalance round.
+   This helper is deliberately side-effect free: it only fills the caller's
+   snapshot workspace.  In particular it does not publish Hybrid.pipe or
+   touch shared metrics/timing state; the caller performs that serially. */
+static void hybridScanRebalanceSnapshot(int k, RebalanceSnapshot *s)
 {
-    HybridPipe *p = &Hybrid.pipe[k];
+    const HybridPipe *p = &Hybrid.pipe[k];
     Pseg seg;
     int nDown = 0, nUp = 0, nCore = 0, total = 0, seenCore = FALSE;
 
@@ -1470,6 +1471,15 @@ static void hybridCaptureRebalanceSnapshot(int k, RebalanceSnapshot *s)
         s->firstCoreId = s->firstCore->hybridId;
         s->lastCoreId = s->lastCore->hybridId;
     }
+}
+
+/* Publish one completed read-only scan.  This is intentionally separate from
+   hybridScanRebalanceSnapshot so the visible action order remains
+   scan(k) -> publish(k) -> optional empty-Core initialization(k). */
+static void hybridPublishRebalanceSnapshot(int k,
+                                            const RebalanceSnapshot *s)
+{
+    HybridPipe *p = &Hybrid.pipe[k];
     p->count = s->coreCount;
     p->downstreamBoundary = s->downCount;
     p->upstreamBoundary = s->upCount;
@@ -2354,8 +2364,9 @@ void MSXsegStorage_hybridRebalanceAll(void)
             RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
             phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
             if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
-            hybridCaptureRebalanceSnapshot(k, s);
+            hybridScanRebalanceSnapshot(k, s);
             if (audit) metrics.rb_scan_ms += MSXgpu_wallTimeMs() - phaseStart;
+            hybridPublishRebalanceSnapshot(k, s);
             if (s->coreCount == 0 && s->total > 2 * s->guard)
             {
                 phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
