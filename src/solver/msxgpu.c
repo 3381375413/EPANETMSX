@@ -45,7 +45,7 @@ extern MSXproject MSX;
 #define GPU_MAX_SPECIES 64
 #define GPU_MAX_EQUIL   16
 #define GPU_MAX_STACK   128
-#define GPU_CACHE_VERSION "v24_ros2_dims_hydpipe_abi1"
+#define GPU_CACHE_VERSION "v25_ros2_joint_rate_hydpipe_abi2"
 #define GPU_ROS2_MAX_RATE_SPECIES 16
 #define RK5_FAST_BUCKETS 6
 #define GPU_CACHE_MAX_BYTES (200LL * 1024LL * 1024LL)
@@ -1987,7 +1987,7 @@ static int collectSpecializedDimensions(GpuSpecializedDimensions *dims)
 static uint64_t hashModelExpressions(void)
 {
     uint64_t h = 1469598103934665603ULL;
-    static const char generatorAbi[] = "specialized-model-dims-v1-kernel-abi1";
+    static const char generatorAbi[] = "specialized-model-dims-v2-joint-rate-kernel-abi2";
     GpuSpecializedDimensions dims;
     int m;
     int rateOrdinal = 0;
@@ -2684,6 +2684,60 @@ static int replaceNamedArrayExtents(const char *source,
     return 0;
 }
 
+/* GPU_COMPILER YES has the complete model at source-generation time.  Keep
+   the existing device helper ABI, but emit each RATE expression directly in
+   model/ordinal order so ROS2 does not perform an indirect eval_prog lookup
+   for every rate.  The interpreter fragment remains unchanged. */
+static int appendSpecializedRos2EvalRates(GpuSourceBuilder *sb)
+{
+    int m;
+    int ordinal = 0;
+    int err;
+
+    if (!sb) return ERR_GPU_UNSUPPORTED_FEATURE;
+    err = sbAppend(sb,
+        "__device__ void ros2_eval_rates(int n,const int* rs,double* c,int pipe,const double* params,int pStride,const double* constants,const double* hyd,int hBase,const Prog* prog,const Prog* termProg,const Instr* instr,int lastSpecies,int lastTerm,int lastParam,int lastConst,double* out){(void)n;(void)rs;(void)prog;\n");
+    if (err) return err;
+    for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+    {
+        char *expr;
+        if (MSX.Species[m].pipeExprType != RATE) continue;
+        expr = emitCudaExprValue(MSX.Species[m].pipeExpr, 0);
+        if (!expr) return ERR_GPU_UNSUPPORTED_FEATURE;
+        ordinal++;
+        err = sbAppendFmt(sb, "{ double v=(%s); out[%d]=(v==v?v:0.0); }\n",
+                          expr, ordinal);
+        free(expr);
+        if (err) return err;
+    }
+    return sbAppend(sb, "}\n");
+}
+
+static int spliceSpecializedRos2EvalRates(const char *source, char **out)
+{
+    const char *start;
+    const char *end;
+    GpuSourceBuilder sb = {0};
+    int err;
+
+    if (!source || !out) return ERR_GPU_UNSUPPORTED_FEATURE;
+    *out = NULL;
+    start = strstr(source, "__device__ void ros2_eval_rates(");
+    if (!start) return ERR_GPU_UNSUPPORTED_FEATURE;
+    end = strstr(start, "__device__ int ros2_lu_factor(");
+    if (!end) return ERR_GPU_UNSUPPORTED_FEATURE;
+    err = sbAppendN(&sb, source, (size_t)(start - source));
+    if (!err) err = appendSpecializedRos2EvalRates(&sb);
+    if (!err) err = sbAppend(&sb, end);
+    if (err)
+    {
+        sbFree(&sb);
+        return err;
+    }
+    *out = sb.data;
+    return 0;
+}
+
 static int specializeRos2CudaSource(const char *source,
                                     const GpuSpecializedDimensions *dims,
                                     char **out)
@@ -2709,6 +2763,11 @@ static int specializeRos2CudaSource(const char *source,
     err = replaceNamedArrayExtents(current, matrixArrays,
                                    sizeof(matrixArrays) / sizeof(matrixArrays[0]),
                                    dims->nRate + 1, 1, &next);
+    free(current);
+    if (err) return err;
+    current = next;
+    next = NULL;
+    err = spliceSpecializedRos2EvalRates(current, &next);
     free(current);
     if (err) return err;
     *out = next;
@@ -2784,6 +2843,17 @@ static void writeSpecializedMetadata(const char *cachePath, uint64_t cacheKey,
         else if (MSX.Species[m].pipeExprType == EQUIL) ordinal = ++equilOrdinal;
         else if (MSX.Species[m].pipeExprType == FORMULA) ordinal = ++formulaOrdinal;
         fprintf(f, "%d,%d,%d\n", m, MSX.Species[m].pipeExprType, ordinal);
+    }
+    if (MSX.GpuSolver == ROS2)
+    {
+        fprintf(f, "rate_evaluator=joint_fixed_outputs\n");
+        fprintf(f, "rate_ordinal,species_index\n");
+        rateOrdinal = 0;
+        for (m = 1; m <= dims->nSpecies; m++)
+        {
+            if (MSX.Species[m].pipeExprType == RATE)
+                fprintf(f, "%d,%d\n", ++rateOrdinal, m);
+        }
     }
     fprintf(f, "attributes\n");
     if (MSX.GpuSolver == ROS2)
