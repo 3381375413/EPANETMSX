@@ -23,13 +23,19 @@ function Require-Text([string]$text, [string]$pattern, [string]$label) {
 
 $metadata = Get-Content -LiteralPath $MetadataFile -Raw
 $source = Get-Content -LiteralPath $SourceFile -Raw
-Require-Text $metadata '^cache_version=v25_ros2_joint_rate_hydpipe_abi2' 'v25 cache ABI'
+Require-Text $metadata '^cache_version=v26_ros2_analytic_rate_jacobian_hydpipe_abi3' 'v26 analytic Jacobian cache ABI'
 Require-Text $metadata '(?m)^rate_evaluator=joint_fixed_outputs\r?$' 'joint RATE evaluator metadata'
-Require-Text $source 'specialized-model-dims-v2-joint-rate-kernel-abi2' 'generator ABI v2'
+Require-Text $metadata '(?m)^rate_jacobian_mode=analytic\r?$' 'analytic Jacobian mode metadata'
+Require-Text $metadata '(?m)^rate_jacobian_eligibility=eligible\r?$' 'analytic Jacobian eligibility metadata'
+Require-Text $source 'specialized-model-dims-v3-analytic-rate-jacobian-kernel-abi3' 'generator ABI v3'
 Require-Text $source 'dims->nRate < 1' 'zero-RATE admission guard'
 Require-Text $source 'const Prog\* prog,const Prog\* termProg,const Instr\* instr' 'ROS2 helper ABI'
 Require-Text $source '\(void\)n;\(void\)rs;\(void\)prog;' 'unused helper ABI arguments'
 Require-Text $source 'out\[%d\]=\(v==v\?v:0\.0\)' 'per-RATE NaN clamp generation'
+Require-Text $source 'ros2_eval_rates_jacobian' 'joint analytic Jacobian helper'
+Require-Text $source 'jac\[%d\*jacStride\+%d\]' 'row/ordinal Jacobian mapping'
+Require-Text $source 'if\(!isfinite\(d\)\)\*analyticOk=0' 'fail-closed derivative check'
+Require-Text $source 'jc\+\+;gh0=0\.0' 'analytic Jacobian does not inflate nfcn'
 Require-Text $source 'if \(!start\) return ERR_GPU_UNSUPPORTED_FEATURE' 'missing helper start failure'
 Require-Text $source 'if \(!end\) return ERR_GPU_UNSUPPORTED_FEATURE' 'missing helper end failure'
 
@@ -50,5 +56,5 @@ if (($mapping -join ',') -ne ($ExpectedRateSpecies -join ',')) {
 }
 
 Write-Output ('specialized_metadata_passed=1')
-Write-Output ('cache_version=v25_ros2_joint_rate_hydpipe_abi2')
+Write-Output ('cache_version=v26_ros2_analytic_rate_jacobian_hydpipe_abi3')
 Write-Output ('rate_species=' + ($mapping -join ','))
