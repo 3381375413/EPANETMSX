@@ -239,6 +239,16 @@ static void t27(void)
     OK(MSXsegStorage_testResidentScanOMP(1,&team,NULL,0,after,2)==0&&
        after[0].core_count>0&&after[1].first_core_id==firstId&&
        after[1].last_core_id==lastId);
+    {
+        Pseg core = MSXsegStorage_hybridCoreSegAt(2,0);
+        uint64_t savedId = core ? core->hybridId : 0;
+        OK(core != NULL && MSXsegStorage_hybridAuditCoreSpan(2)==0);
+        if (core) core->hybridId = savedId + 1;
+        OK(MSXsegStorage_hybridAuditCoreSpan(2)==ERR_PIPE_RING_CAPACITY);
+        OK(MSXsegStorage_hybridCoreSpan(2,0,NULL,NULL)==ERR_PIPE_RING_CAPACITY);
+        if (core) core->hybridId = savedId;
+        OK(MSXsegStorage_hybridAuditCoreSpan(2)==0);
+    }
     reverseLinkForTest(2);
     OK(MSXsegStorage_hybridAfterListReorder(2)==0&&
        MSXsegStorage_hybridOrientation(2)==-1);

@@ -204,6 +204,9 @@ static int HybridResidentScanAuditState = -1;
 static int HybridResidentScanAuditWritten = 0;
 static int HybridResidentScanFullSerialState = -1;
 static int HybridResidentScanOmpAuditWritten = 0;
+#if defined(MSX_RESIDENT_SCAN_OMP_TEST) || defined(MSX_RESIDENT_CORE_SPAN_TEST)
+static unsigned long HybridResidentSpanAuditCalls = 0;
+#endif
 
 /* These values are cached only for one storage lifetime.  In particular,
    close/reopen must re-read MSX_RESIDENT_SCAN_AUDIT and
@@ -381,9 +384,9 @@ static int hybridNextSlot(const HybridPipe *p, int slot);
 static void hybridReplaceInList(int k, Pseg oldseg, Pseg newseg);
 static void hybridCopyBoundaryToSlot(int k, int slot, Pseg src);
 static void hybridMarkBoundaryCommitted(Pseg seg);
+static void hybridMarkCoreSpanDirty(HybridPipe *p);
 static int hybridVerifyCoreSpan(int k);
 static int hybridRefreshCoreSpan(int k);
-static int hybridCertifyScannedSpan(int k, const RebalanceSnapshot *s);
 extern void MSXqual_removeSeg(Pseg seg);
 extern Pseg MSXqual_getFreeSeg(double v, double c[]);
 
@@ -1161,6 +1164,10 @@ int MSXsegStorage_hybridCommitInitialImage(void)
     for (k = 1; k <= Hybrid.nLinks; ++k)
     {
         HybridPipe *p = &Hybrid.pipe[k];
+        /* Invalidate before the first visible topology/map store.  A failed
+           initial commit must never leave the previous empty certification
+           usable by CoreSpan callers. */
+        hybridMarkCoreSpanDirty(p);
         for (i = 0; i < (int)p->initialCount; ++i)
         {
             Pseg boundary = p->residentTx->oldCore[i];
@@ -1223,6 +1230,7 @@ static void hybridMarkCoreSpanDirty(HybridPipe *p)
     ++p->spanVersion;
     if (!p->spanVersion) p->spanVersion = 1;
     p->spanVerified = FALSE;
+    p->spanVerifiedVersion = 0;
 }
 
 /* Validate the dense Core interval and its CPU/Resident mirrors.  This is a
@@ -1235,6 +1243,9 @@ static int hybridVerifyCoreSpan(int k)
     Pseg seg;
     int slot, pos, coreCount = 0, seenCore = FALSE, seenBoundaryAfter = FALSE;
 
+    #if defined(MSX_RESIDENT_SCAN_OMP_TEST) || defined(MSX_RESIDENT_CORE_SPAN_TEST)
+    ++HybridResidentSpanAuditCalls;
+    #endif
     if (!MSXsegStorage_isHybridLink(k) || k <= 0 || k > Hybrid.nLinks ||
         !Hybrid.pipe) return ERR_PIPE_RING_CAPACITY;
     p = &Hybrid.pipe[k];
@@ -1273,6 +1284,17 @@ static int hybridVerifyCoreSpan(int k)
                 (residentSlot >= p->cap ||
                  p->coreSlotForResident[residentSlot] != slot))
                 return ERR_PIPE_RING_CAPACITY;
+            if (MSXresident_isOpen())
+            {
+                uint32_t generation = 0;
+                uint64_t parcelId = 0, epoch = 0;
+                if (residentSlot < 0 || residentSlot >= p->cap ||
+                    MSXresident_getSlotIdentity(
+                        (uint32_t)k, (uint32_t)residentSlot, &generation,
+                        &parcelId, &epoch) != MSX_RESIDENT_OK ||
+                    generation == 0 || parcelId != core->hybridId)
+                    return ERR_PIPE_RING_CAPACITY;
+            }
             if (pos == p->count - 1 && slot != p->tail)
                 return ERR_PIPE_RING_CAPACITY;
             slot = hybridNextSlot(p, slot);
@@ -1329,7 +1351,6 @@ static int hybridRefreshCoreSpan(int k)
     int endpoint, slot[2];
     if (!MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
     p = &Hybrid.pipe[k];
-    hybridMarkCoreSpanDirty(p);
     if (p->count < 0 || p->count > p->cap ||
         (p->orient != 1 && p->orient != -1))
         return ERR_PIPE_RING_CAPACITY;
@@ -1546,6 +1567,7 @@ void MSXsegStorage_hybridCommitPreparedResidentMaterialization(
     top = t->boundarySide ? t->boundary[0] : t->boundary[t->count - 1];
     down = t->boundarySide ? t->down[t->count - 1] : t->down[0];
     up = t->boundarySide ? t->up[0] : t->up[t->count - 1];
+    hybridMarkCoreSpanDirty(t->pipe);
     for (i = 0; i < t->count; ++i)
     {
         Pseg b = t->boundary[i];
@@ -1711,13 +1733,36 @@ static void hybridScanRebalanceSnapshot(int k, RebalanceSnapshot *s)
 static int hybridPublishRebalanceSnapshot(int k,
                                            const RebalanceSnapshot *s)
 {
-    HybridPipe *p = &Hybrid.pipe[k];
-    if (!s || s->linkIndex != k) return ERR_PIPE_RING_CAPACITY;
-    p->count = s->coreCount;
+    HybridPipe *p;
+    if (!s || !MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[k];
+    /* The scan has already traversed the CPU chain.  Publication must not
+       re-scan the dense ring or inverse maps; it only checks the certified
+       metadata and snapshot endpoints before making visible writes. */
+    if (!s->spanValid || s->linkIndex != k ||
+        !p->spanVerified || p->spanVerifiedVersion != p->spanVersion ||
+        s->orient != p->orient || s->guard != hybridPipeGuard(p) ||
+        s->coreCount != p->count || s->coreCount < 0 ||
+        s->coreCount > p->cap || s->head != p->head || s->tail != p->tail ||
+        s->total < 0 || s->downCount < 0 || s->upCount < 0 ||
+        s->coreCount + s->downCount + s->upCount != s->total ||
+        (s->coreCount == 0 && (s->head != -1 || s->tail != -1)) ||
+        (s->coreCount > 0 &&
+         (s->head < 0 || s->head >= p->cap || s->tail < 0 ||
+          s->tail >= p->cap || !p->used[s->head] || !p->used[s->tail] ||
+          !p->view[s->head] || !p->view[s->tail] ||
+          p->view[s->head] != s->firstCore ||
+          p->view[s->tail] != s->lastCore ||
+          p->view[s->head]->hybridId != s->firstCoreId ||
+          p->view[s->tail]->hybridId != s->lastCoreId)))
+    {
+        hybridMarkCoreSpanDirty(p);
+        return ERR_PIPE_RING_CAPACITY;
+    }
+    hybridMarkCoreSpanDirty(p);
     p->downstreamBoundary = s->downCount;
     p->upstreamBoundary = s->upCount;
-    p->head = s->head;
-    p->tail = s->tail;
+    if (hybridRefreshCoreSpan(k)) return ERR_PIPE_RING_CAPACITY;
     if (HybridRebalanceMetrics)
     {
         ++HybridRebalanceMetrics->scan_passes;
@@ -1725,7 +1770,7 @@ static int hybridPublishRebalanceSnapshot(int k,
         HybridRebalanceMetrics->boundary_visits +=
             (uint64_t)s->downCount + (uint64_t)s->upCount;
     }
-    return hybridCertifyScannedSpan(k, s);
+    return 0;
 }
 
 /* Scan every Resident link before any publication.  The default path uses
@@ -1775,72 +1820,6 @@ static void hybridScanResidentSnapshots(int fullSerial, int *workerIds,
     if (teamSize) *teamSize = observedTeam;
     hybridResidentScanOmpAuditRecord(
         observedTeam, fullSerial ? "FULL_SERIAL" : "FULL_OMP8");
-}
-
-/* The FULL scan has already walked the CPU chain.  Certification checks only
-   the dense ring and inverse maps here, avoiding a second CPU-list traversal
-   before serial publication. */
-static int hybridCertifyScannedSpan(int k, const RebalanceSnapshot *s)
-{
-    HybridPipe *p;
-    int slot, pos;
-    if (!s || !s->spanValid || !MSXsegStorage_isHybridLink(k))
-        return ERR_PIPE_RING_CAPACITY;
-    p = &Hybrid.pipe[k];
-    if (s->orient != p->orient || s->coreCount != p->count ||
-        s->coreCount < 0 || s->coreCount > p->cap)
-        return ERR_PIPE_RING_CAPACITY;
-    if (!s->coreCount)
-    {
-        if (p->head != -1 || p->tail != -1) return ERR_PIPE_RING_CAPACITY;
-        for (slot = 0; slot < p->cap; ++slot)
-            if (p->used[slot] || p->residentSlot[slot] >= 0 ||
-                p->coreSlotForResident[slot] >= 0)
-                return ERR_PIPE_RING_CAPACITY;
-    }
-    else
-    {
-        if (p->head < 0 || p->head >= p->cap || p->tail < 0 ||
-            p->tail >= p->cap || !p->used[p->head] || !p->used[p->tail])
-            return ERR_PIPE_RING_CAPACITY;
-        slot = p->head;
-        for (pos = 0; pos < p->count; ++pos)
-        {
-            Pseg core;
-            int residentSlot;
-            if (!p->used[slot] || !p->view[slot])
-                return ERR_PIPE_RING_CAPACITY;
-            core = p->view[slot];
-            if (!core->inHybridCore || core->ownerLink != k ||
-                core->hybridSlot != slot || !core->hybridId)
-                return ERR_PIPE_RING_CAPACITY;
-            residentSlot = p->residentSlot[slot];
-            if (residentSlot >= 0 &&
-                (residentSlot >= p->cap ||
-                 p->coreSlotForResident[residentSlot] != slot))
-                return ERR_PIPE_RING_CAPACITY;
-            if (pos == p->count - 1 && slot != p->tail)
-                return ERR_PIPE_RING_CAPACITY;
-            slot = hybridNextSlot(p, slot);
-        }
-        for (pos = 0; pos < p->cap - p->count; ++pos)
-        {
-            if (p->used[slot] || p->residentSlot[slot] >= 0)
-                return ERR_PIPE_RING_CAPACITY;
-            slot = hybridNextSlot(p, slot);
-        }
-    }
-    for (slot = 0; slot < p->cap; ++slot)
-    {
-        int coreSlot = p->coreSlotForResident[slot];
-        if (coreSlot >= 0 &&
-            (coreSlot >= p->cap || !p->used[coreSlot] ||
-             p->residentSlot[coreSlot] != slot))
-            return ERR_PIPE_RING_CAPACITY;
-    }
-    p->spanVerifiedVersion = p->spanVersion;
-    p->spanVerified = TRUE;
-    return 0;
 }
 
 #if defined(MSX_RESIDENT_SCAN_OMP_TEST)
@@ -1955,6 +1934,76 @@ int MSXsegStorage_testResidentScanAndDemotePoolFailure(
     err = hybridDemoteResidentBatch();
     Hybrid.demoteBoundaryFreeHead = freeHead;
     if (err) MSX.ErrCode = err;
+    return err;
+}
+
+#endif
+
+#if defined(MSX_RESIDENT_SCAN_OMP_TEST) || defined(MSX_RESIDENT_CORE_SPAN_TEST)
+unsigned long MSXsegStorage_testResidentSpanAuditCalls(void)
+{
+    return HybridResidentSpanAuditCalls;
+}
+
+void MSXsegStorage_testResidentSpanAuditReset(void)
+{
+    HybridResidentSpanAuditCalls = 0;
+}
+
+int MSXsegStorage_testResidentPublishFailure(int k)
+{
+    int teamSize = 1;
+    int err;
+    if (!Hybrid.opened || !Hybrid.rebalanceSnapshot ||
+        k <= 0 || k > Hybrid.nLinks)
+        return ERR_PIPE_RING_CAPACITY;
+    hybridScanResidentSnapshots(TRUE, NULL, &teamSize);
+    Hybrid.rebalanceSnapshot[k].linkIndex = k + 1;
+    err = hybridPublishRebalanceSnapshot(k, &Hybrid.rebalanceSnapshot[k]);
+    return err;
+}
+
+int MSXsegStorage_testResidentPublishCurrent(int fullSerial)
+{
+    int k, teamSize = 1, err;
+    if (!Hybrid.opened || !Hybrid.rebalanceSnapshot)
+        return ERR_PIPE_RING_CAPACITY;
+    hybridScanResidentSnapshots(fullSerial, NULL, &teamSize);
+    for (k = 1; k <= Hybrid.nLinks; ++k)
+    {
+        err = hybridPublishRebalanceSnapshot(k, &Hybrid.rebalanceSnapshot[k]);
+        if (err) return err;
+    }
+    return 0;
+}
+
+int MSXsegStorage_testResidentSpanCommitFailure(int k)
+{
+    HybridPipe *p;
+    int oldHead, err;
+    if (!MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[k];
+    oldHead = p->head;
+    hybridMarkCoreSpanDirty(p);
+    p->head = p->cap + 1;
+    err = hybridRefreshCoreSpan(k);
+    p->head = oldHead;
+    return err;
+}
+
+int MSXsegStorage_testResidentCorruptInverseMap(int k)
+{
+    HybridPipe *p;
+    int slot, oldResident, err;
+    if (!MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[k];
+    if (p->count <= 0 || p->head < 0 || p->head >= p->cap ||
+        !p->residentSlot) return ERR_PIPE_RING_CAPACITY;
+    slot = p->head;
+    oldResident = p->residentSlot[slot];
+    p->residentSlot[slot] = p->cap;
+    err = MSXsegStorage_hybridAuditCoreSpan(k);
+    p->residentSlot[slot] = oldResident;
     return err;
 }
 #endif
@@ -2117,6 +2166,9 @@ static int hybridPromote(int k, Pseg boundary, int atHead)
     if (!boundary || boundary->inHybridCore) return 0;
     /* Fixed resident capacity is checked before the first mutation. */
     if (p->fixedCap && p->count + 1 > p->cap) return ERR_PIPE_RING_CAPACITY;
+    /* Capacity migration rewrites the dense view and both inverse maps, so
+       invalidate before entering the fallible growth path. */
+    hybridMarkCoreSpanDirty(p);
     err = hybridEnsureCapacity(k, p->count + 1);
     if (err) return err;
     if (p->count == 0)
@@ -2206,6 +2258,7 @@ static int hybridDemote(int k, int atHead)
     else
 #endif
         hybridCopySlotToBoundary(k, slot, boundary);
+    hybridMarkCoreSpanDirty(p);
     if (hybridResidentRemove(k, slot))
     {
         MSXqual_removeSeg(boundary);
@@ -2407,6 +2460,7 @@ static int hybridCommitDemoteRequest(HybridDemoteRequest *r)
         r->linkIndex > Hybrid.nLinks) return ERR_PIPE_RING_CAPACITY;
     p = &Hybrid.pipe[r->linkIndex];
     residentSlot = p->residentSlot[r->coreSlot];
+    hybridMarkCoreSpanDirty(p);
     r->boundary->v = r->result.payload.volume;
     r->boundary->hstep = r->result.payload.hstep;
     r->boundary->hresponse = r->result.payload.hresponse;
@@ -2744,6 +2798,7 @@ int MSXsegStorage_hybridObserveAll(void)
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return 0;
     for (k = 1; k <= Hybrid.nLinks; k++)
     {
+        hybridMarkCoreSpanDirty(&Hybrid.pipe[k]);
         HybridResidentStatus = hybridResidentObserve(k);
         if (HybridResidentStatus != MSX_RESIDENT_OK) return ERR_PIPE_RING_CAPACITY;
         if (hybridRefreshCoreSpan(k)) return ERR_PIPE_RING_CAPACITY;
@@ -2773,6 +2828,7 @@ int MSXsegStorage_hybridRemoveHead(int k, Pseg seg)
         return ERR_PIPE_RING_CAPACITY;
     }
     next = seg->prev;
+    hybridMarkCoreSpanDirty(p);
     if (hybridResidentRemove(k, slot)) return ERR_PIPE_RING_CAPACITY;
     if (next) next->next = NULL;
     else MSX.LastSeg[k] = NULL;
@@ -2932,6 +2988,7 @@ int MSXsegStorage_hybridAfterListReorder(int k)
         /* Resident metadata is the fallible commit.  If it rejects (only
            epoch exhaustion or a poisoned state), restore the already-flipped
            CPU list before returning so the two owners cannot diverge. */
+        hybridMarkCoreSpanDirty(p);
         if (hybridResidentReverse(k))
         {
             hybridRollbackListReverse(k);
@@ -2990,6 +3047,7 @@ void MSXsegStorage_hybridClear(int k)
         MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
         return;
     }
+    hybridMarkCoreSpanDirty(p);
     seg = MSX.FirstSeg[k];
     while (seg)
     {
@@ -3141,7 +3199,7 @@ int MSXsegStorage_hybridAuditCoreSpan(int k)
 {
     int z = hybridVerifyCoreSpan(k);
     if (z && MSXsegStorage_isHybridLink(k))
-        Hybrid.pipe[k].spanVerified = FALSE;
+        hybridMarkCoreSpanDirty(&Hybrid.pipe[k]);
     return z;
 }
 

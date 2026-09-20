@@ -120,6 +120,16 @@ int MSXsegStorage_testResidentScanAndInitialize(int fullSerial, int *teamSize);
 int MSXsegStorage_testResidentScanAndDemotePoolFailure(
     int fullSerial, int *teamSize, int failureLink);
 #endif
+#if defined(MSX_RESIDENT_SCAN_OMP_TEST) || defined(MSX_RESIDENT_CORE_SPAN_TEST)
+/* Review-fix seams: prove normal publication does not invoke the full audit,
+   and exercise invalidation on controlled publish/mutation/map failures. */
+unsigned long MSXsegStorage_testResidentSpanAuditCalls(void);
+void MSXsegStorage_testResidentSpanAuditReset(void);
+int MSXsegStorage_testResidentPublishFailure(int k);
+int MSXsegStorage_testResidentPublishCurrent(int fullSerial);
+int MSXsegStorage_testResidentSpanCommitFailure(int k);
+int MSXsegStorage_testResidentCorruptInverseMap(int k);
+#endif
 /* Make the selected physical endpoint CPU-readable before transport.  This
    may stage a single Resident demotion and returns a mapped error before any
    endpoint consumer can observe a stale Core mirror. */

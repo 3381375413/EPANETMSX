@@ -211,6 +211,7 @@ static void checkCorruption(int kind)
         if (core) core->ownerLink = 0;
     }
     CHECK(MSXsegStorage_hybridAuditCoreSpan(2) == ERR_EXPECTED);
+    CHECK(MSXsegStorage_hybridCoreSpan(2, 0, &view, &count) == ERR_EXPECTED);
     if (kind == 1 && candidate) candidate->inHybridCore = FALSE;
     if (kind == 2 && seg) seg->inHybridCore = TRUE;
     if (kind == 3 && core) core->ownerLink = 2;
@@ -219,8 +220,23 @@ static void checkCorruption(int kind)
 
 int main(void)
 {
+    Pseg *view = NULL;
+    int count = 0;
     CHECK(buildFixture());
     checkGoodSpans();
+    MSXsegStorage_testResidentSpanAuditReset();
+    CHECK(MSXsegStorage_testResidentPublishCurrent(TRUE) == 0);
+    CHECK(MSXsegStorage_testResidentSpanAuditCalls() == 0);
+    CHECK(MSXsegStorage_hybridCoreSpan(2, 0, &view, &count) > 0);
+    CHECK(MSXsegStorage_testResidentPublishFailure(2) == ERR_EXPECTED);
+    CHECK(MSXsegStorage_hybridCoreSpan(2, 0, &view, &count) == ERR_EXPECTED);
+    CHECK(MSXsegStorage_hybridAuditCoreSpan(2) == 0);
+    CHECK(MSXsegStorage_testResidentSpanCommitFailure(2) == ERR_EXPECTED);
+    CHECK(MSXsegStorage_hybridCoreSpan(2, 0, &view, &count) == ERR_EXPECTED);
+    CHECK(MSXsegStorage_hybridAuditCoreSpan(2) == 0);
+    CHECK(MSXsegStorage_testResidentCorruptInverseMap(2) == ERR_EXPECTED);
+    CHECK(MSXsegStorage_hybridCoreSpan(2, 0, &view, &count) == ERR_EXPECTED);
+    CHECK(MSXsegStorage_hybridAuditCoreSpan(2) == 0);
     checkReverseAndReuse();
     destroyFixture();
 
