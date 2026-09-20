@@ -20,7 +20,7 @@
 
 #include "msxsegment_storage.h"
 #include "msxresident_core.h"
-#if defined(EPANETMSX_CUDA_ENABLED)
+#if defined(EPANETMSX_CUDA_ENABLED) || defined(MSX_RESIDENT_SCAN_OMP_TEST)
 #include "msxresident_runtime.h"
 #endif
 #include "epanet2.h"
@@ -1634,9 +1634,9 @@ int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
 
 /* Test-only production seam for the S02 ordering contract.  It executes the
    same scan -> publish -> empty-init sequence as the Resident entry point,
-   while leaving CUDA fetch/demote work out of the CPU-only Phase2a harness.
+   while keeping any fetch call out of the CPU-only Phase2a failure cases.
    No second scan implementation is maintained here. */
-int MSXsegStorage_testResidentScanAndInitialize(int fullSerial, int *teamSize)
+static int hybridTestScanPublishEmptyInit(int fullSerial, int *teamSize)
 {
     int k, err;
     if (!Hybrid.opened || !Hybrid.rebalanceSnapshot) return ERR_PIPE_RING_CAPACITY;
@@ -1648,10 +1648,63 @@ int MSXsegStorage_testResidentScanAndInitialize(int fullSerial, int *teamSize)
         if (s->coreCount == 0 && s->total > 2 * s->guard)
         {
             err = hybridInitializeResidentLink(k, s);
-            if (err) return err;
+            if (err)
+            {
+                MSX.ErrCode = err;
+                return err;
+            }
         }
     }
     return 0;
+}
+
+int MSXsegStorage_testResidentScanAndInitialize(int fullSerial, int *teamSize)
+{
+    return hybridTestScanPublishEmptyInit(fullSerial, teamSize);
+}
+
+/* Test-only fault seam for the second S02 failure surface.  The scan and
+   ordered publish/empty-init sequence is shared with the production-shaped
+   seam above.  The selected snapshot's demand counters are adjusted only to
+   request an already-valid endpoint demote; no Pseg pointer is fabricated.
+   Exhausting the pre-reserved boundary pool then exercises the real
+   hybridDemoteResidentBatch pre-commit failure path. */
+int MSXsegStorage_testResidentScanAndDemotePoolFailure(
+    int fullSerial, int *teamSize, int failureLink)
+{
+    uint32_t freeHead;
+    int err, k;
+    if (!Hybrid.opened || failureLink < 1 || failureLink > Hybrid.nLinks)
+    {
+        MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+        return ERR_PIPE_RING_CAPACITY;
+    }
+    err = hybridTestScanPublishEmptyInit(fullSerial, teamSize);
+    if (err) return err;
+    if (!Hybrid.demoteBoundary || !Hybrid.demoteBoundaryState ||
+        !Hybrid.demoteBoundaryNext || !Hybrid.demoteBoundaryCapacity)
+    {
+        MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+        return ERR_PIPE_RING_CAPACITY;
+    }
+    for (k = 1; k <= Hybrid.nLinks; ++k)
+        if (k == failureLink)
+        {
+            RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
+            if (s->coreCount <= 0)
+            {
+                MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+                return ERR_PIPE_RING_CAPACITY;
+            }
+            s->downCount = 0;
+            s->upCount = 0;
+        }
+    freeHead = Hybrid.demoteBoundaryFreeHead;
+    Hybrid.demoteBoundaryFreeHead = UINT32_MAX;
+    err = hybridDemoteResidentBatch();
+    Hybrid.demoteBoundaryFreeHead = freeHead;
+    if (err) MSX.ErrCode = err;
+    return err;
 }
 #endif
 
@@ -2052,7 +2105,7 @@ static int hybridRebalanceLink(int k)
     return 0;
 }
 
-#if defined(EPANETMSX_CUDA_ENABLED)
+#if defined(EPANETMSX_CUDA_ENABLED) || defined(MSX_RESIDENT_SCAN_OMP_TEST)
 /* Once a post-transport demote batch has been fetched and validated, only
    bounded list/mapping stores remain.  Resident removal is prevalidated for
    every request before the first CPU topology mutation. */

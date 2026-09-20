@@ -37,6 +37,13 @@ void MSXgpu_profileRecordPromote(uint64_t rows, double ms)
 { (void)rows; (void)ms; }
 void MSXgpu_profileRecordRebalance(const MSXRebalanceMetrics *metrics)
 { (void)metrics; }
+/* The failure seam stops before fetch; this test-only stub keeps the storage
+   object linkable without pulling in the production CUDA runtime. */
+MSXResidentStatus MSXresidentRuntime_fetchBatch(
+    const MSXResidentHandoffItem *items, uint32_t count, double *c,
+    double *lastc, uint32_t stride, MSXResidentHandoffResult *results)
+{ (void)items; (void)count; (void)c; (void)lastc; (void)stride;
+  (void)results; return MSX_RESIDENT_ERR_GPU; }
 
 Pseg MSXqual_getFreeSeg(double volume, double *c)
 {

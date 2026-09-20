@@ -116,6 +116,9 @@ int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
 /* Test-only seam for the production scan -> publish -> empty-init ordering.
    It is compiled only by CPU/OpenMP contract harnesses. */
 int MSXsegStorage_testResidentScanAndInitialize(int fullSerial, int *teamSize);
+/* Test-only seam for the post-scan Resident demote pool failure. */
+int MSXsegStorage_testResidentScanAndDemotePoolFailure(
+    int fullSerial, int *teamSize, int failureLink);
 #endif
 /* Make the selected physical endpoint CPU-readable before transport.  This
    may stage a single Resident demotion and returns a mapped error before any

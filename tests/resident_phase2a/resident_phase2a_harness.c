@@ -20,6 +20,13 @@ int MSXgpu_profileDetailGroupEnabled(MSXProfileDetailGroup group){(void)group;re
 void MSXgpu_profileRecordDemote(uint64_t rows,double ms){(void)rows;(void)ms;}
 void MSXgpu_profileRecordPromote(uint64_t rows,double ms){(void)rows;(void)ms;}
 void MSXgpu_profileRecordRebalance(const MSXRebalanceMetrics *metrics){(void)metrics;}
+/* The pool-failure seam must stop before fetch.  Keep the CUDA handoff
+   symbol explicit so the test-only storage build does not link production
+   runtime or fabricate a GPU result. */
+MSXResidentStatus MSXresidentRuntime_fetchBatch(
+ const MSXResidentHandoffItem *items,uint32_t count,double *c,double *lastc,
+ uint32_t stride,MSXResidentHandoffResult *results)
+{(void)items;(void)count;(void)c;(void)lastc;(void)stride;(void)results;return MSX_RESIDENT_ERR_GPU;}
 Pseg MSXqual_getFreeSeg(double v,double*c){Pseg s;int n=MSX.Nobjects[SPECIES]+1;segmentAllocCalls++;if(segmentAllocFail)return NULL;s=(Pseg)calloc(1,sizeof(*s));if(!s)return NULL;s->c=(double*)calloc(n,sizeof(double));s->lastc=(double*)calloc(n,sizeof(double));if(!s->c||!s->lastc){free(s->c);free(s->lastc);free(s);return NULL;}s->privateC=s->c;s->privateLastC=s->lastc;s->v=v;if(c)memcpy(s->c,c,n*sizeof(double));return s;}
 void MSXqual_removeSeg(Pseg s){if(!s)return;if(MSXsegStorage_hybridReleaseBoundary(s))return;free(s->privateC);if(s->privateLastC!=s->privateC)free(s->privateLastC);free(s);}
 static void csv(const char*n,const char*b){FILE*f=fopen(n,"wb");if(f){fputs(b,f);fclose(f);}}
@@ -240,4 +247,112 @@ static void t27(void)
        reversed[1].first_core_id==lastId&&reversed[1].last_core_id==firstId&&
        reversed[1].orient==-1);
 }
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t27();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+/* 28: the ordered scan seam retains the successful prefix when an empty-Core
+   rebuild hits a fixed Resident capacity.  A later link was scanned but its
+   published pipe image and CPU list remain untouched. */
+static void t28(void)
+{
+    char b[768];
+    MSXResidentLayout l;
+    Pseg prev, first2, last2, target, prefix;
+    uint64_t prefixId, first2Id, last2Id;
+    int i, team = 0, n2, c2;
+    setup(1,2);
+    MSX.SegmentStorage = SEG_STORAGE_HYBRID;
+    snprintf(b,sizeof(b),"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n"
+      "1,L1,1,1,1,2,%s\n2,L2,16,16,1,2,%s\n",UP,UP);
+    csv("resident_phase2a.csv",b);
+    OK(MSXresident_open("resident_phase2a.csv")==0);
+    MSXresident_setMode(MSX_RESIDENT_RESIDENT,1);
+    OK(MSXsegStorage_open()==0&&MSXresident_getLayout(&l)==0&&
+       MSXsegStorage_hybridReserve(&l)==0);
+    /* Link 2 is the already-published non-empty prefix; link 1 is added as
+       a valid boundary list after reserve so the scan seam, rather than
+       startup preflight, reaches the fixed-capacity failure. */
+    prev=NULL;
+    for(i=0;i<7;i++)
+    {
+        Pseg s=fseg(i+1,(uint64_t)(2600+i));
+        OK(s!=NULL); s->next=prev;
+        if(prev) prev->prev=s; else MSX.FirstSeg[2]=s;
+        prev=s; MSX.LastSeg[2]=s; MSX.Link[2].nsegs++;
+    }
+    OK(MSXsegStorage_hybridizeAll()==0&&MSXsegStorage_hybridCoreCount(2)==3);
+    first2=MSX.FirstSeg[2]; last2=MSX.LastSeg[2]; n2=MSX.Link[2].nsegs;
+    first2Id=MSXsegStorage_hybridCoreSegFromHead(2,0)->hybridId;
+    last2Id=MSXsegStorage_hybridCoreSegAt(2,2)->hybridId;
+    prev=NULL;
+    for(i=0;i<7;i++)
+    {
+        Pseg s=fseg(i+1,(uint64_t)(2700+i));
+        OK(s!=NULL); s->next=prev;
+        if(prev) prev->prev=s; else MSX.FirstSeg[1]=s;
+        prev=s; MSX.LastSeg[1]=s; MSX.Link[1].nsegs++;
+    }
+    target=MSX.FirstSeg[1];
+    for(i=0;i<2;i++) target=target->prev;
+    prefix=target; prefixId=prefix->hybridId;
+    MSX.ErrCode=0;
+    OK(MSXsegStorage_testResidentScanAndInitialize(1,&team)==ERR_PIPE_RING_CAPACITY);
+    OK(team==1&&MSX.ErrCode==ERR_PIPE_RING_CAPACITY);
+    OK(MSXsegStorage_hybridCoreCount(1)==1&&
+       MSXsegStorage_hybridCoreSegFromHead(1,0)->hybridId==prefixId&&
+       MSX.Link[1].nsegs==7);
+    OK(MSX.FirstSeg[2]==first2&&MSX.LastSeg[2]==last2&&
+       MSX.Link[2].nsegs==n2&&MSXsegStorage_hybridCoreCount(2)==3&&
+       MSXsegStorage_hybridCoreSegFromHead(2,0)->hybridId==first2Id&&
+       MSXsegStorage_hybridCoreSegAt(2,2)->hybridId==last2Id);
+}
+
+/* 29: after the complete scan and ordered publish pass, exhausting the
+   pre-reserved boundary pool makes the real hybridDemoteResidentBatch fail
+   before any CPU or Resident row commit.  The failure is injected only by
+   leasing the pool head; all valid topology and identity pointers remain. */
+static void t29(void)
+{
+    char b[768];
+    MSXResidentLayout l;
+    Pseg first1,last1,first2,last2;
+    uint64_t first1Id,last1Id,first2Id,last2Id;
+    int i,k,n1,n2,c1,c2,team=0;
+    setup(1,2);
+    MSX.SegmentStorage=SEG_STORAGE_HYBRID;
+    snprintf(b,sizeof(b),"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n"
+      "1,L1,16,16,1,2,%s\n2,L2,16,16,1,2,%s\n",UP,UP);
+    csv("resident_phase2a.csv",b);
+    OK(MSXresident_open("resident_phase2a.csv")==0);
+    MSXresident_setMode(MSX_RESIDENT_RESIDENT,1);
+    OK(MSXsegStorage_open()==0&&MSXresident_getLayout(&l)==0&&
+       MSXsegStorage_hybridReserve(&l)==0);
+    for(k=1;k<=2;k++)
+    {
+        Pseg prev=NULL;
+        for(i=0;i<5;i++)
+        {
+            Pseg s=fseg(i+1,(uint64_t)(2800+100*k+i));
+            OK(s!=NULL); s->next=prev;
+            if(prev) prev->prev=s; else MSX.FirstSeg[k]=s;
+            prev=s; MSX.LastSeg[k]=s; MSX.Link[k].nsegs++;
+        }
+    }
+    OK(MSXsegStorage_hybridizeAll()==0&&
+       MSXsegStorage_hybridCoreCount(1)==1&&MSXsegStorage_hybridCoreCount(2)==1);
+    first1=MSX.FirstSeg[1]; last1=MSX.LastSeg[1]; n1=MSX.Link[1].nsegs;
+    first2=MSX.FirstSeg[2]; last2=MSX.LastSeg[2]; n2=MSX.Link[2].nsegs;
+    first1Id=MSXsegStorage_hybridCoreSegFromHead(1,0)->hybridId;
+    last1Id=MSXsegStorage_hybridCoreSegAt(1,0)->hybridId;
+    first2Id=MSXsegStorage_hybridCoreSegFromHead(2,0)->hybridId;
+    last2Id=MSXsegStorage_hybridCoreSegAt(2,0)->hybridId;
+    MSX.ErrCode=0;
+    OK(MSXsegStorage_testResidentScanAndDemotePoolFailure(1,&team,2)==
+       ERR_MEMORY);
+    OK(team==1&&MSX.ErrCode==ERR_MEMORY);
+    c1=MSXsegStorage_hybridCoreCount(1); c2=MSXsegStorage_hybridCoreCount(2);
+    OK(MSX.FirstSeg[1]==first1&&MSX.LastSeg[1]==last1&&MSX.Link[1].nsegs==n1&&
+       c1==1&&MSXsegStorage_hybridCoreSegFromHead(1,0)->hybridId==first1Id&&
+       MSXsegStorage_hybridCoreSegAt(1,0)->hybridId==last1Id);
+    OK(MSX.FirstSeg[2]==first2&&MSX.LastSeg[2]==last2&&MSX.Link[2].nsegs==n2&&
+       c2==1&&MSXsegStorage_hybridCoreSegFromHead(2,0)->hybridId==first2Id&&
+       MSXsegStorage_hybridCoreSegAt(2,0)->hybridId==last2Id);
+}
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t27();t28();t29();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
