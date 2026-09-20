@@ -165,6 +165,37 @@ Pseg MSXsegStorage_hybridCoreSegAt(int k, int pos);
    cache miss. */
 int  MSXsegStorage_hybridCoreSpan(int k, int spanIndex, Pseg **segs,
                                   int *count);
+/* Current-reaction boundary view.  The endpoint pointers are valid only for
+   the duration of the caller's reaction section; they are never retained by
+   storage or transport.  A zero verified flag is a legal unverified state
+   and must use the caller's full filtered walk.  Structural contradiction of
+   an already-certified view returns ERR_PIPE_RING_CAPACITY. */
+int  MSXsegStorage_hybridBoundaryView(int k, Pseg *firstCore,
+                                      Pseg *lastCore, int *coreCount,
+                                      int *verified);
+enum {
+    MSX_RESIDENT_BOUNDARY_SCAN_FULL = 0,
+    MSX_RESIDENT_BOUNDARY_SCAN_SPAN = 1
+};
+typedef int (*MSXResidentBoundaryVisitor)(int k, double dt, Pseg seg,
+                                           void *context);
+typedef struct
+{
+    int spanHit;
+    int noCore;
+    int fallbackUnverified;
+    int invalid;
+    int fullWalk;
+    uint64_t visits;
+    uint64_t skippedCore;
+} MSXResidentBoundaryScanResult;
+/* Shared current-reaction traversal.  The visitor is called only for CPU
+   boundary parcels, in FirstSeg -> prev order; it is never called for Core.
+   The result counts the successful callback prefix, while callback errors
+   are returned unchanged. */
+int MSXsegStorage_visitHybridBoundarySegments(
+    int k, int mode, double dt, MSXResidentBoundaryVisitor visitor,
+    void *context, MSXResidentBoundaryScanResult *result);
 /* Explicit structural audit; unlike CoreSpan this may walk the CPU chain.
    It is intended for stage certification and controlled fault injection. */
 int  MSXsegStorage_hybridAuditCoreSpan(int k);

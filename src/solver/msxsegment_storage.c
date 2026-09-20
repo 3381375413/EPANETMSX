@@ -3392,6 +3392,139 @@ int MSXsegStorage_hybridCoreSpan(int k, int spanIndex, Pseg **segs,
     return secondCount;
 }
 
+int MSXsegStorage_hybridBoundaryView(int k, Pseg *firstCore,
+                                     Pseg *lastCore, int *coreCount,
+                                     int *verified)
+{
+    HybridPipe *p;
+    Pseg first, last;
+    if (firstCore) *firstCore = NULL;
+    if (lastCore) *lastCore = NULL;
+    if (coreCount) *coreCount = 0;
+    if (verified) *verified = 0;
+    if (!MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[k];
+    if (p->count < 0 || p->count > p->cap ||
+        (p->orient != 1 && p->orient != -1))
+        return ERR_PIPE_RING_CAPACITY;
+    if (coreCount) *coreCount = p->count;
+    if (!p->spanVerified || p->spanVerifiedVersion != p->spanVersion)
+        return 0;
+    if (p->count == 0)
+    {
+        if (p->head != -1 || p->tail != -1)
+            return ERR_PIPE_RING_CAPACITY;
+        if (verified) *verified = 1;
+        return 0;
+    }
+    if (p->cap <= 0 || p->head < 0 || p->head >= p->cap ||
+        p->tail < 0 || p->tail >= p->cap || !p->used || !p->view ||
+        !p->used[p->head] || !p->used[p->tail] ||
+        !(first = p->view[p->head]) || !(last = p->view[p->tail]) ||
+        !first->inHybridCore || !last->inHybridCore ||
+        first->ownerLink != k || last->ownerLink != k ||
+        first->hybridSlot != p->head || last->hybridSlot != p->tail ||
+        !first->hybridId || !last->hybridId)
+        return ERR_PIPE_RING_CAPACITY;
+    if (firstCore) *firstCore = first;
+    if (lastCore) *lastCore = last;
+    if (verified) *verified = 1;
+    return 0;
+}
+
+int MSXsegStorage_visitHybridBoundarySegments(
+    int k, int mode, double dt, MSXResidentBoundaryVisitor visitor,
+    void *context, MSXResidentBoundaryScanResult *result)
+{
+    MSXResidentBoundaryScanResult local = {0};
+    MSXResidentBoundaryScanResult *out = result ? result : &local;
+    Pseg seg = NULL, firstCore = NULL, lastCore = NULL;
+    int coreCount = 0, verified = 0, z;
+
+    memset(out, 0, sizeof(*out));
+    if (!visitor) return ERR_PIPE_RING_CAPACITY;
+    if (!MSXsegStorage_isHybridLink(k))
+    {
+        out->invalid = 1;
+        return ERR_PIPE_RING_CAPACITY;
+    }
+    if (mode != MSX_RESIDENT_BOUNDARY_SCAN_SPAN)
+        mode = MSX_RESIDENT_BOUNDARY_SCAN_FULL;
+
+    if (mode == MSX_RESIDENT_BOUNDARY_SCAN_SPAN)
+    {
+        z = MSXsegStorage_hybridBoundaryView(
+            k, &firstCore, &lastCore, &coreCount, &verified);
+        if (z)
+        {
+            out->invalid = 1;
+            return z;
+        }
+        if (coreCount == 0)
+        {
+            out->noCore = 1;
+            out->fullWalk = 1;
+        }
+        else if (!verified)
+        {
+            out->fallbackUnverified = 1;
+            out->fullWalk = 1;
+        }
+        else
+        {
+            out->spanHit = 1;
+            out->skippedCore = (uint64_t)coreCount;
+            seg = MSX.FirstSeg[k];
+            while (seg && seg != firstCore)
+            {
+                if (seg->inHybridCore)
+                {
+                    out->invalid = 1;
+                    return ERR_PIPE_RING_CAPACITY;
+                }
+                z = visitor(k, dt, seg, context);
+                if (z) return z;
+                ++out->visits;
+                seg = seg->prev;
+            }
+            if (seg != firstCore || !lastCore)
+            {
+                out->invalid = 1;
+                return ERR_PIPE_RING_CAPACITY;
+            }
+            for (seg = lastCore->prev; seg; seg = seg->prev)
+            {
+                if (seg->inHybridCore)
+                {
+                    out->invalid = 1;
+                    return ERR_PIPE_RING_CAPACITY;
+                }
+                z = visitor(k, dt, seg, context);
+                if (z) return z;
+                ++out->visits;
+            }
+            return 0;
+        }
+    }
+    else
+    {
+        out->fullWalk = 1;
+    }
+
+    for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev)
+    {
+        if (MSXsegStorage_isHybridCoreSegment(seg))
+        {
+            ++out->skippedCore;
+            continue;
+        }
+        z = visitor(k, dt, seg, context);
+        if (z) return z;
+        ++out->visits;
+    }
+    return 0;
+}
+
 int MSXsegStorage_hybridAuditCoreSpan(int k)
 {
     int z = hybridVerifyCoreSpan(k);

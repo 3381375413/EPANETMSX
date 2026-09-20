@@ -62,6 +62,17 @@ static double HydVar[MAX_HYD_VARS];    // Values of hydraulic variables
 static double *F;                      // Function values                      
 static double *ChemC1;
 
+static int ResidentBoundaryScanModeState = -1;
+static int ResidentBoundaryAuditState = -1;
+static int ResidentBoundaryAuditWritten = 0;
+static uint64_t ResidentBoundarySpanHits = 0;
+static uint64_t ResidentBoundaryNoCore = 0;
+static uint64_t ResidentBoundaryFallbackUnverified = 0;
+static uint64_t ResidentBoundaryInvalid = 0;
+static uint64_t ResidentBoundaryFullWalks = 0;
+static uint64_t ResidentBoundaryVisits = 0;
+static uint64_t ResidentBoundarySkippedCore = 0;
+
 #pragma omp threadprivate(TheSeg, TheLink, TheNode, TheTank, Yrate, Yequil, HydVar, F, ChemC1)
 
 //  Exported functions
@@ -101,6 +112,121 @@ static void   getPipeEquil(double t, double y[], int n, double f[]);
 static void   getTankEquil(double t, double y[], int n, double f[]);
 static int    isValidNumber(double x);                                         //(L.Rossman - 11/03/10)
 
+static void residentBoundaryAuditReset(void)
+{
+    ResidentBoundaryScanModeState = -1;
+    ResidentBoundaryAuditState = -1;
+    ResidentBoundaryAuditWritten = 0;
+    ResidentBoundarySpanHits = 0;
+    ResidentBoundaryNoCore = 0;
+    ResidentBoundaryFallbackUnverified = 0;
+    ResidentBoundaryInvalid = 0;
+    ResidentBoundaryFullWalks = 0;
+    ResidentBoundaryVisits = 0;
+    ResidentBoundarySkippedCore = 0;
+}
+
+static int residentBoundaryAuditEnabled(void)
+{
+    if (ResidentBoundaryAuditState < 0)
+    {
+        const char *value = getenv("MSX_RESIDENT_SCAN_AUDIT");
+        ResidentBoundaryAuditState =
+            value && (strcmp(value, "1") == 0 ||
+                      _stricmp(value, "YES") == 0 ||
+                      _stricmp(value, "ON") == 0);
+    }
+    return ResidentBoundaryAuditState;
+}
+
+static int residentBoundaryScanMode(void)
+{
+    const char *value;
+    if (ResidentBoundaryScanModeState >= 0)
+        return ResidentBoundaryScanModeState;
+    ResidentBoundaryScanModeState = MSX_RESIDENT_BOUNDARY_SCAN_FULL;
+    value = getenv("MSX_RESIDENT_BOUNDARY_SCAN_MODE");
+    if (value && _stricmp(value, "SPAN") == 0)
+        ResidentBoundaryScanModeState = MSX_RESIDENT_BOUNDARY_SCAN_SPAN;
+    else if (value && _stricmp(value, "FULL") == 0)
+        ResidentBoundaryScanModeState = MSX_RESIDENT_BOUNDARY_SCAN_FULL;
+    else if (!value)
+    {
+        /* The S04 scan selector is accepted as a convenience for paired
+           Resident runs.  The dedicated boundary variable still wins. */
+        value = getenv("MSX_RESIDENT_SCAN_MODE");
+        if (value && (_stricmp(value, "SPAN_OMP8") == 0 ||
+                      _stricmp(value, "SPAN_SERIAL") == 0))
+            ResidentBoundaryScanModeState = MSX_RESIDENT_BOUNDARY_SCAN_SPAN;
+    }
+    return ResidentBoundaryScanModeState;
+}
+
+static void residentBoundaryAuditAdd(uint64_t spanHits, uint64_t noCore,
+                                     uint64_t fallbackUnverified,
+                                     uint64_t invalid, uint64_t fullWalks,
+                                     uint64_t visits, uint64_t skippedCore)
+{
+    if (!residentBoundaryAuditEnabled()) return;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    ResidentBoundarySpanHits += spanHits;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    ResidentBoundaryNoCore += noCore;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    ResidentBoundaryFallbackUnverified += fallbackUnverified;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    ResidentBoundaryInvalid += invalid;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    ResidentBoundaryFullWalks += fullWalks;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    ResidentBoundaryVisits += visits;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    ResidentBoundarySkippedCore += skippedCore;
+}
+
+static void residentBoundaryAuditWrite(void)
+{
+    FILE *f;
+    if (ResidentBoundaryAuditWritten || !residentBoundaryAuditEnabled())
+        return;
+    f = fopen("resident_boundary_reaction_audit.txt", "wt");
+    if (!f) return;
+    fprintf(f, "phase=resident_boundary_reaction\n");
+    fprintf(f, "actual_mode=%s\n",
+            residentBoundaryScanMode() == MSX_RESIDENT_BOUNDARY_SCAN_SPAN ?
+            "SPAN" : "FULL");
+    fprintf(f, "span_hits=%llu\n",
+            (unsigned long long)ResidentBoundarySpanHits);
+    fprintf(f, "span_no_core=%llu\n",
+            (unsigned long long)ResidentBoundaryNoCore);
+    fprintf(f, "span_fallback_unverified=%llu\n",
+            (unsigned long long)ResidentBoundaryFallbackUnverified);
+    fprintf(f, "span_invalid=%llu\n",
+            (unsigned long long)ResidentBoundaryInvalid);
+    fprintf(f, "full_walks=%llu\n",
+            (unsigned long long)ResidentBoundaryFullWalks);
+    fprintf(f, "boundary_parcel_visits=%llu\n",
+            (unsigned long long)ResidentBoundaryVisits);
+    fprintf(f, "skipped_core_segments=%llu\n",
+            (unsigned long long)ResidentBoundarySkippedCore);
+    fclose(f);
+    ResidentBoundaryAuditWritten = 1;
+}
+
 
 //=============================================================================
 
@@ -122,6 +248,12 @@ int  MSXchem_open()
     int numTankExpr;
     int numPipeExpr;
     int errcode = 0;
+
+    residentBoundaryAuditReset();
+    /* Parse the optional audit/mode selectors before the chemistry team is
+       entered; reaction workers only read the cached values. */
+    (void)residentBoundaryAuditEnabled();
+    (void)residentBoundaryScanMode();
 
     // --- allocate memory
 
@@ -239,6 +371,7 @@ void MSXchem_close()
 **    none.
 */
 {
+    residentBoundaryAuditWrite();
     if (MSX.Compiler)	MSXcompiler_close();                                   
     if (MSX.Solver == RK5) rk5_close();
     if (MSX.Solver == ROS2) ros2_close();
@@ -919,21 +1052,27 @@ static int evalPipeHybridReactions(int k, double dt)
     return errcode;
 }
 
+static int residentBoundaryReactionVisitor(int k, double dt, Pseg seg,
+                                           void *context)
+{
+    (void)context;
+    return evalPipeSegmentReaction(k, dt, seg);
+}
+
 static int evalPipeHybridBoundaryReactions(int k, double dt)
 {
-    int errcode = 0;
-    Pseg seg = MSX.FirstSeg[k];
-    MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
-    while (seg)
-    {
-        if (!MSXsegStorage_isHybridCoreSegment(seg))
-        {
-            errcode = evalPipeSegmentReaction(k, dt, seg);
-            if (errcode) return errcode;
-        }
-        seg = seg->prev;
-    }
-    return 0;
+    MSXResidentBoundaryScanResult scan;
+    int errcode = MSXsegStorage_visitHybridBoundarySegments(
+        k, residentBoundaryScanMode(), dt, residentBoundaryReactionVisitor,
+        NULL, &scan);
+    MSXsegProfile_reactVisitsForLink(k, (int)scan.visits);
+    residentBoundaryAuditAdd((uint64_t)scan.spanHit,
+                             (uint64_t)scan.noCore,
+                             (uint64_t)scan.fallbackUnverified,
+                             (uint64_t)scan.invalid,
+                             (uint64_t)scan.fullWalk,
+                             scan.visits, scan.skippedCore);
+    return errcode;
 }
 
 //=============================================================================
