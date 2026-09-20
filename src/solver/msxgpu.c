@@ -2904,9 +2904,10 @@ static int ensureModule(void)
     uint64_t cacheKey = 0;
     int haveSpecializedDims = 0;
     int requestedCompiler;
+    int liveCompiler = MSX.GpuCompiler ? 1 : 0;
 
     memset(&specializedDims, 0, sizeof(specializedDims));
-    if (!GpuModel.valid)
+    if (!GpuModel.valid || GpuModel.compiler != liveCompiler)
     {
         err = cacheGpuModelBinding();
         if (err) return err;
