@@ -1624,6 +1624,8 @@ typedef struct
     int ready;
     int solver;
     int rk5Mode;
+    int compiler;
+    uint64_t cacheKey;
 } GpuModuleState;
 
 static GpuModuleState GpuModule;
@@ -2856,11 +2858,21 @@ static int ensureModule(void)
     GpuSpecializedDimensions specializedDims;
     uint64_t cacheKey = 0;
     int haveSpecializedDims = 0;
+    int requestedCompiler = MSX.GpuCompiler ? 1 : 0;
 
     memset(&specializedDims, 0, sizeof(specializedDims));
 
+    if (MSX.GpuCompiler)
+    {
+        err = collectSpecializedDimensions(&specializedDims);
+        if (err) return err;
+        cacheKey = hashModelExpressions();
+        haveSpecializedDims = 1;
+    }
     if (GpuModule.ready && GpuModule.solver == MSX.GpuSolver &&
-        (MSX.GpuSolver != RK5 || GpuModule.rk5Mode == MSX.GpuRk5Mode)) return 0;
+        (MSX.GpuSolver != RK5 || GpuModule.rk5Mode == MSX.GpuRk5Mode) &&
+        GpuModule.compiler == requestedCompiler &&
+        GpuModule.cacheKey == cacheKey) return 0;
     if (GpuModule.ready)
     {
         cuModuleUnload(GpuModule.module);
@@ -2878,12 +2890,6 @@ static int ensureModule(void)
                   (MSX.GpuSolver == ROS2 ? "-DMSX_GPU_SOLVER_ROS2" : "-DMSX_GPU_SOLVER_EUL");
     if (MSX.GpuSolver == RK5 && MSX.GpuRk5Mode == GPU_RK5_FAST_BUCKET)
         modeMacro = "-DMSX_GPU_RK5_FAST_BUCKET";
-    if (MSX.GpuCompiler)
-    {
-        err = collectSpecializedDimensions(&specializedDims);
-        if (err) return err;
-        haveSpecializedDims = 1;
-    }
     err = checkCu(cuInit(0), ERR_GPU_NOT_ENABLED);
     if (err) return err;
     err = checkCu(cuDeviceGet(&dev, 0), ERR_GPU_NOT_ENABLED);
@@ -2909,7 +2915,6 @@ static int ensureModule(void)
 
     if (MSX.GpuCompiler)
     {
-        cacheKey = hashModelExpressions();
         snprintf(cachePath, sizeof(cachePath), "%s/specialized_%s_%016llx_sm%d%d_%s.ptx",
                  cacheDir, solverName, (unsigned long long)cacheKey, major, minor, GPU_CACHE_VERSION);
     }
@@ -3044,6 +3049,8 @@ static int ensureModule(void)
     GpuModule.ready = 1;
     GpuModule.solver = MSX.GpuSolver;
     GpuModule.rk5Mode = MSX.GpuRk5Mode;
+    GpuModule.compiler = requestedCompiler;
+    GpuModule.cacheKey = cacheKey;
     if (haveSpecializedDims)
         writeSpecializedMetadata(cachePath, cacheKey, &specializedDims);
     if (timing)
@@ -3158,6 +3165,11 @@ int MSXgpu_prepareResidentContext(void)
 void MSXgpu_closeResidentPrograms(void)
 {
     if (GpuContext) cuCtxSetCurrent(GpuContext);
+    if (GpuModule.ready)
+    {
+        cuModuleUnload(GpuModule.module);
+        memset(&GpuModule, 0, sizeof(GpuModule));
+    }
 #ifdef EPANETMSX_CUDA_ENABLED
     if (ResidentProgram.h_err) cuMemFreeHost(ResidentProgram.h_err);
 #endif
