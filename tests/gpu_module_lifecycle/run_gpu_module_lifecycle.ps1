@@ -9,6 +9,7 @@ param(
     [string]$YesMsxFile,
     [Parameter(Mandatory = $true)]
     [string]$ResultDir,
+    [string[]]$ExplicitExpectedModes,
     [switch]$Reverse
 )
 
@@ -22,6 +23,43 @@ foreach ($path in @($RuntimeDir, $InpFile, $NoMsxFile, $YesMsxFile)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Missing lifecycle gate input: $path"
     }
+}
+$resolvedNoMsx = [IO.Path]::GetFullPath($NoMsxFile)
+$resolvedYesMsx = [IO.Path]::GetFullPath($YesMsxFile)
+if ([StringComparer]::OrdinalIgnoreCase.Equals($resolvedNoMsx, $resolvedYesMsx)) {
+    throw "NoMsxFile and YesMsxFile must be different files"
+}
+
+$expectedModes = @('NO', 'YES')
+if ($ExplicitExpectedModes) {
+    if ($ExplicitExpectedModes.Count -ne 2) {
+        throw "ExplicitExpectedModes must contain exactly two entries: NO/YES roles"
+    }
+    $expectedModes = @(
+        $ExplicitExpectedModes[0].ToUpperInvariant(),
+        $ExplicitExpectedModes[1].ToUpperInvariant()
+    )
+}
+foreach ($mode in $expectedModes) {
+    if ($mode -notin @('NO', 'YES')) {
+        throw "Unsupported expected GPU_COMPILER mode '$mode'; use NO or YES"
+    }
+}
+function Read-GpuCompilerMode([string]$msxPath) {
+    foreach ($line in Get-Content -LiteralPath $msxPath) {
+        if ($line -match '^\s*[;#]') {
+            continue
+        }
+        if ($line -match '^\s*GPU_COMPILER\s+(NO|YES)\s*$') {
+            return $Matches[1].ToUpperInvariant()
+        }
+    }
+    throw "Missing non-comment GPU_COMPILER NO/YES directive in $msxPath"
+}
+$actualNoMode = Read-GpuCompilerMode $NoMsxFile
+$actualYesMode = Read-GpuCompilerMode $YesMsxFile
+if ($actualNoMode -ne $expectedModes[0] -or $actualYesMode -ne $expectedModes[1]) {
+    throw "Lifecycle role mismatch: NoMsxFile=$actualNoMode (expected $($expectedModes[0])), YesMsxFile=$actualYesMode (expected $($expectedModes[1]))"
 }
 New-Item -ItemType Directory -Force -Path $ResultDir | Out-Null
 
