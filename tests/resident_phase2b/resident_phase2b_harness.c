@@ -144,6 +144,95 @@ static void t_active_empty(void) { MSXResidentGpu*g=initial4();MSXResidentActive
 static void t_active_abort_and_query_guard(void) { MSXResidentGpu*g=initial4();double hyd[MSX_RESIDENT_HYD_STRIDE]={0},mass[S],c[S],l[S];MSXResidentActiveItem a={1,0,1,5,2,hyd};MSXResidentActiveBatch b={&a,1};MSXResidentGpuDeviceView v;MSXResidentGpuReactResult r;MSXResidentGpuReduction q;MSXResidentHandoffItem item={1,0,1,0,5,0};MSXResidentHandoffResult meta;MSXResidentGpuFetchOutput out={&meta,c,l,S};OK(MSXresidentGpu_prepareActive(g,&b,&v,&r)==0);OK(MSXresidentGpu_reduce(g,mass,S,&q)==MSX_RESIDENT_ERR_ARGUMENT);OK(MSXresidentGpu_fetchHandoffBatch(g,&item,1,&out)==MSX_RESIDENT_ERR_ARGUMENT);OK(MSXresidentGpu_abortActive(g)==0);OK(MSXresidentGpu_prepareActive(g,&b,&v,&r)==MSX_RESIDENT_ERR_POISONED);MSXresidentGpu_close(g);}
 static void t_explicit_poison_query_guard(void) { MSXResidentGpu*g=initial4();double mass[S],c[S],l[S];MSXResidentGpuReduction q;MSXResidentHandoffItem item={1,0,1,0,5,0};MSXResidentHandoffResult meta;MSXResidentGpuFetchOutput out={&meta,c,l,S};OK(MSXresidentGpu_poison(g)==MSX_RESIDENT_OK);OK(MSXresidentGpu_reduce(g,mass,S,&q)==MSX_RESIDENT_ERR_POISONED);OK(MSXresidentGpu_fetchHandoffBatch(g,&item,1,&out)==MSX_RESIDENT_ERR_POISONED);OK(MSXresidentGpu_poison(g)==MSX_RESIDENT_OK);MSXresidentGpu_close(g);}
 static void t_large_batch(void) { static MSXResidentSlotPatch x[LARGE]; static MSXResidentActiveItem a[LARGE]; static MSXResidentHandoffItem hi[LARGE]; static MSXResidentHandoffResult hr[LARGE]; static double hc[(size_t)LARGE*S],hl[(size_t)LARGE*S]; MSXResidentDescriptorPatch d,dd[2]; MSXResidentPatchBatch b; MSXResidentGpu*g=0; MSXResidentGpuDeviceView v; MSXResidentGpuReactResult r; MSXResidentGpuReduction z; MSXResidentGpuFetchOutput fo; MSXResidentGpuTransferStats ts0,ts1; double m[S],hyd[MSX_RESIDENT_HYD_STRIDE]={0}; uint32_t cap[2]={0,LARGE},base[2]={0,0}; MSXResidentGpuOpen o={1,LARGE,S,cap,base}; for(uint32_t i=0;i<LARGE;i++){slot(&x[i],1,i,1,1000+i,1.0,(double)i);a[i]=(MSXResidentActiveItem){1,i,1,1,1.0,hyd};hi[i]=(MSXResidentHandoffItem){1,i,1,0,1};}desc(&d,1,LARGE,LARGE,1,1);b=(MSXResidentPatchBatch){&d,1,x,LARGE};OK(MSXresidentGpu_open(&o,&g)==0&&MSXresidentGpu_initialUpload(g,&b)==0);fo=(MSXResidentGpuFetchOutput){hr,hc,hl,S};OK(MSXresidentGpu_getTransferStats(g,&ts0)==0&&ts0.h2dCalls==0&&ts0.d2hCalls==0);OK(MSXresidentGpu_fetchHandoffBatch(g,hi,LARGE,&fo)==0&&hr[LARGE-1].payload.parcelId==1000+LARGE-1);OK(MSXresidentGpu_getTransferStats(g,&ts1)==0&&ts1.h2dCalls==1&&ts1.d2hCalls==3&&ts1.h2dBytes>0&&ts1.d2hBytes>0);OK(snap(g,&z,m)&&z.activeCount==LARGE);dd[0]=d;dd[1]=d;b=(MSXResidentPatchBatch){dd,2,0,0};invalid_unchanged(g,&b,MSX_RESIDENT_ERR_ARGUMENT);b=(MSXResidentPatchBatch){0,0,x,1};x[0].slot=LARGE;invalid_unchanged(g,&b,MSX_RESIDENT_ERR_CAPACITY);x[0].slot=0;{MSXResidentActiveBatch q={a,LARGE};OK(MSXresidentGpu_prepareActive(g,&q,&v,&r)==0&&v.itemCount==LARGE&&v.hydStride==MSX_RESIDENT_HYD_STRIDE);OK(MSXresidentGpu_finishActive(g,&r)==0);}MSXresidentGpu_close(g);}
+/* S06a streaming writer contract: the host writer accepts the second chunk
+   after 256 rows, while duplicate/generation/epoch failures stay host-only.
+   Transfer counters prove those failures cannot submit a new GPU batch. */
+static void t_stream_writer_large(void)
+{
+    enum { CAP = 300, ACTIVE = 257 };
+    static MSXResidentSlotPatch slots[CAP];
+    static MSXResidentActiveRow rows[ACTIVE];
+    uint32_t cap[2] = {0, CAP}, base[2] = {0, 0};
+    MSXResidentGpuOpen open = {1, CAP, S, cap, base};
+    MSXResidentDescriptorPatch d;
+    MSXResidentPatchBatch batch;
+    MSXResidentGpu *g = 0;
+    MSXResidentGpuActiveWriter w;
+    MSXResidentGpuTransferStats before, after;
+    MSXResidentHydView hyd;
+    MSXResidentGpuDeviceView view;
+    MSXResidentGpuReactResult result;
+    double pipe[(size_t)2 * MSX_RESIDENT_HYD_STRIDE] = {0};
+    uint32_t i;
+
+    desc(&d, 1, CAP, ACTIVE, 11, 1);
+    d.descriptor.tail = ACTIVE - 1;
+    for (i = 0; i < ACTIVE; ++i)
+    {
+        slot(&slots[i], 1, i, 1, UINT64_C(5000) + i, 1.0, (double)i);
+        rows[i] = (MSXResidentActiveRow){1, i, i, 1, 0, ACTIVE, 1,
+                                         11, UINT64_C(5000) + i, 1.0};
+    }
+    for (; i < CAP; ++i)
+    {
+        memset(&slots[i], 0, sizeof(slots[i]));
+        slots[i].linkIndex = 1;
+        slots[i].slot = i;
+    }
+    batch = (MSXResidentPatchBatch){&d, 1, slots, CAP};
+    open.totalSlots = CAP;
+    OK(MSXresidentGpu_open(&open, &g) == MSX_RESIDENT_OK &&
+       MSXresidentGpu_initialUpload(g, &batch) == MSX_RESIDENT_OK);
+    hyd = (MSXResidentHydView){pipe, 1, MSX_RESIDENT_HYD_STRIDE,
+                               MSX_RESIDENT_HYD_PIPE_MAJOR};
+
+    OK(MSXresidentGpu_beginActive(g, ACTIVE, 30, &w) == MSX_RESIDENT_OK);
+    for (i = 0; i < ACTIVE; ++i)
+        OK(MSXresidentGpu_appendActive(g, &w, &rows[i]) == MSX_RESIDENT_OK);
+    OK(w.count == ACTIVE && w.touchedCount == ACTIVE &&
+       w.touchedRows[255] == 255 && w.touchedRows[256] == 256);
+    OK(MSXresidentGpu_sealActive(g, &w, 30) == MSX_RESIDENT_OK && w.sealed);
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK &&
+       before.hydH2DCalls == 0);
+    OK(MSXresidentGpu_prepareSealedActiveHyd(g, &w, &hyd, &view, &result) ==
+           MSX_RESIDENT_OK && view.itemCount == ACTIVE);
+    OK(MSXresidentGpu_finishActive(g, &result) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK &&
+       before.hydH2DCalls == 1);
+
+    /* Duplicate clears the writer once; no transfer or launch is added. */
+    OK(MSXresidentGpu_beginActive(g, ACTIVE, 31, &w) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActive(g, &w, &rows[0]) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActive(g, &w, &rows[0]) ==
+           MSX_RESIDENT_ERR_ARGUMENT);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       after.hydH2DCalls == before.hydH2DCalls && after.h2dCalls == before.h2dCalls);
+
+    rows[0].generation = 9;
+    OK(MSXresidentGpu_beginActive(g, ACTIVE, 32, &w) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActive(g, &w, &rows[0]) ==
+           MSX_RESIDENT_ERR_GENERATION);
+    rows[0].generation = 1;
+    rows[0].descriptorEpoch = 12;
+    OK(MSXresidentGpu_beginActive(g, ACTIVE, 33, &w) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActive(g, &w, &rows[0]) ==
+           MSX_RESIDENT_ERR_GENERATION);
+    rows[0].descriptorEpoch = 11;
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       after.hydH2DCalls == before.hydH2DCalls && after.h2dCalls == before.h2dCalls);
+
+    /* abortActiveBuild is idempotence-guarded: a second call cannot submit or
+       mutate a new writer, and a fresh begin remains possible afterward. */
+    OK(MSXresidentGpu_beginActive(g, ACTIVE, 34, &w) == MSX_RESIDENT_OK &&
+       MSXresidentGpu_appendActive(g, &w, &rows[0]) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_abortActiveBuild(g, &w) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_abortActiveBuild(g, &w) == MSX_RESIDENT_ERR_ARGUMENT);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       after.hydH2DCalls == before.hydH2DCalls && after.h2dCalls == before.h2dCalls);
+    OK(MSXresidentGpu_beginActive(g, 0, 35, &w) == MSX_RESIDENT_OK &&
+       MSXresidentGpu_sealActive(g, &w, 35) == MSX_RESIDENT_OK);
+    MSXresidentGpu_close(g);
+}
 /* P1 typed patches: META leaves the GPU concentration vectors untouched,
    INVALIDATE carries no concentration payload, and a later IMPORT reuses the
    slot with a new generation.  The descriptor patch is intentionally sparse. */
@@ -152,4 +241,4 @@ static void t_typed_patches(void) { MSXResidentGpu*g=initial4();MSXResidentGpuRe
    must preserve both GPU payloads; INVALIDATE carries no concentration arrays. */
 desc(&multi[0],1,2,2,8,1);desc(&multi[1],2,2,2,8,-1);slot(&typed[0],1,1,1,102,3,20);typed[0].kind=MSX_RESIDENT_PATCH_META;slot(&typed[1],2,0,1,201,4,30);typed[1].kind=MSX_RESIDENT_PATCH_META;b=(MSXResidentPatchBatch){multi,2,typed,2};OK(snap(g,&a,m)&&MSXresidentGpu_applyPatches(g,&b)==0&&snap(g,&z,n)&&same(&a,&z,m,n));desc(&multi[0],1,2,2,9,1);desc(&multi[1],2,2,1,9,-1);multi[1].descriptor.head=1;multi[1].descriptor.tail=1;slot(&typed[0],1,1,1,102,3,20);typed[0].kind=MSX_RESIDENT_PATCH_META;memset(&typed[1],0,sizeof(typed[1]));typed[1].linkIndex=2;typed[1].slot=0;typed[1].generation=1;typed[1].kind=MSX_RESIDENT_PATCH_INVALIDATE;b=(MSXResidentPatchBatch){multi,2,typed,2};OK(MSXresidentGpu_applyPatches(g,&b)==0&&snap(g,&z,n)&&z.activeCount==3);MSXresidentGpu_close(g);}
 static void t_active_sync(void) { MSXResidentGpu*g=initial4();MSXResidentGpuReduction z;double mass[S],hyd[MSX_RESIDENT_HYD_STRIDE]={0},c[S],l[S],h=77;MSXResidentActiveItem a={1,0,1,5,2,hyd};MSXResidentActiveBatch b={&a,1};MSXResidentGpuDeviceView v;MSXResidentGpuReactResult r;MSXResidentGpuActiveSyncRow row;MSXResidentGpuActiveSyncOutput o={&row,c,l,S};MSXResidentDescriptorPatch d;MSXResidentPatchBatch q;OK(MSXresidentGpu_prepareActive(g,&b,&v,&r)==0);c[0]=321;l[0]=654;OK(vcopy(&v,(void*)(uintptr_t)v.c,c,sizeof(c),cudaMemcpyHostToDevice)==cudaSuccess);OK(vcopy(&v,(void*)(uintptr_t)v.lastc,l,sizeof(l),cudaMemcpyHostToDevice)==cudaSuccess);OK(vcopy(&v,(void*)(uintptr_t)v.hstep,&h,sizeof(h),cudaMemcpyHostToDevice)==cudaSuccess);OK(MSXresidentGpu_finishActive(g,&r)==0);OK(MSXresidentGpu_reduce(g,mass,S,&z)==0&&mass[0]==321*2+20*3+30*4+40*5);memset(c,0,sizeof(c));memset(l,0,sizeof(l));OK(MSXresidentGpu_syncActive(g,&o,1)==0&&row.linkIndex==1&&row.globalRow==0&&row.generation==1&&row.descriptorEpoch==5&&row.hstep==77&&c[0]==321&&l[0]==654);OK(MSXresidentGpu_prepareActive(g,&b,&v,&r)==0&&MSXresidentGpu_finishActive(g,&r)==0);desc(&d,1,2,2,6,1);q=(MSXResidentPatchBatch){&d,1,0,0};OK(MSXresidentGpu_applyPatches(g,&q)==0);OK(MSXresidentGpu_syncActive(g,&o,1)==MSX_RESIDENT_ERR_GENERATION);MSXresidentGpu_close(g);}
-int main(void) { struct cudaDeviceProp p;int n=0;cudaError_t e=cudaGetDeviceCount(&n);printf("cuda_required=true\n");if(e!=cudaSuccess||n<1){printf("gpu_name=unavailable\nassertions_passed=0\nassertions_failed=1\n");return 2;}cudaGetDeviceProperties(&p,0);printf("gpu_name=%s\n",p.name);OK(MSXresidentGpu_isEnabled()==1);t_open();t_initial();t_scatter();t_descriptor_generation();t_fetch();t_fetch_batch_contract();t_reduce_lifecycle();t_hole_initial_fetch();t_ring_span_reject();t_wrap_active();t_stream_builder();t_active_view();t_pipe_hyd_contract();t_pipe_hyd_exact_bits();t_pipe_hyd_failure_invalidates();t_active_sync();t_active_error();t_active_empty();t_active_abort_and_query_guard();t_explicit_poison_query_guard();t_large_batch();t_typed_patches();printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0; }
+int main(void) { struct cudaDeviceProp p;int n=0;cudaError_t e=cudaGetDeviceCount(&n);printf("cuda_required=true\n");if(e!=cudaSuccess||n<1){printf("gpu_name=unavailable\nassertions_passed=0\nassertions_failed=1\n");return 2;}cudaGetDeviceProperties(&p,0);printf("gpu_name=%s\n",p.name);OK(MSXresidentGpu_isEnabled()==1);t_open();t_initial();t_scatter();t_descriptor_generation();t_fetch();t_fetch_batch_contract();t_reduce_lifecycle();t_hole_initial_fetch();t_ring_span_reject();t_wrap_active();t_stream_builder();t_stream_writer_large();t_active_view();t_pipe_hyd_contract();t_pipe_hyd_exact_bits();t_pipe_hyd_failure_invalidates();t_active_sync();t_active_error();t_active_empty();t_active_abort_and_query_guard();t_explicit_poison_query_guard();t_large_batch();t_typed_patches();printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0; }

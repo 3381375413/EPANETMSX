@@ -365,4 +365,93 @@ static void t29(void)
        c2==1&&MSXsegStorage_hybridCoreSegFromHead(2,0)->hybridId==first2Id&&
        MSXsegStorage_hybridCoreSegAt(2,0)->hybridId==last2Id);
 }
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t27();t28();t29();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+/* 30: allocation-free active iteration preserves the legacy order and every
+   identity field across the 256-row chunk boundary.  The reverse fixture and
+   close/reopen check exercise the same cursor lifecycle used by production. */
+static int sameActiveRow(const MSXResidentActiveRow *a,
+                         const MSXResidentActiveRow *b)
+{
+    return a && b && a->linkIndex == b->linkIndex && a->slot == b->slot &&
+        a->globalRow == b->globalRow && a->generation == b->generation &&
+        a->descriptorHead == b->descriptorHead &&
+        a->descriptorCount == b->descriptorCount &&
+        a->descriptorOrient == b->descriptorOrient &&
+        a->descriptorEpoch == b->descriptorEpoch &&
+        a->parcelId == b->parcelId && a->volume == b->volume;
+}
+static void t30(void)
+{
+    char b[512];
+    MSXResidentActiveRow reference[257], row;
+    MSXResidentActiveIterator it;
+    double c[2] = {0, 1}, lastc[2] = {0, 2};
+    uint64_t ids[257];
+    MSXResidentPayload payloads[257];
+    unsigned char seen[300];
+    uint32_t cases[] = {0, 1, 255, 256, 257};
+    uint32_t i, j, n, refn, got, before;
+    MSXResidentStatus z;
+    for (j = 0; j < sizeof(cases)/sizeof(cases[0]); ++j)
+    {
+        uint32_t want = cases[j];
+        setup(1, 1); MSX.MaxSegments = 300;
+        onecsv(b, sizeof(b), UP, 300); open1(b);
+        for (i = 0; i < want; ++i)
+        {
+            ids[i] = UINT64_C(50000) + i;
+            payloads[i] = payload(c, lastc, (double)i + 1.0, ids[i]);
+        }
+        OK(MSXresident_observePipe(1, ids, payloads, want, 1) == MSX_RESIDENT_OK);
+        refn = 0;
+        OK(MSXresident_enumerateActive(reference, 257, &refn) == MSX_RESIDENT_OK &&
+           refn == want);
+        memset(&it, 0, sizeof(it));
+        OK(MSXresident_beginActiveIterator(&it) == MSX_RESIDENT_OK &&
+           MSXresident_validateActiveIterator(&it) == MSX_RESIDENT_OK &&
+           MSXresident_countActiveIterator(&it, &n) == MSX_RESIDENT_OK && n == want);
+        memset(seen, 0, sizeof(seen)); got = 0;
+        while ((z = MSXresident_nextActive(&it, &row)) == MSX_RESIDENT_OK)
+        {
+            OK(got < refn && sameActiveRow(&row, &reference[got]));
+            OK(row.slot < 300 && !seen[row.slot]);
+            if (row.slot < 300) seen[row.slot] = 1;
+            ++got;
+        }
+        OK(z == MSX_RESIDENT_ITER_END && got == want);
+        before = got;
+        OK(MSXresident_nextActive(&it, &row) == MSX_RESIDENT_ITER_END && got == before);
+        /* A second begin is a fresh pass, not a continuation of validate. */
+        OK(MSXresident_beginActiveIterator(&it) == MSX_RESIDENT_OK);
+        got = 0;
+        while ((z = MSXresident_nextActive(&it, &row)) == MSX_RESIDENT_OK) ++got;
+        OK(z == MSX_RESIDENT_ITER_END && got == want);
+    }
+    setup(1, 1); MSX.MaxSegments = 8;
+    onecsv(b, sizeof(b), UP, 8); open1(b);
+    for (i = 0; i < 5; ++i)
+    {
+        ids[i] = UINT64_C(60000) + i;
+        payloads[i] = payload(c, lastc, (double)i + 3.0, ids[i]);
+    }
+    OK(MSXresident_observePipe(1, ids, payloads, 5, -1) == MSX_RESIDENT_OK);
+    refn = 0;
+    OK(MSXresident_enumerateActive(reference, 8, &refn) == MSX_RESIDENT_OK && refn == 5);
+    OK(MSXresident_beginActiveIterator(&it) == MSX_RESIDENT_OK &&
+       MSXresident_validateActiveIterator(&it) == MSX_RESIDENT_OK);
+    got = 0;
+    while ((z = MSXresident_nextActive(&it, &row)) == MSX_RESIDENT_OK)
+    {
+        OK(got < refn && sameActiveRow(&row, &reference[got]) &&
+           row.descriptorOrient == -1 && row.parcelId == ids[got] &&
+           row.volume == (double)got + 3.0);
+        ++got;
+    }
+    OK(z == MSX_RESIDENT_ITER_END && got == 5);
+    MSXresident_close();
+    open1(b);
+    OK(MSXresident_beginActiveIterator(&it) == MSX_RESIDENT_OK &&
+       MSXresident_validateActiveIterator(&it) == MSX_RESIDENT_OK &&
+       MSXresident_countActiveIterator(&it, &n) == MSX_RESIDENT_OK && n == 0);
+    OK(MSXresident_nextActive(&it, &row) == MSX_RESIDENT_ITER_END);
+}
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t27();t28();t29();t30();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}

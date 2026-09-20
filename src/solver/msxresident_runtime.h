@@ -77,6 +77,7 @@ typedef struct {
     uint64_t wouldDescriptorPatches,wouldSlotPatches,stalePatches,fallbacks;
     uint64_t activeIteratorPasses,activeRowsAppended,activeFullRowCopies,
              activeBuilderAborts;
+    uint64_t activeChunkHighWater,activeChunkCapacity;
     int opened,resident;
 } MSXResidentRuntimeMetrics;
 void MSXresidentRuntime_getMetrics(MSXResidentRuntimeMetrics *);

@@ -424,10 +424,134 @@ MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*b){if(!b)return M
 void MSXresident_clearPatches(void)
 { uint32_t i,k,s; if(!S.open)return; for(i=0;i<S.ndesc;i++){k=S.desc[i].linkIndex;if(k&&k<=S.nlinks)S.dirty[k]=NONE;} for(i=0;i<S.nslot;i++){k=S.slot[i].linkIndex;s=S.slot[i].slot;if(k&&k<=S.nlinks&&s<S.p[k].d.capacity)S.p[k].patch[s]=NONE;} S.ndesc=S.nslot=0; }
 MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *o){uint32_t k;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(!S.open||!S.capacity||!S.base)return MSX_RESIDENT_DISABLED;if(!S.guard){S.guard=(uint32_t*)resident_calloc((size_t)S.nlinks+1,sizeof(*S.guard));if(!S.guard)return MSX_RESIDENT_ERR_MEMORY;for(k=1;k<=S.nlinks;k++)S.guard[k]=S.p[k].guard;}o->nLinks=S.nlinks;o->totalSlots=(uint32_t)S.slots;o->speciesStride=S.stride;o->capacity=S.capacity;o->base=S.base;o->guard=S.guard;return MSX_RESIDENT_OK;}
-MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,uint32_t cap,uint32_t *count)
-{ uint32_t k,s,n=0,total=0,base=0; if(!count||(!rows&&cap))return MSX_RESIDENT_ERR_ARGUMENT;*count=0;if(!S.open)return MSX_RESIDENT_DISABLED;
-  for(k=1;k<=S.nlinks;k++){Pipe*p=&S.p[k];uint32_t seen=0;if(p->d.count>p->d.capacity||(p->d.count&&p->d.head>=p->d.capacity))return MSX_RESIDENT_ERR_CAPACITY;s=p->d.head;while(seen<p->d.count){if(s>=p->d.capacity||!p->used[s])return MSX_RESIDENT_ERR_GENERATION;if(n>=cap)return MSX_RESIDENT_ERR_CAPACITY;rows[n].linkIndex=k;rows[n].slot=s;rows[n].globalRow=base+s;rows[n].generation=p->gen[s];rows[n].descriptorHead=p->d.head;rows[n].descriptorCount=p->d.count;rows[n].descriptorOrient=p->d.orient;rows[n].descriptorEpoch=p->d.epoch;rows[n].parcelId=p->id[s];rows[n].volume=crow(p,s)[0];n++;seen++;s=(uint32_t)(((int64_t)s+p->d.orient+(int64_t)p->d.capacity)%(int64_t)p->d.capacity);}if(base>UINT32_MAX-p->d.capacity)return MSX_RESIDENT_ERR_OVERFLOW;base+=p->d.capacity;total+=seen;}
-  if(total!=n||n>S.slots)return MSX_RESIDENT_ERR_OVERFLOW;*count=n;return MSX_RESIDENT_OK; }
+static MSXResidentStatus activeIteratorStep(MSXResidentActiveIterator *it,
+                                            MSXResidentActiveRow *row)
+{
+    Pipe *p;
+    uint32_t s;
+    if (!it || !row) return MSX_RESIDENT_ERR_ARGUMENT;
+    if (!it->active || !S.open) return MSX_RESIDENT_DISABLED;
+    if (it->done) return MSX_RESIDENT_ITER_END;
+    while (it->linkIndex <= it->nlinks)
+    {
+        p = &S.p[it->linkIndex];
+        if (it->seen == 0)
+        {
+            if (p->d.count > p->d.capacity ||
+                (p->d.count && p->d.head >= p->d.capacity))
+                return MSX_RESIDENT_ERR_CAPACITY;
+            it->slot = p->d.head;
+            it->orient = p->d.orient;
+        }
+        if (it->seen < p->d.count)
+        {
+            s = it->slot;
+            if (s >= p->d.capacity || !p->used[s])
+                return MSX_RESIDENT_ERR_GENERATION;
+            row->linkIndex = it->linkIndex;
+            row->slot = s;
+            row->globalRow = it->base + s;
+            row->generation = p->gen[s];
+            row->descriptorHead = p->d.head;
+            row->descriptorCount = p->d.count;
+            row->descriptorOrient = p->d.orient;
+            row->descriptorEpoch = p->d.epoch;
+            row->parcelId = p->id[s];
+            row->volume = crow(p, s)[0];
+            ++it->seen;
+            ++it->count;
+            ++it->total;
+            it->slot = (uint32_t)(((int64_t)s + it->orient +
+                                   (int64_t)p->d.capacity) %
+                                  (int64_t)p->d.capacity);
+            return MSX_RESIDENT_OK;
+        }
+        if (it->base > UINT32_MAX - p->d.capacity)
+            return MSX_RESIDENT_ERR_OVERFLOW;
+        it->base += p->d.capacity;
+        ++it->linkIndex;
+        it->seen = 0;
+        it->slot = 0;
+    }
+    if (it->total != it->count || it->count > S.slots)
+        return MSX_RESIDENT_ERR_OVERFLOW;
+    it->done = 1;
+    return MSX_RESIDENT_ITER_END;
+}
+
+MSXResidentStatus MSXresident_beginActiveIterator(MSXResidentActiveIterator *it)
+{
+    if (!it) return MSX_RESIDENT_ERR_ARGUMENT;
+    memset(it, 0, sizeof(*it));
+    if (!S.open) return MSX_RESIDENT_DISABLED;
+    it->active = 1;
+    it->linkIndex = 1;
+    it->nlinks = S.nlinks;
+    return MSX_RESIDENT_OK;
+}
+
+MSXResidentStatus MSXresident_validateActiveIterator(MSXResidentActiveIterator *it)
+{
+    MSXResidentActiveIterator q;
+    MSXResidentActiveRow row;
+    MSXResidentStatus z;
+    if (!it) return MSX_RESIDENT_ERR_ARGUMENT;
+    if (!it->active || !S.open) return MSX_RESIDENT_DISABLED;
+    q = *it;
+    q.linkIndex = 1;
+    q.slot = q.seen = q.base = q.count = q.total = 0;
+    q.done = 0;
+    while ((z = activeIteratorStep(&q, &row)) == MSX_RESIDENT_OK) { }
+    if (z != MSX_RESIDENT_ITER_END) return z;
+    /* Keep validation's total separate from the cursor counters.  The caller
+       may immediately count() and then consume the same iterator with next;
+       next must start at the first row, not after the validation pass. */
+    it->linkIndex = 1;
+    it->slot = it->seen = it->base = it->count = it->total = 0;
+    it->done = 0;
+    it->expectedCount = q.count;
+    it->validated = 1;
+    return MSX_RESIDENT_OK;
+}
+
+MSXResidentStatus MSXresident_countActiveIterator(
+    const MSXResidentActiveIterator *it, uint32_t *count)
+{
+    if (!it || !count) return MSX_RESIDENT_ERR_ARGUMENT;
+    if (!it->active || !S.open) return MSX_RESIDENT_DISABLED;
+    if (!it->validated) return MSX_RESIDENT_ERR_ARGUMENT;
+    *count = it->expectedCount;
+    return MSX_RESIDENT_OK;
+}
+
+MSXResidentStatus MSXresident_nextActive(MSXResidentActiveIterator *it,
+                                         MSXResidentActiveRow *row)
+{
+    return activeIteratorStep(it, row);
+}
+
+MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,
+                                               uint32_t cap,
+                                               uint32_t *count)
+{
+    MSXResidentActiveIterator it;
+    MSXResidentActiveRow row;
+    MSXResidentStatus z;
+    uint32_t n = 0;
+    if (!count || (!rows && cap)) return MSX_RESIDENT_ERR_ARGUMENT;
+    *count = 0;
+    z = MSXresident_beginActiveIterator(&it);
+    if (z != MSX_RESIDENT_OK) return z;
+    while ((z = MSXresident_nextActive(&it, &row)) == MSX_RESIDENT_OK)
+    {
+        if (n >= cap) return MSX_RESIDENT_ERR_CAPACITY;
+        if (rows) rows[n] = row;
+        ++n;
+    }
+    if (z != MSX_RESIDENT_ITER_END) return z;
+    *count = n;
+    return MSX_RESIDENT_OK;
+}
 MSXResidentStatus MSXresident_getInitialBatch(MSXResidentPatchBatch *b){uint32_t k,s,n=0;if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;if(!S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT;/* Initial image construction reuses the patch arenas; discard the staging
    indices before filling the dense all-slot image so later incremental
    markslot() calls cannot address overwritten records. */MSXresident_clearPatches();for(k=1;k<=S.nlinks;k++){S.desc[k-1].linkIndex=k;S.desc[k-1].descriptor=S.p[k].d;for(s=0;s<S.p[k].d.capacity;s++){MSXResidentSlotPatch*q=&S.slot[n++];q->linkIndex=k;q->slot=s;q->generation=S.p[k].gen[s];q->used=S.p[k].used[s];q->kind=q->used?MSX_RESIDENT_PATCH_IMPORT:MSX_RESIDENT_PATCH_INVALIDATE;getpayload(&S.p[k],s,&q->payload);}}b->descriptor=S.desc;b->descriptorCount=S.nlinks;b->slot=S.slot;b->slotCount=n;return MSX_RESIDENT_OK;}
