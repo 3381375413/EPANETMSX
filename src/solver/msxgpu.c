@@ -62,6 +62,16 @@ typedef struct
 
 typedef struct
 {
+    int valid;
+    int compiler;
+    uint64_t cacheKey;
+    GpuSpecializedDimensions dims;
+} GpuModelBinding;
+
+static GpuModelBinding GpuModel;
+
+typedef struct
+{
     int opcode;
     int ivar;
     double fvalue;
@@ -129,6 +139,9 @@ static int Ros2RawErrorSid = -1;
 #ifdef EPANETMSX_CUDA_ENABLED
 static int ReactTransferReady = 0;
 #endif
+
+static int cacheGpuModelBinding(void);
+static void clearGpuModelBinding(void);
 
 double MSXgpu_wallTimeMs(void)
 {
@@ -313,8 +326,11 @@ int MSXgpu_validateStrict(void)
 
 int MSXgpu_openTiming(void)
 {
+    int err;
     MSXgpu_profileInit();
     MSXgpu_closeTiming();
+    err = cacheGpuModelBinding();
+    if (err) return err;
     StepIndex = 0;
     memset(&TotalTiming, 0, sizeof(TotalTiming));
     memset(&RunTotals, 0, sizeof(RunTotals));
@@ -2004,6 +2020,35 @@ static uint64_t hashModelExpressions(void)
     return h;
 }
 
+static int cacheGpuModelBinding(void)
+{
+    GpuSpecializedDimensions dims;
+    int compiler = MSX.GpuCompiler ? 1 : 0;
+    int err;
+
+    memset(&dims, 0, sizeof(dims));
+    if (compiler)
+    {
+        err = collectSpecializedDimensions(&dims);
+        if (err)
+        {
+            clearGpuModelBinding();
+            return err;
+        }
+    }
+    memset(&GpuModel, 0, sizeof(GpuModel));
+    GpuModel.compiler = compiler;
+    GpuModel.dims = dims;
+    GpuModel.cacheKey = compiler ? hashModelExpressions() : 0;
+    GpuModel.valid = 1;
+    return 0;
+}
+
+static void clearGpuModelBinding(void)
+{
+    memset(&GpuModel, 0, sizeof(GpuModel));
+}
+
 static int gpuRk5PipeWarpEnabled(void)
 {
     const char *value = getenv("MSX_GPU_RK5_PIPE_WARP");
@@ -2858,15 +2903,19 @@ static int ensureModule(void)
     GpuSpecializedDimensions specializedDims;
     uint64_t cacheKey = 0;
     int haveSpecializedDims = 0;
-    int requestedCompiler = MSX.GpuCompiler ? 1 : 0;
+    int requestedCompiler;
 
     memset(&specializedDims, 0, sizeof(specializedDims));
-
-    if (MSX.GpuCompiler)
+    if (!GpuModel.valid)
     {
-        err = collectSpecializedDimensions(&specializedDims);
+        err = cacheGpuModelBinding();
         if (err) return err;
-        cacheKey = hashModelExpressions();
+    }
+    requestedCompiler = GpuModel.compiler;
+    cacheKey = GpuModel.cacheKey;
+    if (requestedCompiler)
+    {
+        specializedDims = GpuModel.dims;
         haveSpecializedDims = 1;
     }
     if (GpuModule.ready && GpuModule.solver == MSX.GpuSolver &&
@@ -2913,7 +2962,7 @@ static int ensureModule(void)
     if (err) return err;
     cleanupGpuCache(cacheDir);
 
-    if (MSX.GpuCompiler)
+    if (requestedCompiler)
     {
         snprintf(cachePath, sizeof(cachePath), "%s/specialized_%s_%016llx_sm%d%d_%s.ptx",
                  cacheDir, solverName, (unsigned long long)cacheKey, major, minor, GPU_CACHE_VERSION);
@@ -2943,7 +2992,7 @@ static int ensureModule(void)
         char *hydSource = NULL;
         const char *compileSource = GpuReactCudaSource;
         if (timing) timer = MSXgpu_wallTimeMs();
-        if (MSX.GpuCompiler)
+        if (requestedCompiler)
         {
             err = buildSpecializedCudaSource(&specializedSource);
             if (err) return err;
@@ -2964,7 +3013,7 @@ static int ensureModule(void)
             const char *ros2Fragment = GpuRos2CudaSource;
             size_t baseLen = strlen(compileSource);
             size_t ros2Len;
-            if (MSX.GpuCompiler)
+            if (requestedCompiler)
             {
                 err = specializeRos2CudaSource(GpuRos2CudaSource, &specializedDims,
                                                &specializedRos2);
@@ -3164,12 +3213,15 @@ int MSXgpu_prepareResidentContext(void)
 
 void MSXgpu_closeResidentPrograms(void)
 {
-    if (GpuContext) cuCtxSetCurrent(GpuContext);
+    if (GpuContext)
+        (void)checkCu(cuCtxSetCurrent(GpuContext), ERR_GPU_NOT_ENABLED);
     if (GpuModule.ready)
     {
-        cuModuleUnload(GpuModule.module);
+        (void)checkCu(cuModuleUnload(GpuModule.module),
+                      ERR_GPU_KERNEL_RUNTIME_ERROR);
         memset(&GpuModule, 0, sizeof(GpuModule));
     }
+    clearGpuModelBinding();
 #ifdef EPANETMSX_CUDA_ENABLED
     if (ResidentProgram.h_err) cuMemFreeHost(ResidentProgram.h_err);
 #endif
