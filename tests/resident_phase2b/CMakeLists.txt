@@ -24,5 +24,6 @@ add_custom_command(OUTPUT ${RESIDENT_CUDA_OBJ}
 add_executable(resident_phase2b_harness resident_phase2b_harness.c ${RESIDENT_CUDA_OBJ})
 target_include_directories(resident_phase2b_harness PRIVATE
   ../../src/solver ../../src ../../EPANET2.2/SRC_engines/include)
-target_compile_definitions(resident_phase2b_harness PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(resident_phase2b_harness PRIVATE
+  _CRT_SECURE_NO_WARNINGS MSX_RESIDENT_ACTIVE_STREAM_TEST)
 target_link_libraries(resident_phase2b_harness PRIVATE CUDA::cudart)

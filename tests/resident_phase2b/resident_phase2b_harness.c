@@ -314,6 +314,29 @@ static void t_batch_writer_contract(void)
     MSXresidentGpu_close(batchGpu);
     MSXresidentGpu_close(oracleGpu);
 
+    /* A zero-capacity batch is a valid no-op, while NULL with a non-zero
+       capacity is a fail-closed argument error and must not transfer. */
+    batchGpu = openStreamFixture();
+    accepted = UINT32_MAX;
+    OK(MSXresidentGpu_beginActive(batchGpu, 0, 40, &batchWriter) ==
+       MSX_RESIDENT_OK &&
+       MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, NULL, 0,
+                                         &accepted) == MSX_RESIDENT_OK &&
+       accepted == 0 &&
+       MSXresidentGpu_sealActive(batchGpu, &batchWriter, 40) ==
+           MSX_RESIDENT_OK);
+    MSXresidentGpu_close(batchGpu);
+    batchGpu = openStreamFixture();
+    OK(MSXresidentGpu_beginActive(batchGpu, ACTIVE, 40, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_getTransferStats(batchGpu, &before) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, NULL, 1,
+                                         &accepted) ==
+           MSX_RESIDENT_ERR_ARGUMENT && accepted == 0 && !batchWriter.owner);
+    OK(MSXresidentGpu_getTransferStats(batchGpu, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+    MSXresidentGpu_close(batchGpu);
+
     /* A duplicate split across batches clears the whole writer and reports
        the valid prefix accepted by the failed batch. */
     batchGpu = openStreamFixture();
@@ -437,7 +460,8 @@ typedef struct {
     MSXResidentActiveRow row[301];
     uint32_t count, emitCount, position, nextCalls, identityCalls, auditCalls;
     int nextFailAt, identityFailAt, duplicateAt, auditEvery, topologyChangeAt;
-    MSXResidentStatus nextStatus, beginStatus, validateStatus, countStatus;
+    MSXResidentStatus nextStatus, rawStatus, beginStatus, validateStatus,
+                      countStatus;
     uint64_t topologyVersion;
 } StreamSourceTest;
 
@@ -449,7 +473,8 @@ static void streamSourceReset(StreamSourceTest *s)
     s->nextFailAt = s->identityFailAt = s->duplicateAt = -1;
     s->topologyChangeAt = -1;
     s->nextStatus = MSX_RESIDENT_ERR_OVERFLOW;
-    s->beginStatus = s->validateStatus = s->countStatus = MSX_RESIDENT_OK;
+    s->rawStatus = s->beginStatus = s->validateStatus = s->countStatus =
+        MSX_RESIDENT_OK;
     s->topologyVersion = 30;
     for (i = 0; i < s->count; ++i)
     {
@@ -463,6 +488,14 @@ static MSXResidentStatus streamSourceValidate(void *p)
 { return ((StreamSourceTest *)p)->validateStatus; }
 static MSXResidentStatus streamSourceCount(void *p, uint32_t *n)
 { StreamSourceTest *s = (StreamSourceTest *)p; *n = s->count; return s->countStatus; }
+static MSXResidentStatus streamSourceRawCount(void *p, uint64_t *n,
+                                              uint32_t *links)
+{
+    StreamSourceTest *s = (StreamSourceTest *)p;
+    if (n) *n = s->count;
+    if (links) *links = 1;
+    return s->rawStatus;
+}
 static MSXResidentStatus streamSourceNext(void *p, MSXResidentActiveRow *row)
 {
     StreamSourceTest *s = (StreamSourceTest *)p;
@@ -472,6 +505,24 @@ static MSXResidentStatus streamSourceNext(void *p, MSXResidentActiveRow *row)
     if (i >= s->emitCount) return MSX_RESIDENT_ITER_END;
     *row = s->row[i];
     if (s->duplicateAt >= 0 && (int)i == s->duplicateAt) *row = s->row[0];
+    return MSX_RESIDENT_OK;
+}
+static MSXResidentStatus streamSourceNextBatch(void *p,
+                                               MSXResidentActiveRow *rows,
+                                               uint32_t cap, uint32_t *count)
+{
+    StreamSourceTest *s = (StreamSourceTest *)p;
+    MSXResidentStatus z;
+    uint32_t n = 0;
+    if (!rows || !count || !cap) return MSX_RESIDENT_ERR_ARGUMENT;
+    while (n < cap)
+    {
+        z = streamSourceNext(p, &rows[n]);
+        if (z == MSX_RESIDENT_OK) { ++n; continue; }
+        *count = n;
+        return z;
+    }
+    *count = n;
     return MSX_RESIDENT_OK;
 }
 static int streamSourceIdentity(void *p, const MSXResidentActiveRow *row)
@@ -502,7 +553,9 @@ static MSXResidentActiveStreamSource streamSource(StreamSourceTest *s, int audit
     source.begin = streamSourceBegin;
     source.validate = streamSourceValidate;
     source.count = streamSourceCount;
+    source.rawCount = streamSourceRawCount;
     source.next = streamSourceNext;
+    source.nextBatch = streamSourceNextBatch;
     source.identity = streamSourceIdentity;
     source.audit = audit ? streamSourceAudit : NULL;
     source.topology = streamSourceTopology;
@@ -562,7 +615,8 @@ static void t_runtime_stream_contract(void)
     OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active,
                                      &report) == MSX_RESIDENT_OK);
     OK(active == 257 && report.expectedCount == 257 &&
-       report.iteratorPasses == 2 && report.rowsAppended == 257 &&
+       report.iteratorPasses == 1 && report.rawCountPasses == 1 &&
+       report.rawLinks == 1 && report.rowsAppended == 257 &&
        report.chunkHighWater == 256 && report.builderAborts == 0 && w.sealed);
     OK(MSXresidentGpu_prepareSealedActiveHyd(g, &w, &hyd, &view, &result) ==
        MSX_RESIDENT_OK && view.itemCount == 257 &&
@@ -601,6 +655,42 @@ static void t_runtime_stream_contract(void)
     OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
        sameTransfer(&before, &after));
 
+    /* Identity must win when the same row is also malformed for append;
+       an earlier append failure wins over a later identity failure. */
+    streamSourceReset(&sourceState);
+    sourceState.identityFailAt = 0;
+    sourceState.row[0].volume = NAN;
+    source = streamSource(&sourceState, 0); memset(&w, 0, sizeof(w));
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK);
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active,
+                                     &report) == MSX_RESIDENT_ERR_GENERATION &&
+       report.appendFailures == 0 && report.builderAborts == 1 && !w.owner);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+    streamSourceReset(&sourceState);
+    sourceState.identityFailAt = 1;
+    sourceState.row[0].volume = NAN;
+    source = streamSource(&sourceState, 0); memset(&w, 0, sizeof(w));
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active,
+                                     &report) == MSX_RESIDENT_ERR_ARGUMENT &&
+       report.appendFailures == 1 && report.builderAborts == 1 && !w.owner);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+
+    /* A raw-count failure is deferred until the single iterator pass has
+       completed; no writer or GPU transfer may be created. */
+    streamSourceReset(&sourceState); sourceState.rawStatus =
+        MSX_RESIDENT_ERR_CAPACITY;
+    source = streamSource(&sourceState, 0); memset(&w, 0, sizeof(w));
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK);
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active,
+                                     &report) == MSX_RESIDENT_ERR_CAPACITY &&
+       report.rawCountPasses == 1 && report.iteratorPasses == 1 &&
+       report.iteratorFailures == 0 && sourceState.nextCalls > 0 &&
+       !w.owner);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+
     /* The audit continues after its first mismatch; every even row is
        counted, while append/submit remains stopped after row zero. */
     streamSourceReset(&sourceState); sourceState.auditEvery = 2;
@@ -628,7 +718,7 @@ static void t_runtime_stream_contract(void)
     OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK);
     OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active, &report) ==
        MSX_RESIDENT_ERR_CAPACITY && report.expectedCount == 301 &&
-       sourceState.nextCalls == 0);
+       report.beginFailures == 1 && sourceState.nextCalls > 0);
     OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
        sameTransfer(&before, &after));
     MSXresidentGpu_close(g);
