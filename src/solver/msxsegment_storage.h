@@ -140,9 +140,17 @@ int  MSXsegStorage_hybridOrientation(int k);
 Pseg MSXsegStorage_hybridCoreSegFromHead(int k, int pos);
 Pseg MSXsegStorage_hybridCoreSegAt(int k, int pos);
 /* Returns one of at most two contiguous downstream-to-upstream Core spans.
-   The returned Pseg views reference the authoritative dense slot arrays. */
+   This is a stable, read-only view for the current stage only: callers must
+   not retain the returned Pseg pointer across transport, handoff, reverse,
+   clear, or any other topology mutation.  The accessor requires the current
+   version to have been certified by the FULL scan or a mutation hook;
+   structural failure returns ERR_PIPE_RING_CAPACITY rather than an empty-span
+   cache miss. */
 int  MSXsegStorage_hybridCoreSpan(int k, int spanIndex, Pseg **segs,
                                   int *count);
+/* Explicit structural audit; unlike CoreSpan this may walk the CPU chain.
+   It is intended for stage certification and controlled fault injection. */
+int  MSXsegStorage_hybridAuditCoreSpan(int k);
 void MSXsegStorage_hybridPrepareCore(int k);
 void MSXsegStorage_hybridCommitCore(int k);
 int  MSXsegStorage_hybridTimingEnabled(void);
