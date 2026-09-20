@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "msxresident_runtime.h"
-#include "msxresident_active_stream.h"
 #include "msxresident_core_cuda.h"
 #include "msxresident_hash.h"
 #include "msxsegment_storage.h"
@@ -10,6 +9,8 @@
 #include "msxtypes.h"
 
 extern MSXproject MSX;
+
+#define MSX_RESIDENT_ACTIVE_CHUNK_ROWS 256u
 
 typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; MSXResidentGpu *gpu;
     uint64_t wouldDescriptors, wouldSlots, stale, fallbacks; MSXResidentStatus lastStatus;
@@ -23,6 +24,10 @@ typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; 
     uint64_t sequence, topologyVersion, stateVersion;
     uint64_t activeIteratorPasses, activeRowsAppended, activeFullRowCopies,
              activeBuilderAborts, activeChunkHighWater;
+    uint64_t activeRawCountPasses, activeRawLinks, activeRawExpectedRows,
+             activeBatchCalls, activeBatchRows, activeBeginFailures,
+             activeAppendFailures, activeIteratorFailures, activeSealFailures,
+             activeIteratorChunkCalls;
     MSXResidentGpuActiveWriter activeWriter;
     MSXResidentRuntimeToken flight;
     char status[96], resolvedCapacity[MAXFNAME]; } Runtime;
@@ -447,13 +452,23 @@ void MSXresidentRuntime_close(void)
     }
     if (emitDiagnosticSummary)
         fprintf(stderr,
-                "RESIDENT_ACTIVE_BUILDER,iterator_passes=%llu,rows_appended=%llu,full_row_copies=%llu,builder_aborts=%llu,chunk_high_water=%llu,chunk_capacity=%u\n",
+                "RESIDENT_ACTIVE_BUILDER,iterator_passes=%llu,rows_appended=%llu,full_row_copies=%llu,builder_aborts=%llu,chunk_high_water=%llu,chunk_capacity=%u,raw_count_passes=%llu,raw_links=%llu,raw_expected_rows=%llu,iterator_chunk_calls=%llu,batch_calls=%llu,batch_rows_attempted=%llu,begin_failures=%llu,append_failures=%llu,iterator_failures=%llu,seal_failures=%llu\n",
                 (unsigned long long)R.activeIteratorPasses,
                 (unsigned long long)R.activeRowsAppended,
                 (unsigned long long)R.activeFullRowCopies,
                 (unsigned long long)R.activeBuilderAborts,
                 (unsigned long long)R.activeChunkHighWater,
-                MSX_RESIDENT_ACTIVE_CHUNK_ROWS);
+                MSX_RESIDENT_ACTIVE_CHUNK_ROWS,
+                (unsigned long long)R.activeRawCountPasses,
+                (unsigned long long)R.activeRawLinks,
+                (unsigned long long)R.activeRawExpectedRows,
+                (unsigned long long)R.activeIteratorChunkCalls,
+                (unsigned long long)R.activeBatchCalls,
+                (unsigned long long)R.activeBatchRows,
+                (unsigned long long)R.activeBeginFailures,
+                (unsigned long long)R.activeAppendFailures,
+                (unsigned long long)R.activeIteratorFailures,
+                (unsigned long long)R.activeSealFailures);
     /* Same CUDA context: destroy dependent program objects before its mirror. */
     MSXgpu_closeResidentPrograms();
     if (R.gpu) { MSXresidentGpu_close(R.gpu); R.gpu=0; }
@@ -713,104 +728,216 @@ int MSXresidentRuntime_completeHandoffs(void)
                                           fetchCalls);
     return 0;
 }
-typedef struct {
-    MSXResidentActiveIterator iterator;
-    const MSXResidentHydView *hyd;
-    int stage;
-    double validationTimer;
-    double streamTimer;
-} RuntimeActiveSource;
+static int runtimeActiveIdentity(const MSXResidentActiveRow *row)
+{
+    return row && MSXsegStorage_isHybridCoreSlotIdentity((int)row->linkIndex,
+                                                          (int)row->slot,
+                                                          row->parcelId);
+}
 
-static MSXResidentStatus runtimeActiveBegin(void *context)
-{ return MSXresident_beginActiveIterator(&((RuntimeActiveSource *)context)->iterator); }
-static MSXResidentStatus runtimeActiveValidate(void *context)
-{ return MSXresident_validateActiveIterator(&((RuntimeActiveSource *)context)->iterator); }
-static MSXResidentStatus runtimeActiveCount(void *context, uint32_t *count)
-{ return MSXresident_countActiveIterator(&((RuntimeActiveSource *)context)->iterator, count); }
-static MSXResidentStatus runtimeActiveNext(void *context, MSXResidentActiveRow *row)
-{ return MSXresident_nextActive(&((RuntimeActiveSource *)context)->iterator, row); }
-static int runtimeActiveIdentity(void *context, const MSXResidentActiveRow *row)
+/* S06b production builder: one raw descriptor-count pass followed by one
+   read-only iterator pass.  The raw pass is deliberately weaker than the
+   iterator so descriptor/count and GPU-begin failures remain deferred while
+   a later historical iterator error retains priority. */
+static MSXResidentStatus runtimeBuildActive(MSXResidentGpuActiveWriter *writer,
+                                             uint32_t *activeOut,
+                                             const MSXResidentHydView *hyd)
 {
-    (void)context;
-    return MSXsegStorage_isHybridCoreSlotIdentity((int)row->linkIndex,
-                                                    (int)row->slot,
-                                                    row->parcelId);
-}
-static int runtimeActiveAudit(void *context, const MSXResidentActiveRow *row)
-{
-    RuntimeActiveSource *source = (RuntimeActiveSource *)context;
-    return auditHydRow(row, source->hyd);
-}
-static uint64_t runtimeActiveTopology(void *context)
-{ (void)context; return R.topologyVersion; }
-static void runtimeActiveValidationEnd(void *context)
-{
-    RuntimeActiveSource *source = (RuntimeActiveSource *)context;
-    if (source->stage)
+    MSXResidentActiveIterator iterator;
+    MSXResidentActiveRow rows[MSX_RESIDENT_ACTIVE_CHUNK_ROWS];
+    MSXResidentStatus s, deferredBegin = MSX_RESIDENT_OK;
+    MSXResidentStatus deferred = MSX_RESIDENT_OK;
+    MSXResidentStatus iterError = MSX_RESIDENT_OK;
+    uint64_t rawCount = 0, hydMismatches = 0;
+    uint32_t rawLinks = 0, expected = 0, batchCount, i;
+    int writerLive = 0, done = 0, stage;
+    double enumerateStart = 0.0, streamStart = 0.0;
+
+    if (!writer || !activeOut) return MSX_RESIDENT_ERR_ARGUMENT;
+    *activeOut = 0;
+    stage = MSXgpu_profileStageEnabled();
+    if (stage) enumerateStart = MSXgpu_wallTimeMs();
+
+    ++R.activeRawCountPasses;
+    s = MSXresident_rawActiveCount(&rawCount, &rawLinks);
+    R.activeRawLinks += rawLinks;
+    R.activeRawExpectedRows += rawCount;
+    if (s != MSX_RESIDENT_OK)
+        deferredBegin = s;
+    else if (rawCount > UINT32_MAX)
+        deferredBegin = MSX_RESIDENT_ERR_OVERFLOW;
+    else
+        expected = (uint32_t)rawCount;
+
+    ++R.activeIteratorPasses;
+    s = MSXresident_beginActiveIterator(&iterator);
+    if (s != MSX_RESIDENT_OK)
+        iterError = s;
+    if (stage)
     {
-        double elapsed = MSXgpu_wallTimeMs() - source->validationTimer;
+        double elapsed = MSXgpu_wallTimeMs() - enumerateStart;
         MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_ENUMERATE, elapsed);
         MSX.GpuTimingRecord.resident_enumerate_filter_ms += elapsed;
     }
-}
-static void runtimeActiveStreamBegin(void *context)
-{
-    RuntimeActiveSource *source = (RuntimeActiveSource *)context;
-    if (source->stage) source->streamTimer = MSXgpu_wallTimeMs();
-}
-static void runtimeActiveStreamEnd(void *context)
-{
-    RuntimeActiveSource *source = (RuntimeActiveSource *)context;
-    if (source->stage)
+    if (iterError != MSX_RESIDENT_OK)
     {
-        double elapsed = MSXgpu_wallTimeMs() - source->streamTimer;
-        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_IDENTITY_FILTER, elapsed);
+        ++R.activeIteratorFailures;
+        return iterError;
+    }
+
+    if (deferredBegin == MSX_RESIDENT_OK)
+    {
+        s = MSXresidentGpu_beginActive(R.gpu, expected, R.topologyVersion,
+                                       writer);
+        if (s != MSX_RESIDENT_OK)
+        {
+            deferredBegin = s;
+            ++R.activeBeginFailures;
+        }
+        else
+            writerLive = 1;
+    }
+
+    if (stage) streamStart = MSXgpu_wallTimeMs();
+    while (!done)
+    {
+        uint32_t identityFail = 0, hydFail = 0, accepted = 0;
+        uint32_t appendCount = 0;
+        MSXResidentStatus terminal = MSX_RESIDENT_OK;
+        MSXResidentStatus nextStatus;
+        int haveIdentityFail = 0, haveHydFail = 0;
+
+        s = MSXresident_nextActiveBatch(&iterator, rows,
+                                        MSX_RESIDENT_ACTIVE_CHUNK_ROWS,
+                                        &batchCount);
+        nextStatus = s;
+        if (batchCount > R.activeChunkHighWater)
+            R.activeChunkHighWater = batchCount;
+        if (batchCount)
+            ++R.activeIteratorChunkCalls;
+
+        /* Preserve the old row order: identity is checked before append and
+           Hyd audit is observed after the row prefix is committed.  A
+           contiguous prefix is therefore the largest safe batch. */
+        if (deferred == MSX_RESIDENT_OK && writerLive)
+        {
+            for (i = 0; i < batchCount; ++i)
+                if (!runtimeActiveIdentity(&rows[i]))
+                {
+                    identityFail = i;
+                    haveIdentityFail = 1;
+                    break;
+                }
+        }
+        if (R.auditHyd)
+        {
+            for (i = 0; i < batchCount; ++i)
+                if (auditHydRow(&rows[i], hyd))
+                {
+                    ++hydMismatches;
+                    if (!haveHydFail)
+                    {
+                        hydFail = i;
+                        haveHydFail = 1;
+                    }
+                }
+        }
+
+        if (deferred == MSX_RESIDENT_OK && writerLive)
+        {
+            if (haveIdentityFail &&
+                (!haveHydFail || identityFail <= hydFail))
+            {
+                appendCount = identityFail;
+                terminal = MSX_RESIDENT_ERR_GENERATION;
+            }
+            else if (haveHydFail)
+            {
+                appendCount = hydFail + 1u;
+                terminal = MSX_RESIDENT_ERR_ARGUMENT;
+            }
+            else
+                appendCount = batchCount;
+
+            if (appendCount)
+            {
+                ++R.activeBatchCalls;
+                R.activeBatchRows += appendCount;
+                s = MSXresidentGpu_appendActiveBatch(R.gpu, writer, rows,
+                                                      appendCount, &accepted);
+                R.activeRowsAppended += accepted;
+                if (s != MSX_RESIDENT_OK)
+                {
+                    deferred = s;
+                    ++R.activeAppendFailures;
+                    ++R.activeBuilderAborts;
+                    writerLive = 0; /* batch API resets the writer */
+                }
+                else if (terminal != MSX_RESIDENT_OK)
+                {
+                    deferred = terminal;
+                    ++R.activeBuilderAborts;
+                    (void)MSXresidentGpu_abortActiveBuild(R.gpu, writer);
+                    writerLive = 0;
+                }
+            }
+            else if (terminal != MSX_RESIDENT_OK)
+            {
+                deferred = terminal;
+                ++R.activeBuilderAborts;
+                (void)MSXresidentGpu_abortActiveBuild(R.gpu, writer);
+                writerLive = 0;
+            }
+        }
+
+        if (nextStatus == MSX_RESIDENT_ITER_END)
+            done = 1;
+        else if (nextStatus != MSX_RESIDENT_OK)
+        {
+            iterError = nextStatus;
+            done = 1;
+        }
+    }
+    if (stage)
+    {
+        double elapsed = MSXgpu_wallTimeMs() - streamStart;
+        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_IDENTITY_FILTER,
+                               elapsed);
         MSX.GpuTimingRecord.resident_enumerate_filter_ms += elapsed;
     }
-}
-
-static MSXResidentStatus runtimeBuildActive(MSXResidentGpuActiveWriter *writer,
-                                            uint32_t *activeOut,
-                                            const MSXResidentHydView *hyd)
-{
-    RuntimeActiveSource context;
-    MSXResidentActiveStreamSource source;
-    MSXResidentActiveStreamReport report;
-    MSXResidentStatus s;
-    int stage = MSXgpu_profileStageEnabled();
-
-    if (!writer || !activeOut) return MSX_RESIDENT_ERR_ARGUMENT;
-    memset(&context, 0, sizeof(context));
-    context.hyd = hyd;
-    context.stage = stage;
-    context.validationTimer = stage ? MSXgpu_wallTimeMs() : 0.0;
-    source.context = &context;
-    source.begin = runtimeActiveBegin;
-    source.validate = runtimeActiveValidate;
-    source.count = runtimeActiveCount;
-    source.next = runtimeActiveNext;
-    source.identity = runtimeActiveIdentity;
-    source.audit = R.auditHyd ? runtimeActiveAudit : NULL;
-    source.topology = runtimeActiveTopology;
-    source.validationEnd = runtimeActiveValidationEnd;
-    source.streamBegin = runtimeActiveStreamBegin;
-    source.streamEnd = runtimeActiveStreamEnd;
-    s = MSXresident_activeStreamBuild(R.gpu, writer, R.topologyVersion,
-                                      &source, hyd, activeOut, &report);
-    R.activeIteratorPasses += report.iteratorPasses;
-    R.activeRowsAppended += report.rowsAppended;
-    R.activeBuilderAborts += report.builderAborts;
-    if (report.chunkHighWater > R.activeChunkHighWater)
-        R.activeChunkHighWater = report.chunkHighWater;
     if (R.auditHyd)
     {
-        fprintf(stderr, "RESIDENT_HYD_AUDIT,active=%u,mismatches=%llu\n",
-                report.expectedCount, (unsigned long long)report.hydMismatches);
+        fprintf(stderr, "RESIDENT_HYD_AUDIT,active=%llu,mismatches=%llu\n",
+                (unsigned long long)rawCount,
+                (unsigned long long)hydMismatches);
         fflush(stderr);
     }
-    if (stage && s == MSX_RESIDENT_OK)
-        MSX.GpuTimingRecord.resident_active_rows += *activeOut;
-    return s;
+
+    /* Iterator errors always win, including an error returned with a partial
+       batch.  Abort only while this call still owns a live writer. */
+    if (iterError != MSX_RESIDENT_OK)
+    {
+        ++R.activeIteratorFailures;
+        if (writerLive)
+        {
+            ++R.activeBuilderAborts;
+            (void)MSXresidentGpu_abortActiveBuild(R.gpu, writer);
+            writerLive = 0;
+        }
+        return iterError;
+    }
+    if (deferredBegin != MSX_RESIDENT_OK) return deferredBegin;
+    if (deferred != MSX_RESIDENT_OK) return deferred;
+    s = MSXresidentGpu_sealActive(R.gpu, writer, R.topologyVersion);
+    if (s != MSX_RESIDENT_OK)
+    {
+        ++R.activeSealFailures;
+        ++R.activeBuilderAborts;
+        return s;
+    }
+    *activeOut = expected;
+    if (stage) MSX.GpuTimingRecord.resident_active_rows += *activeOut;
+    return MSX_RESIDENT_OK;
 }
 
 /* A stale caller token must never leave the device submission live: its
@@ -926,4 +1053,4 @@ const char *MSXresidentRuntime_status(void) { return R.status; }
 MSXResidentStatus MSXresidentRuntime_lastStatus(void) { return R.lastStatus; }
 const char *MSXresidentRuntime_resolvedCapacityPath(void) { return R.resolvedCapacity; }
 void MSXresidentRuntime_getMetrics(MSXResidentRuntimeMetrics *m)
-{ if(!m)return; m->wouldDescriptorPatches=R.wouldDescriptors; m->wouldSlotPatches=R.wouldSlots; m->stalePatches=R.stale; m->fallbacks=R.fallbacks; m->activeIteratorPasses=R.activeIteratorPasses; m->activeRowsAppended=R.activeRowsAppended; m->activeFullRowCopies=R.activeFullRowCopies; m->activeBuilderAborts=R.activeBuilderAborts; m->activeChunkHighWater=R.activeChunkHighWater; m->activeChunkCapacity=MSX_RESIDENT_ACTIVE_CHUNK_ROWS; m->opened=R.opened; m->resident=R.resident; }
+{ if(!m)return; m->wouldDescriptorPatches=R.wouldDescriptors; m->wouldSlotPatches=R.wouldSlots; m->stalePatches=R.stale; m->fallbacks=R.fallbacks; m->activeIteratorPasses=R.activeIteratorPasses; m->activeRowsAppended=R.activeRowsAppended; m->activeFullRowCopies=R.activeFullRowCopies; m->activeBuilderAborts=R.activeBuilderAborts; m->activeChunkHighWater=R.activeChunkHighWater; m->activeChunkCapacity=MSX_RESIDENT_ACTIVE_CHUNK_ROWS; m->activeRawCountPasses=R.activeRawCountPasses; m->activeRawLinks=R.activeRawLinks; m->activeRawExpectedRows=R.activeRawExpectedRows; m->activeIteratorChunkCalls=R.activeIteratorChunkCalls; m->activeBatchCalls=R.activeBatchCalls; m->activeBatchRows=R.activeBatchRows; m->activeBeginFailures=R.activeBeginFailures; m->activeAppendFailures=R.activeAppendFailures; m->activeIteratorFailures=R.activeIteratorFailures; m->activeSealFailures=R.activeSealFailures; m->opened=R.opened; m->resident=R.resident; }

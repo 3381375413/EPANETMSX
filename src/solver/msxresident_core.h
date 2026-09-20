@@ -103,6 +103,16 @@ MSXResidentStatus MSXresident_countActiveIterator(const MSXResidentActiveIterato
                                                    uint32_t *count);
 MSXResidentStatus MSXresident_nextActive(MSXResidentActiveIterator *,
                                          MSXResidentActiveRow *row);
+/* S06b production path: raw descriptor count is a read-only O(P) pass.  It
+   deliberately does not inspect capacity/head/used/generation so a later
+   iterator error retains the historical priority. */
+MSXResidentStatus MSXresident_rawActiveCount(uint64_t *count, uint32_t *links);
+/* Emits at most cap rows without crossing a pipe boundary.  A partial batch
+   is returned with the iterator error status so callers can preserve rows
+   already consumed before that error. */
+MSXResidentStatus MSXresident_nextActiveBatch(MSXResidentActiveIterator *,
+                                              MSXResidentActiveRow *rows,
+                                              uint32_t cap, uint32_t *count);
 /* Complete fixed image: one descriptor per link and one patch per owned slot;
    unused rows are included with used=0. Valid until close/reset. */
 MSXResidentStatus MSXresident_getInitialBatch(MSXResidentPatchBatch *);

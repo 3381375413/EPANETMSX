@@ -78,6 +78,11 @@ typedef struct {
     uint64_t activeIteratorPasses,activeRowsAppended,activeFullRowCopies,
              activeBuilderAborts;
     uint64_t activeChunkHighWater,activeChunkCapacity;
+    uint64_t activeRawCountPasses,activeRawLinks,activeRawExpectedRows;
+    uint64_t activeBatchCalls,activeBatchRows;
+    uint64_t activeBeginFailures,activeAppendFailures,
+             activeIteratorFailures,activeSealFailures;
+    uint64_t activeIteratorChunkCalls;
     int opened,resident;
 } MSXResidentRuntimeMetrics;
 void MSXresidentRuntime_getMetrics(MSXResidentRuntimeMetrics *);

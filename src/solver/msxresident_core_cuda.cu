@@ -748,41 +748,89 @@ extern "C" MSXResidentStatus MSXresidentGpu_beginActive(
     g->activeWriter = w; g->activeBuilding = 1; g->activeSealed = 0;
     return MSX_RESIDENT_OK;
 }
-extern "C" MSXResidentStatus MSXresidentGpu_appendActive(
+static MSXResidentStatus appendActiveRowNoReset(
     MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,
     const MSXResidentActiveRow *x)
 {
     uint32_t row, local, n;
-    if (!g || !w || w->owner != g || !w->building || !w->valid || !x ||
-        g->activeWriter != w) return MSX_RESIDENT_ERR_ARGUMENT;
     n = w->count;
-    if (n >= w->expectedCount || n >= g->owned) goto capacity;
-    if (!x->linkIndex || x->linkIndex > g->n) goto argument;
+    if (n >= w->expectedCount || n >= g->owned)
+        return MSX_RESIDENT_ERR_CAPACITY;
+    if (!x->linkIndex || x->linkIndex > g->n)
+        return MSX_RESIDENT_ERR_ARGUMENT;
     if (x->slot >= g->cap[x->linkIndex] ||
-        x->globalRow != g->base[x->linkIndex] + x->slot) goto capacity;
-    row = x->globalRow; local = row - g->base[x->linkIndex];
-    if (!isfinite(x->volume)) goto argument;
+        x->globalRow != g->base[x->linkIndex] + x->slot)
+        return MSX_RESIDENT_ERR_CAPACITY;
+    row = x->globalRow;
+    local = row - g->base[x->linkIndex];
+    if (!isfinite(x->volume))
+        return MSX_RESIDENT_ERR_ARGUMENT;
     if (!g->hu[row] || g->hg[row] != x->generation ||
         g->he[x->linkIndex] != x->descriptorEpoch ||
         !activeMember(&g->hd[x->linkIndex], local)) {
         g->c.staleGeneration++;
-        w->valid = 0; clearActiveSeen(g, w); w->count = 0;
-        resetActiveWriter(g, w);
         return MSX_RESIDENT_ERR_GENERATION;
     }
-    if (g->activeSeen[row] == w->buildSequence) goto argument;
+    if (g->activeSeen[row] == w->buildSequence)
+        return MSX_RESIDENT_ERR_ARGUMENT;
     g->activeSeen[row] = w->buildSequence;
-    g->haPipe[n] = x->linkIndex; g->haRow[n] = row;
-    g->haGen[n] = x->generation; g->haEpoch[n] = x->descriptorEpoch;
+    g->haPipe[n] = x->linkIndex;
+    g->haRow[n] = row;
+    g->haGen[n] = x->generation;
+    g->haEpoch[n] = x->descriptorEpoch;
     g->haVol[n] = x->volume;
-    w->count = n + 1; w->touchedCount = w->count;
+    w->count = n + 1;
+    w->touchedCount = w->count;
     return MSX_RESIDENT_OK;
-capacity:
-    w->valid = 0; clearActiveSeen(g, w); w->count = 0;
-    resetActiveWriter(g, w); return MSX_RESIDENT_ERR_CAPACITY;
-argument:
-    w->valid = 0; clearActiveSeen(g, w); w->count = 0;
-    resetActiveWriter(g, w); return MSX_RESIDENT_ERR_ARGUMENT;
+}
+
+static MSXResidentStatus failActiveWriter(
+    MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,
+    MSXResidentStatus status)
+{
+    w->valid = 0;
+    clearActiveSeen(g, w);
+    w->count = 0;
+    resetActiveWriter(g, w);
+    return status;
+}
+
+extern "C" MSXResidentStatus MSXresidentGpu_appendActive(
+    MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,
+    const MSXResidentActiveRow *x)
+{
+    MSXResidentStatus status;
+    if (!g || !w || w->owner != g || !w->building || !w->valid || !x ||
+        g->activeWriter != w)
+        return MSX_RESIDENT_ERR_ARGUMENT;
+    status = appendActiveRowNoReset(g, w, x);
+    return status == MSX_RESIDENT_OK ? status :
+        failActiveWriter(g, w, status);
+}
+
+extern "C" MSXResidentStatus MSXresidentGpu_appendActiveBatch(
+    MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,
+    const MSXResidentActiveRow *rows, uint32_t count, uint32_t *accepted)
+{
+    uint32_t i;
+    MSXResidentStatus status;
+    if (accepted) *accepted = 0;
+    if (!g || !w || w->owner != g || !w->building || !w->valid ||
+        g->activeWriter != w)
+        return MSX_RESIDENT_ERR_ARGUMENT;
+    if (!rows && count)
+        return failActiveWriter(g, w, MSX_RESIDENT_ERR_ARGUMENT);
+    for (i = 0; i < count; ++i)
+    {
+        status = appendActiveRowNoReset(g, w, &rows[i]);
+        if (status != MSX_RESIDENT_OK)
+        {
+            if (accepted) *accepted = i;
+            return failActiveWriter(g, w, status);
+        }
+    }
+    if (accepted) *accepted = count;
+    return MSX_RESIDENT_OK;
 }
 extern "C" MSXResidentStatus MSXresidentGpu_sealActive(
     MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,

@@ -234,6 +234,205 @@ static void t_stream_writer_large(void)
        MSXresidentGpu_sealActive(g, &w, 35) == MSX_RESIDENT_OK);
     MSXresidentGpu_close(g);
 }
+static MSXResidentGpu *openStreamFixture(void);
+static int captureSealedWriter(MSXResidentGpu *g,
+                               MSXResidentGpuActiveWriter *w,
+                               uint32_t count,
+                               uint32_t *pipeOut,
+                               uint32_t *rowOut,
+                               double *volOut)
+{
+    double hyd[(size_t)2 * MSX_RESIDENT_HYD_STRIDE] = {0};
+    MSXResidentHydView h = {hyd, 1, MSX_RESIDENT_HYD_STRIDE,
+                            MSX_RESIDENT_HYD_PIPE_MAJOR};
+    MSXResidentGpuDeviceView v;
+    MSXResidentGpuReactResult r;
+    if (MSXresidentGpu_prepareSealedActiveHyd(g, w, &h, &v, &r) !=
+        MSX_RESIDENT_OK || v.itemCount != count)
+        return 0;
+    if (count &&
+        (vcopy(&v, pipeOut, (const void *)(uintptr_t)v.segPipe,
+               (size_t)count * sizeof(*pipeOut), cudaMemcpyDeviceToHost) !=
+             cudaSuccess ||
+         vcopy(&v, rowOut, (const void *)(uintptr_t)v.segRow,
+               (size_t)count * sizeof(*rowOut), cudaMemcpyDeviceToHost) !=
+             cudaSuccess ||
+         vcopy(&v, volOut, (const void *)(uintptr_t)v.segVol,
+               (size_t)count * sizeof(*volOut), cudaMemcpyDeviceToHost) !=
+             cudaSuccess))
+        return 0;
+    return MSXresidentGpu_finishActive(g, &r) == MSX_RESIDENT_OK;
+}
+
+/* S06b batch writer contract.  The batch path must produce the same pinned
+   active payload as the legacy one-row path, while preserving seen state
+   across a 256/1 split and clearing it on every failed batch. */
+static void t_batch_writer_contract(void)
+{
+    enum { CAP = 300, ACTIVE = 257 };
+    static MSXResidentActiveRow rows[ACTIVE];
+    uint32_t i, accepted, pipeBatch[ACTIVE], rowBatch[ACTIVE];
+    uint32_t pipeOracle[ACTIVE], rowOracle[ACTIVE];
+    double volBatch[ACTIVE], volOracle[ACTIVE];
+    MSXResidentGpu *batchGpu = openStreamFixture();
+    MSXResidentGpu *oracleGpu = openStreamFixture();
+    MSXResidentGpuActiveWriter batchWriter, oracleWriter;
+    MSXResidentGpuTransferStats before, after;
+    MSXResidentStatus z;
+    MSXResidentActiveRow duplicateRows[2];
+
+    (void)CAP;
+    for (i = 0; i < ACTIVE; ++i)
+        rows[i] = (MSXResidentActiveRow){1, i, i, 1, 0, ACTIVE, 1,
+                                         11, UINT64_C(5000) + i, 1.0};
+
+    OK(MSXresidentGpu_beginActive(batchGpu, ACTIVE, 41, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 256,
+                                         &accepted) == MSX_RESIDENT_OK &&
+       accepted == 256 && batchWriter.count == 256);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows + 256, 1,
+                                         &accepted) == MSX_RESIDENT_OK &&
+       accepted == 1 && batchWriter.count == ACTIVE);
+    OK(MSXresidentGpu_sealActive(batchGpu, &batchWriter, 41) ==
+       MSX_RESIDENT_OK && batchWriter.sealed);
+
+    OK(MSXresidentGpu_beginActive(oracleGpu, ACTIVE, 41, &oracleWriter) ==
+       MSX_RESIDENT_OK);
+    for (i = 0; i < ACTIVE; ++i)
+        OK(MSXresidentGpu_appendActive(oracleGpu, &oracleWriter, &rows[i]) ==
+           MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_sealActive(oracleGpu, &oracleWriter, 41) ==
+       MSX_RESIDENT_OK && oracleWriter.sealed);
+    OK(captureSealedWriter(batchGpu, &batchWriter, ACTIVE,
+                           pipeBatch, rowBatch, volBatch));
+    OK(captureSealedWriter(oracleGpu, &oracleWriter, ACTIVE,
+                           pipeOracle, rowOracle, volOracle));
+    OK(!memcmp(pipeBatch, pipeOracle, sizeof(pipeBatch)) &&
+       !memcmp(rowBatch, rowOracle, sizeof(rowBatch)) &&
+       !memcmp(volBatch, volOracle, sizeof(volBatch)));
+    MSXresidentGpu_close(batchGpu);
+    MSXresidentGpu_close(oracleGpu);
+
+    /* A duplicate split across batches clears the whole writer and reports
+       the valid prefix accepted by the failed batch. */
+    batchGpu = openStreamFixture();
+    duplicateRows[0] = rows[256];
+    duplicateRows[1] = rows[0];
+    OK(MSXresidentGpu_beginActive(batchGpu, 258, 42, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 256,
+                                         &accepted) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, duplicateRows, 2,
+                                         &accepted) == MSX_RESIDENT_ERR_ARGUMENT &&
+       accepted == 1 && !batchWriter.owner && batchWriter.count == 0);
+    OK(MSXresidentGpu_beginActive(batchGpu, 0, 43, &batchWriter) ==
+       MSX_RESIDENT_OK &&
+       MSXresidentGpu_sealActive(batchGpu, &batchWriter, 43) ==
+       MSX_RESIDENT_OK);
+    MSXresidentGpu_close(batchGpu);
+
+    /* Cross-pipe duplicate: a valid pipe-2 row follows pipe 1, then the same
+       pipe-2 row is repeated in a later batch. */
+    {
+        MSXResidentGpu *g = initial4();
+        MSXResidentActiveRow cross[2] = {
+            {1, 0, 0, 1, 0, 2, 1, 5, 101, 2.0},
+            {2, 1, 3, 1, 0, 2, -1, 7, 202, 5.0}};
+        OK(MSXresidentGpu_beginActive(g, 3, 44, &batchWriter) ==
+           MSX_RESIDENT_OK);
+        OK(MSXresidentGpu_appendActiveBatch(g, &batchWriter, cross, 2,
+                                            &accepted) == MSX_RESIDENT_OK &&
+           accepted == 2);
+        OK(MSXresidentGpu_appendActiveBatch(g, &batchWriter, &cross[1], 1,
+                                            &accepted) ==
+               MSX_RESIDENT_ERR_ARGUMENT && accepted == 0 &&
+           !batchWriter.owner && batchWriter.count == 0);
+        OK(MSXresidentGpu_beginActive(g, 0, 45, &batchWriter) ==
+           MSX_RESIDENT_OK &&
+           MSXresidentGpu_sealActive(g, &batchWriter, 45) ==
+               MSX_RESIDENT_OK);
+        MSXresidentGpu_close(g);
+    }
+
+    /* Each row-level validation failure is fail-closed and does not add a
+       transfer.  A fresh begin proves activeSeen/touchedRows were cleared. */
+    batchGpu = openStreamFixture();
+    OK(MSXresidentGpu_getTransferStats(batchGpu, &before) == MSX_RESIDENT_OK);
+    rows[0].generation = 9;
+    z = MSXresidentGpu_beginActive(batchGpu, ACTIVE, 46, &batchWriter);
+    OK(z == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 1,
+                                         &accepted) == MSX_RESIDENT_ERR_GENERATION &&
+       accepted == 0 && !batchWriter.owner);
+    rows[0].generation = 1;
+    rows[0].descriptorEpoch = 12;
+    OK(MSXresidentGpu_beginActive(batchGpu, ACTIVE, 47, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 1,
+                                         &accepted) == MSX_RESIDENT_ERR_GENERATION &&
+       accepted == 0 && !batchWriter.owner);
+    rows[0].descriptorEpoch = 11;
+    rows[0].volume = NAN;
+    OK(MSXresidentGpu_beginActive(batchGpu, ACTIVE, 48, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 1,
+                                         &accepted) == MSX_RESIDENT_ERR_ARGUMENT &&
+       accepted == 0 && !batchWriter.owner);
+    rows[0].volume = 1.0;
+    rows[0].globalRow = 1;
+    OK(MSXresidentGpu_beginActive(batchGpu, ACTIVE, 49, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 1,
+                                         &accepted) == MSX_RESIDENT_ERR_CAPACITY &&
+       accepted == 0 && !batchWriter.owner);
+    rows[0].globalRow = 0;
+    rows[0].slot = CAP;
+    OK(MSXresidentGpu_beginActive(batchGpu, ACTIVE, 50, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 1,
+                                         &accepted) == MSX_RESIDENT_ERR_CAPACITY &&
+       accepted == 0 && !batchWriter.owner);
+    rows[0].slot = 0;
+    OK(MSXresidentGpu_getTransferStats(batchGpu, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+    /* An unused mirror slot must fail generation even when its generation
+       field is made to look current.  A used but non-member slot must take
+       the same fail-closed path through activeMember. */
+    rows[0].slot = 257;
+    rows[0].globalRow = 257;
+    rows[0].generation = 1;
+    OK(MSXresidentGpu_beginActive(batchGpu, ACTIVE, 52, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 1,
+                                         &accepted) == MSX_RESIDENT_ERR_GENERATION &&
+       accepted == 0 && !batchWriter.owner);
+    rows[0].slot = 0;
+    rows[0].globalRow = 0;
+    rows[0].generation = 1;
+    /* Restore the original row before exercising expectedCount exhaustion on
+       a fresh mirror. */
+    rows[0].slot = 0;
+    rows[0].globalRow = 0;
+    rows[0].descriptorEpoch = 11;
+    /* The previous descriptor fixture is intentionally closed before the
+       expected-count case, so no stale writer or descriptor state is reused. */
+    MSXresidentGpu_close(batchGpu);
+    batchGpu = openStreamFixture();
+    OK(MSXresidentGpu_beginActive(batchGpu, 1, 54, &batchWriter) ==
+       MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 1,
+                                         &accepted) == MSX_RESIDENT_OK &&
+       accepted == 1 && batchWriter.count == 1);
+    OK(MSXresidentGpu_appendActiveBatch(batchGpu, &batchWriter, rows, 1,
+                                         &accepted) == MSX_RESIDENT_ERR_CAPACITY &&
+       accepted == 0 && !batchWriter.owner && batchWriter.count == 0);
+    OK(MSXresidentGpu_beginActive(batchGpu, 0, 55, &batchWriter) ==
+       MSX_RESIDENT_OK &&
+       MSXresidentGpu_sealActive(batchGpu, &batchWriter, 55) ==
+           MSX_RESIDENT_OK);
+    MSXresidentGpu_close(batchGpu);
+}
 typedef struct {
     MSXResidentActiveRow row[301];
     uint32_t count, emitCount, position, nextCalls, identityCalls, auditCalls;
@@ -442,4 +641,4 @@ static void t_typed_patches(void) { MSXResidentGpu*g=initial4();MSXResidentGpuRe
    must preserve both GPU payloads; INVALIDATE carries no concentration arrays. */
 desc(&multi[0],1,2,2,8,1);desc(&multi[1],2,2,2,8,-1);slot(&typed[0],1,1,1,102,3,20);typed[0].kind=MSX_RESIDENT_PATCH_META;slot(&typed[1],2,0,1,201,4,30);typed[1].kind=MSX_RESIDENT_PATCH_META;b=(MSXResidentPatchBatch){multi,2,typed,2};OK(snap(g,&a,m)&&MSXresidentGpu_applyPatches(g,&b)==0&&snap(g,&z,n)&&same(&a,&z,m,n));desc(&multi[0],1,2,2,9,1);desc(&multi[1],2,2,1,9,-1);multi[1].descriptor.head=1;multi[1].descriptor.tail=1;slot(&typed[0],1,1,1,102,3,20);typed[0].kind=MSX_RESIDENT_PATCH_META;memset(&typed[1],0,sizeof(typed[1]));typed[1].linkIndex=2;typed[1].slot=0;typed[1].generation=1;typed[1].kind=MSX_RESIDENT_PATCH_INVALIDATE;b=(MSXResidentPatchBatch){multi,2,typed,2};OK(MSXresidentGpu_applyPatches(g,&b)==0&&snap(g,&z,n)&&z.activeCount==3);MSXresidentGpu_close(g);}
 static void t_active_sync(void) { MSXResidentGpu*g=initial4();MSXResidentGpuReduction z;double mass[S],hyd[MSX_RESIDENT_HYD_STRIDE]={0},c[S],l[S],h=77;MSXResidentActiveItem a={1,0,1,5,2,hyd};MSXResidentActiveBatch b={&a,1};MSXResidentGpuDeviceView v;MSXResidentGpuReactResult r;MSXResidentGpuActiveSyncRow row;MSXResidentGpuActiveSyncOutput o={&row,c,l,S};MSXResidentDescriptorPatch d;MSXResidentPatchBatch q;OK(MSXresidentGpu_prepareActive(g,&b,&v,&r)==0);c[0]=321;l[0]=654;OK(vcopy(&v,(void*)(uintptr_t)v.c,c,sizeof(c),cudaMemcpyHostToDevice)==cudaSuccess);OK(vcopy(&v,(void*)(uintptr_t)v.lastc,l,sizeof(l),cudaMemcpyHostToDevice)==cudaSuccess);OK(vcopy(&v,(void*)(uintptr_t)v.hstep,&h,sizeof(h),cudaMemcpyHostToDevice)==cudaSuccess);OK(MSXresidentGpu_finishActive(g,&r)==0);OK(MSXresidentGpu_reduce(g,mass,S,&z)==0&&mass[0]==321*2+20*3+30*4+40*5);memset(c,0,sizeof(c));memset(l,0,sizeof(l));OK(MSXresidentGpu_syncActive(g,&o,1)==0&&row.linkIndex==1&&row.globalRow==0&&row.generation==1&&row.descriptorEpoch==5&&row.hstep==77&&c[0]==321&&l[0]==654);OK(MSXresidentGpu_prepareActive(g,&b,&v,&r)==0&&MSXresidentGpu_finishActive(g,&r)==0);desc(&d,1,2,2,6,1);q=(MSXResidentPatchBatch){&d,1,0,0};OK(MSXresidentGpu_applyPatches(g,&q)==0);OK(MSXresidentGpu_syncActive(g,&o,1)==MSX_RESIDENT_ERR_GENERATION);MSXresidentGpu_close(g);}
-int main(void) { struct cudaDeviceProp p;int n=0;cudaError_t e=cudaGetDeviceCount(&n);printf("cuda_required=true\n");if(e!=cudaSuccess||n<1){printf("gpu_name=unavailable\nassertions_passed=0\nassertions_failed=1\n");return 2;}cudaGetDeviceProperties(&p,0);printf("gpu_name=%s\n",p.name);OK(MSXresidentGpu_isEnabled()==1);t_open();t_initial();t_scatter();t_descriptor_generation();t_fetch();t_fetch_batch_contract();t_reduce_lifecycle();t_hole_initial_fetch();t_ring_span_reject();t_wrap_active();t_stream_builder();t_stream_writer_large();t_runtime_stream_contract();t_active_view();t_pipe_hyd_contract();t_pipe_hyd_exact_bits();t_pipe_hyd_failure_invalidates();t_active_sync();t_active_error();t_active_empty();t_active_abort_and_query_guard();t_explicit_poison_query_guard();t_large_batch();t_typed_patches();printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0; }
+int main(void) { struct cudaDeviceProp p;int n=0;cudaError_t e=cudaGetDeviceCount(&n);printf("cuda_required=true\n");if(e!=cudaSuccess||n<1){printf("gpu_name=unavailable\nassertions_passed=0\nassertions_failed=1\n");return 2;}cudaGetDeviceProperties(&p,0);printf("gpu_name=%s\n",p.name);OK(MSXresidentGpu_isEnabled()==1);t_open();t_initial();t_scatter();t_descriptor_generation();t_fetch();t_fetch_batch_contract();t_reduce_lifecycle();t_hole_initial_fetch();t_ring_span_reject();t_wrap_active();t_stream_builder();t_stream_writer_large();t_batch_writer_contract();t_runtime_stream_contract();t_active_view();t_pipe_hyd_contract();t_pipe_hyd_exact_bits();t_pipe_hyd_failure_invalidates();t_active_sync();t_active_error();t_active_empty();t_active_abort_and_query_guard();t_explicit_poison_query_guard();t_large_batch();t_typed_patches();printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0; }

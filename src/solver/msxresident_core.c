@@ -530,6 +530,52 @@ MSXResidentStatus MSXresident_nextActive(MSXResidentActiveIterator *it,
     return activeIteratorStep(it, row);
 }
 
+MSXResidentStatus MSXresident_rawActiveCount(uint64_t *count, uint32_t *links)
+{
+    uint32_t k;
+    uint64_t total = 0, n;
+    if (!count) return MSX_RESIDENT_ERR_ARGUMENT;
+    *count = 0;
+    if (links) *links = 0;
+    if (!S.open) return MSX_RESIDENT_DISABLED;
+    for (k = 1; k <= S.nlinks; ++k)
+    {
+        n = (uint64_t)S.p[k].d.count;
+        if (UINT64_MAX - total < n) total = UINT64_MAX;
+        else total += n;
+    }
+    *count = total;
+    if (links) *links = S.nlinks;
+    return MSX_RESIDENT_OK;
+}
+
+MSXResidentStatus MSXresident_nextActiveBatch(MSXResidentActiveIterator *it,
+                                               MSXResidentActiveRow *rows,
+                                               uint32_t cap, uint32_t *count)
+{
+    MSXResidentStatus z;
+    uint32_t n = 0;
+    if (!count || (!rows && cap)) return MSX_RESIDENT_ERR_ARGUMENT;
+    *count = 0;
+    if (!it || !it->active || !S.open) return MSX_RESIDENT_DISABLED;
+    if (!cap) return MSX_RESIDENT_ERR_ARGUMENT;
+    while (n < cap)
+    {
+        /* Once the current pipe has been exhausted, leave its transition to
+           activeIteratorStep on the next call.  This guarantees no batch
+           crosses a link boundary while preserving the old cursor order. */
+        if (n && it->linkIndex <= it->nlinks &&
+            it->seen >= S.p[it->linkIndex].d.count)
+            break;
+        z = activeIteratorStep(it, &rows[n]);
+        if (z == MSX_RESIDENT_OK) { ++n; continue; }
+        *count = n;
+        return z;
+    }
+    *count = n;
+    return n ? MSX_RESIDENT_OK : MSX_RESIDENT_ITER_END;
+}
+
 MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,
                                                uint32_t cap,
                                                uint32_t *count)

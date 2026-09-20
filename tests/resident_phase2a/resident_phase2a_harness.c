@@ -477,4 +477,46 @@ static void t30(void)
        MSXresident_countActiveIterator(&it, &n) == MSX_RESIDENT_OK && n == 0);
     OK(MSXresident_nextActive(&it, &row) == MSX_RESIDENT_ITER_END);
 }
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t27();t28();t29();t30();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+/* 31: S06b raw-count and pipe-local batch cursor.  The batch boundary is
+   observable at the first pipe's end, including a reverse-oriented pipe. */
+static void t31(void)
+{
+    char b[768];
+    double c[2] = {0, 1}, lastc[2] = {0, 2};
+    uint64_t a[3] = {7001, 7002, 7003}, z[2] = {8001, 8002};
+    MSXResidentPayload p[3], q[2];
+    MSXResidentActiveIterator it;
+    MSXResidentActiveRow rows[4];
+    uint64_t raw;
+    uint32_t links, n;
+    MSXResidentStatus s;
+    int i;
+    setup(1, 2);
+    MSX.MaxSegments = 8;
+    snprintf(b, sizeof(b),
+             "link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n"
+             "1,L1,4,4,1,2,%s\n2,L2,3,3,1,2,%s\n", UP, UP);
+    csv("resident_phase2a.csv", b); open1(b);
+    for (i = 0; i < 3; ++i) p[i] = payload(c, lastc, (double)i + 1, a[i]);
+    for (i = 0; i < 2; ++i) q[i] = payload(c, lastc, (double)i + 4, z[i]);
+    OK(MSXresident_observePipe(1, a, p, 3, 1) == MSX_RESIDENT_OK);
+    OK(MSXresident_observePipe(2, z, q, 2, -1) == MSX_RESIDENT_OK);
+    OK(MSXresident_rawActiveCount(&raw, &links) == MSX_RESIDENT_OK &&
+       raw == 5 && links == 2);
+    OK(MSXresident_beginActiveIterator(&it) == MSX_RESIDENT_OK);
+    OK(MSXresident_nextActiveBatch(&it, rows, 2, &n) == MSX_RESIDENT_OK &&
+       n == 2 && rows[0].linkIndex == 1 && rows[0].slot == 0 &&
+       rows[1].linkIndex == 1 && rows[1].slot == 1);
+    OK(MSXresident_nextActiveBatch(&it, rows, 2, &n) == MSX_RESIDENT_OK &&
+       n == 1 && rows[0].linkIndex == 1 && rows[0].slot == 2);
+    OK(MSXresident_nextActiveBatch(&it, rows, 2, &n) == MSX_RESIDENT_OK &&
+       n == 2 && rows[0].linkIndex == 2 && rows[0].slot == 0 &&
+       rows[1].linkIndex == 2 && rows[1].slot == 2);
+    s = MSXresident_nextActiveBatch(&it, rows, 2, &n);
+    OK(s == MSX_RESIDENT_ITER_END && n == 0);
+    MSXresident_close();
+    open1(b);
+    OK(MSXresident_rawActiveCount(&raw, &links) == MSX_RESIDENT_OK &&
+       raw == 0 && links == 2);
+}
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t27();t28();t29();t30();t31();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}

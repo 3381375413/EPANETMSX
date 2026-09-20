@@ -107,6 +107,12 @@ MSXResidentStatus MSXresidentGpu_beginActive(MSXResidentGpu *, uint32_t expected
 MSXResidentStatus MSXresidentGpu_appendActive(MSXResidentGpu *,
                                               MSXResidentGpuActiveWriter *,
                                               const MSXResidentActiveRow *);
+/* Append one same-pipe batch using the exact legacy row validation order.
+   accepted is the prefix committed before a validation failure; a failed
+   batch invalidates and clears the whole writer and never touches CUDA. */
+MSXResidentStatus MSXresidentGpu_appendActiveBatch(
+    MSXResidentGpu *, MSXResidentGpuActiveWriter *,
+    const MSXResidentActiveRow *, uint32_t count, uint32_t *accepted);
 MSXResidentStatus MSXresidentGpu_sealActive(MSXResidentGpu *,
                                             MSXResidentGpuActiveWriter *,
                                             uint64_t topologyVersion);
