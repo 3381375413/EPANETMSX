@@ -103,6 +103,15 @@ int MSXsegStorage_hybridAuditSnapshot(int k,
                                       MSXHybridAuditRow *rows,
                                       uint32_t row_capacity,
                                       uint32_t *row_count);
+#if defined(MSX_RESIDENT_SCAN_OMP_TEST)
+/* Test-only entry point for the production scan workshare.  It exposes no
+   normal runtime configuration surface and is compiled only by the real
+   OpenMP audit target. */
+int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
+                                      int *workerIds, int workerCapacity,
+                                      MSXHybridAuditSnapshot *snapshots,
+                                      int snapshotCapacity);
+#endif
 /* Make the selected physical endpoint CPU-readable before transport.  This
    may stage a single Resident demotion and returns a mapped error before any
    endpoint consumer can observe a stale Core mirror. */

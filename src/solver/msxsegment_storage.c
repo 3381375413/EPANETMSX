@@ -198,6 +198,8 @@ static int HybridRebalanceStage = HYBRID_REBALANCE_NONE;
    environment parse and a branch at the Resident rebalance entry. */
 static int HybridResidentScanAuditState = -1;
 static int HybridResidentScanAuditWritten = 0;
+static int HybridResidentScanFullSerialState = -1;
+static int HybridResidentScanOmpAuditWritten = 0;
 
 static int hybridResidentScanAuditEnabled(void)
 {
@@ -232,6 +234,42 @@ static void hybridResidentScanAuditRecord(int teamSize)
 #endif
     fclose(f);
     HybridResidentScanAuditWritten = 1;
+}
+
+static int hybridResidentScanFullSerial(void)
+{
+    if (HybridResidentScanFullSerialState < 0)
+    {
+        const char *value = getenv("MSX_RESIDENT_SCAN_MODE");
+        HybridResidentScanFullSerialState =
+            value && _stricmp(value, "FULL_SERIAL") == 0;
+    }
+    return HybridResidentScanFullSerialState;
+}
+
+/* The S02 audit is written after the parallel region by the caller thread;
+   scan workers only fill their per-link snapshot slots (plus test-only
+   worker IDs when the OpenMP audit target supplies them). */
+static void hybridResidentScanOmpAuditRecord(int teamSize)
+{
+    FILE *f;
+    if (HybridResidentScanOmpAuditWritten ||
+        !hybridResidentScanAuditEnabled()) return;
+    f = fopen("resident_scan_omp_team_size.txt", "wt");
+    if (!f) return;
+    fprintf(f, "phase=resident_rebalance_scan\n");
+    fprintf(f, "team_size=%d\n", teamSize);
+#if defined(_OPENMP)
+    fprintf(f, "omp_max_threads=%d\n", omp_get_max_threads());
+    fprintf(f, "omp_dynamic=%d\n", omp_get_dynamic());
+    fprintf(f, "omp_nested=%d\n", omp_get_nested());
+#else
+    fprintf(f, "omp_max_threads=not_compiled\n");
+    fprintf(f, "omp_dynamic=not_compiled\n");
+    fprintf(f, "omp_nested=not_compiled\n");
+#endif
+    fclose(f);
+    HybridResidentScanOmpAuditWritten = 1;
 }
 
 static void hybridRebalanceAddPhaseInternal(int phase, double ms)
@@ -1494,6 +1532,85 @@ static void hybridPublishRebalanceSnapshot(int k,
     }
 }
 
+/* Scan every Resident link before any publication.  The default path uses
+   one static OpenMP workshare; FULL_SERIAL is an internal audit comparison
+   mode and deliberately invokes the same helper from the caller thread. */
+static void hybridScanResidentSnapshots(int fullSerial, int *workerIds,
+                                        int *teamSize)
+{
+    int k, observedTeam = 1;
+    if (fullSerial)
+    {
+        for (k = 1; k <= Hybrid.nLinks; ++k)
+        {
+            hybridScanRebalanceSnapshot(k, &Hybrid.rebalanceSnapshot[k]);
+            if (workerIds) workerIds[k] = 0;
+        }
+    }
+#if defined(_OPENMP)
+    else
+    {
+#pragma omp parallel default(none) shared(observedTeam, workerIds)
+        {
+#pragma omp single
+            {
+                observedTeam = omp_get_num_threads();
+            }
+#pragma omp for schedule(static)
+            for (k = 1; k <= Hybrid.nLinks; ++k)
+            {
+                hybridScanRebalanceSnapshot(k, &Hybrid.rebalanceSnapshot[k]);
+                if (workerIds) workerIds[k] = omp_get_thread_num();
+            }
+        }
+    }
+#else
+    else
+    {
+        for (k = 1; k <= Hybrid.nLinks; ++k)
+        {
+            hybridScanRebalanceSnapshot(k, &Hybrid.rebalanceSnapshot[k]);
+            if (workerIds) workerIds[k] = 0;
+        }
+    }
+#endif
+    if (teamSize) *teamSize = observedTeam;
+    hybridResidentScanOmpAuditRecord(observedTeam);
+}
+
+#if defined(MSX_RESIDENT_SCAN_OMP_TEST)
+int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
+                                      int *workerIds, int workerCapacity,
+                                      MSXHybridAuditSnapshot *snapshots,
+                                      int snapshotCapacity)
+{
+    int k;
+    if (!Hybrid.opened || !Hybrid.rebalanceSnapshot ||
+        (workerIds && workerCapacity <= Hybrid.nLinks) ||
+        (snapshots && snapshotCapacity < Hybrid.nLinks))
+        return ERR_PIPE_RING_CAPACITY;
+    if (workerIds)
+        for (k = 0; k <= Hybrid.nLinks; ++k) workerIds[k] = -1;
+    hybridScanResidentSnapshots(fullSerial, workerIds, teamSize);
+    if (snapshots)
+        for (k = 1; k <= Hybrid.nLinks; ++k)
+        {
+            const RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
+            snapshots[k - 1].link_index = s->linkIndex;
+            snapshots[k - 1].total = s->total;
+            snapshots[k - 1].core_count = s->coreCount;
+            snapshots[k - 1].downstream_boundary = s->downCount;
+            snapshots[k - 1].upstream_boundary = s->upCount;
+            snapshots[k - 1].first_core_slot =
+                s->coreCount ? s->head : -1;
+            snapshots[k - 1].last_core_slot =
+                s->coreCount ? s->tail : -1;
+            snapshots[k - 1].orient = s->orient;
+        }
+    return 0;
+}
+#endif
+
 static void hybridSnapshotRefreshEndpoints(RebalanceSnapshot *s,
                                             HybridPipe *p)
 {
@@ -2356,16 +2473,22 @@ void MSXsegStorage_hybridRebalanceAll(void)
             HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
             parentStart = MSXgpu_wallTimeMs();
         }
+        /* Scan every link before publishing any snapshot.  The default is
+           OpenMP static scheduling; FULL_SERIAL is an internal comparison
+           mode.  Both paths use the same read-only helper. */
+        {
+            double scanStart = audit ? MSXgpu_wallTimeMs() : 0.0;
+            int fullSerial = hybridResidentScanFullSerial();
+            if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
+            hybridScanResidentSnapshots(fullSerial, NULL, NULL);
+            if (audit) metrics.rb_scan_ms += MSXgpu_wallTimeMs() - scanStart;
+        }
         /* Initialization contains only fallible promote commits.  Complete
-           those first, then collect every post-transport demote before any
-           CPU topology mutation or selected GPU fetch. */
+           those in link order after all read-only scans, then collect every
+           post-transport demote before any selected GPU fetch. */
         for (k = 1; k <= Hybrid.nLinks; k++)
         {
             RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
-            phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
-            if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
-            hybridScanRebalanceSnapshot(k, s);
-            if (audit) metrics.rb_scan_ms += MSXgpu_wallTimeMs() - phaseStart;
             hybridPublishRebalanceSnapshot(k, s);
             if (s->coreCount == 0 && s->total > 2 * s->guard)
             {
