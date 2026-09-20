@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "msxresident_runtime.h"
+#include "msxresident_active_stream.h"
 #include "msxresident_core_cuda.h"
 #include "msxresident_hash.h"
 #include "msxsegment_storage.h"
@@ -10,12 +11,9 @@
 
 extern MSXproject MSX;
 
-#define MSX_RESIDENT_ACTIVE_CHUNK_ROWS 256u
-
 typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; MSXResidentGpu *gpu;
     uint64_t wouldDescriptors, wouldSlots, stale, fallbacks; MSXResidentStatus lastStatus;
     double *pipeHyd;
-    MSXResidentActiveRow activeChunk[MSX_RESIDENT_ACTIVE_CHUNK_ROWS];
     uint32_t activeCap, stride;
     MSXResidentHandoffPlan *plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *out;
     double *c,*lastc; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
@@ -715,133 +713,104 @@ int MSXresidentRuntime_completeHandoffs(void)
                                           fetchCalls);
     return 0;
 }
+typedef struct {
+    MSXResidentActiveIterator iterator;
+    const MSXResidentHydView *hyd;
+    int stage;
+    double validationTimer;
+    double streamTimer;
+} RuntimeActiveSource;
+
+static MSXResidentStatus runtimeActiveBegin(void *context)
+{ return MSXresident_beginActiveIterator(&((RuntimeActiveSource *)context)->iterator); }
+static MSXResidentStatus runtimeActiveValidate(void *context)
+{ return MSXresident_validateActiveIterator(&((RuntimeActiveSource *)context)->iterator); }
+static MSXResidentStatus runtimeActiveCount(void *context, uint32_t *count)
+{ return MSXresident_countActiveIterator(&((RuntimeActiveSource *)context)->iterator, count); }
+static MSXResidentStatus runtimeActiveNext(void *context, MSXResidentActiveRow *row)
+{ return MSXresident_nextActive(&((RuntimeActiveSource *)context)->iterator, row); }
+static int runtimeActiveIdentity(void *context, const MSXResidentActiveRow *row)
+{
+    (void)context;
+    return MSXsegStorage_isHybridCoreSlotIdentity((int)row->linkIndex,
+                                                    (int)row->slot,
+                                                    row->parcelId);
+}
+static int runtimeActiveAudit(void *context, const MSXResidentActiveRow *row)
+{
+    RuntimeActiveSource *source = (RuntimeActiveSource *)context;
+    return auditHydRow(row, source->hyd);
+}
+static uint64_t runtimeActiveTopology(void *context)
+{ (void)context; return R.topologyVersion; }
+static void runtimeActiveValidationEnd(void *context)
+{
+    RuntimeActiveSource *source = (RuntimeActiveSource *)context;
+    if (source->stage)
+    {
+        double elapsed = MSXgpu_wallTimeMs() - source->validationTimer;
+        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_ENUMERATE, elapsed);
+        MSX.GpuTimingRecord.resident_enumerate_filter_ms += elapsed;
+    }
+}
+static void runtimeActiveStreamBegin(void *context)
+{
+    RuntimeActiveSource *source = (RuntimeActiveSource *)context;
+    if (source->stage) source->streamTimer = MSXgpu_wallTimeMs();
+}
+static void runtimeActiveStreamEnd(void *context)
+{
+    RuntimeActiveSource *source = (RuntimeActiveSource *)context;
+    if (source->stage)
+    {
+        double elapsed = MSXgpu_wallTimeMs() - source->streamTimer;
+        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_IDENTITY_FILTER, elapsed);
+        MSX.GpuTimingRecord.resident_enumerate_filter_ms += elapsed;
+    }
+}
+
 static MSXResidentStatus runtimeBuildActive(MSXResidentGpuActiveWriter *writer,
                                             uint32_t *activeOut,
                                             const MSXResidentHydView *hyd)
 {
-    MSXResidentActiveIterator it;
-    MSXResidentStatus s, deferred = MSX_RESIDENT_OK, iterError = MSX_RESIDENT_OK;
-    uint32_t n = 0, chunkCount, i, hydMismatches = 0;
-    int done = 0, stage = MSXgpu_profileStageEnabled();
-    double timer = 0.0, phaseStart = 0.0;
+    RuntimeActiveSource context;
+    MSXResidentActiveStreamSource source;
+    MSXResidentActiveStreamReport report;
+    MSXResidentStatus s;
+    int stage = MSXgpu_profileStageEnabled();
+
     if (!writer || !activeOut) return MSX_RESIDENT_ERR_ARGUMENT;
-    if (stage) timer = MSXgpu_wallTimeMs();
-
-    /* First pass is the complete legacy validation/count contract.  It does
-       not materialize rows, so a later enumerate error still has priority
-       over any deferred Hybrid/GPU append error. */
-    s = MSXresident_beginActiveIterator(&it);
-    if (s == MSX_RESIDENT_OK) s = MSXresident_validateActiveIterator(&it);
-    ++R.activeIteratorPasses;
-    if (s == MSX_RESIDENT_OK) s = MSXresident_countActiveIterator(&it, &n);
-    if (stage)
-    {
-        double elapsed = MSXgpu_wallTimeMs() - timer;
-        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_ENUMERATE, elapsed);
-        MSX.GpuTimingRecord.resident_enumerate_filter_ms += elapsed;
-    }
-    if (s != MSX_RESIDENT_OK) return s;
-
-    s = MSXresident_beginActiveIterator(&it);
-    if (s != MSX_RESIDENT_OK) return s;
-    ++R.activeIteratorPasses;
-    s = MSXresidentGpu_beginActive(R.gpu, n, R.topologyVersion, writer);
-    if (s != MSX_RESIDENT_OK) return s;
-    if (stage) phaseStart = MSXgpu_wallTimeMs();
-
-    while (!done)
-    {
-        chunkCount = 0;
-        while (chunkCount < MSX_RESIDENT_ACTIVE_CHUNK_ROWS)
-        {
-            s = MSXresident_nextActive(&it, &R.activeChunk[chunkCount]);
-            if (s == MSX_RESIDENT_OK) { ++chunkCount; continue; }
-            if (s == MSX_RESIDENT_ITER_END) { done = 1; break; }
-            iterError = s;
-            done = 1;
-            break;
-        }
-        if (chunkCount > R.activeChunkHighWater)
-            R.activeChunkHighWater = chunkCount;
-        if (iterError != MSX_RESIDENT_OK)
-        {
-            /* The writer is still live here; this is the sole abort for the
-               enumerate-failure path.  No H2D or launch follows this return. */
-            ++R.activeBuilderAborts;
-            (void)MSXresidentGpu_abortActiveBuild(R.gpu, writer);
-            return iterError;
-        }
-        for (i = 0; i < chunkCount; ++i)
-        {
-            MSXResidentActiveRow *row = &R.activeChunk[i];
-            if (deferred == MSX_RESIDENT_OK)
-            {
-                /* The Hybrid identity check is deliberately before the GPU
-                   mirror check in appendActive, preserving historical order. */
-                if (!MSXsegStorage_isHybridCoreSlotIdentity((int)row->linkIndex,
-                                                             (int)row->slot,
-                                                             row->parcelId))
-                {
-                    deferred = MSX_RESIDENT_ERR_GENERATION;
-                    ++R.activeBuilderAborts;
-                    (void)MSXresidentGpu_abortActiveBuild(R.gpu, writer);
-                }
-                else
-                {
-                    s = MSXresidentGpu_appendActive(R.gpu, writer, row);
-                    if (s != MSX_RESIDENT_OK)
-                    {
-                        /* appendActive clears/reset its writer on failure;
-                           do not issue a second abort against that writer. */
-                        deferred = s;
-                        ++R.activeBuilderAborts;
-                    }
-                    else
-                    {
-                        ++R.activeRowsAppended;
-                        if (R.auditHyd && auditHydRow(row, hyd))
-                        {
-                            ++hydMismatches;
-                            deferred = MSX_RESIDENT_ERR_ARGUMENT;
-                            ++R.activeBuilderAborts;
-                            (void)MSXresidentGpu_abortActiveBuild(R.gpu, writer);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (stage)
-    {
-        double elapsed = MSXgpu_wallTimeMs() - phaseStart;
-        MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_IDENTITY_FILTER, elapsed);
-        MSX.GpuTimingRecord.resident_enumerate_filter_ms += elapsed;
-    }
+    memset(&context, 0, sizeof(context));
+    context.hyd = hyd;
+    context.stage = stage;
+    context.validationTimer = stage ? MSXgpu_wallTimeMs() : 0.0;
+    source.context = &context;
+    source.begin = runtimeActiveBegin;
+    source.validate = runtimeActiveValidate;
+    source.count = runtimeActiveCount;
+    source.next = runtimeActiveNext;
+    source.identity = runtimeActiveIdentity;
+    source.audit = R.auditHyd ? runtimeActiveAudit : NULL;
+    source.topology = runtimeActiveTopology;
+    source.validationEnd = runtimeActiveValidationEnd;
+    source.streamBegin = runtimeActiveStreamBegin;
+    source.streamEnd = runtimeActiveStreamEnd;
+    s = MSXresident_activeStreamBuild(R.gpu, writer, R.topologyVersion,
+                                      &source, hyd, activeOut, &report);
+    R.activeIteratorPasses += report.iteratorPasses;
+    R.activeRowsAppended += report.rowsAppended;
+    R.activeBuilderAborts += report.builderAborts;
+    if (report.chunkHighWater > R.activeChunkHighWater)
+        R.activeChunkHighWater = report.chunkHighWater;
     if (R.auditHyd)
     {
-        fprintf(stderr, "RESIDENT_HYD_AUDIT,active=%u,mismatches=%u\n",
-                n, hydMismatches);
+        fprintf(stderr, "RESIDENT_HYD_AUDIT,active=%u,mismatches=%llu\n",
+                report.expectedCount, (unsigned long long)report.hydMismatches);
         fflush(stderr);
     }
-    /* A later iterator error would have been returned above; therefore this
-       deferred append/identity/audit error is the next priority. */
-    if (deferred != MSX_RESIDENT_OK) return deferred;
-    if (R.topologyVersion != writer->topologyVersion)
-    {
-        ++R.activeBuilderAborts;
-        (void)MSXresidentGpu_abortActiveBuild(R.gpu, writer);
-        return MSX_RESIDENT_ERR_GENERATION;
-    }
-    s = MSXresidentGpu_sealActive(R.gpu, writer, R.topologyVersion);
-    if (s != MSX_RESIDENT_OK)
-    {
-        /* sealActive owns its failure reset; do not abort twice. */
-        ++R.activeBuilderAborts;
-        return s;
-    }
-    if (stage) MSX.GpuTimingRecord.resident_active_rows += n;
-    *activeOut = n;
-    return MSX_RESIDENT_OK;
+    if (stage && s == MSX_RESIDENT_OK)
+        MSX.GpuTimingRecord.resident_active_rows += *activeOut;
+    return s;
 }
 
 /* A stale caller token must never leave the device submission live: its

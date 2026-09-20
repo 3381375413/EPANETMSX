@@ -379,17 +379,43 @@ static int sameActiveRow(const MSXResidentActiveRow *a,
         a->descriptorEpoch == b->descriptorEpoch &&
         a->parcelId == b->parcelId && a->volume == b->volume;
 }
+/* Independent golden oracle for the first publication of a single link.
+   It intentionally does not call enumerateActive or any iterator API.  The
+   expected slot order is the published descriptor contract: head=0, then
+   orient steps around the fixed-capacity ring. */
+static void goldenActiveRows(MSXResidentActiveRow *rows, uint32_t count,
+                             uint32_t capacity, int32_t orient,
+                             const uint64_t *ids, double firstVolume)
+{
+    uint32_t i;
+    for (i = 0; i < count; ++i)
+    {
+        uint32_t slot = orient > 0 ? i : (i ? capacity - i : 0);
+        memset(&rows[i], 0, sizeof(rows[i]));
+        rows[i].linkIndex = 1;
+        rows[i].slot = slot;
+        rows[i].globalRow = slot;
+        rows[i].generation = 1;
+        rows[i].descriptorHead = 0;
+        rows[i].descriptorCount = count;
+        rows[i].descriptorOrient = orient;
+        rows[i].descriptorEpoch = 1;
+        rows[i].parcelId = ids[i];
+        rows[i].volume = firstVolume + (double)i;
+    }
+}
+
 static void t30(void)
 {
     char b[512];
-    MSXResidentActiveRow reference[257], row;
+    MSXResidentActiveRow golden[257], row;
     MSXResidentActiveIterator it;
     double c[2] = {0, 1}, lastc[2] = {0, 2};
     uint64_t ids[257];
     MSXResidentPayload payloads[257];
     unsigned char seen[300];
     uint32_t cases[] = {0, 1, 255, 256, 257};
-    uint32_t i, j, n, refn, got, before;
+    uint32_t i, j, n, got, before;
     MSXResidentStatus z;
     for (j = 0; j < sizeof(cases)/sizeof(cases[0]); ++j)
     {
@@ -402,9 +428,7 @@ static void t30(void)
             payloads[i] = payload(c, lastc, (double)i + 1.0, ids[i]);
         }
         OK(MSXresident_observePipe(1, ids, payloads, want, 1) == MSX_RESIDENT_OK);
-        refn = 0;
-        OK(MSXresident_enumerateActive(reference, 257, &refn) == MSX_RESIDENT_OK &&
-           refn == want);
+        goldenActiveRows(golden, want, 300, 1, ids, 1.0);
         memset(&it, 0, sizeof(it));
         OK(MSXresident_beginActiveIterator(&it) == MSX_RESIDENT_OK &&
            MSXresident_validateActiveIterator(&it) == MSX_RESIDENT_OK &&
@@ -412,7 +436,7 @@ static void t30(void)
         memset(seen, 0, sizeof(seen)); got = 0;
         while ((z = MSXresident_nextActive(&it, &row)) == MSX_RESIDENT_OK)
         {
-            OK(got < refn && sameActiveRow(&row, &reference[got]));
+            OK(got < want && sameActiveRow(&row, &golden[got]));
             OK(row.slot < 300 && !seen[row.slot]);
             if (row.slot < 300) seen[row.slot] = 1;
             ++got;
@@ -434,14 +458,13 @@ static void t30(void)
         payloads[i] = payload(c, lastc, (double)i + 3.0, ids[i]);
     }
     OK(MSXresident_observePipe(1, ids, payloads, 5, -1) == MSX_RESIDENT_OK);
-    refn = 0;
-    OK(MSXresident_enumerateActive(reference, 8, &refn) == MSX_RESIDENT_OK && refn == 5);
+    goldenActiveRows(golden, 5, 8, -1, ids, 3.0);
     OK(MSXresident_beginActiveIterator(&it) == MSX_RESIDENT_OK &&
        MSXresident_validateActiveIterator(&it) == MSX_RESIDENT_OK);
     got = 0;
     while ((z = MSXresident_nextActive(&it, &row)) == MSX_RESIDENT_OK)
     {
-        OK(got < refn && sameActiveRow(&row, &reference[got]) &&
+        OK(got < 5 && sameActiveRow(&row, &golden[got]) &&
            row.descriptorOrient == -1 && row.parcelId == ids[got] &&
            row.volume == (double)got + 3.0);
         ++got;

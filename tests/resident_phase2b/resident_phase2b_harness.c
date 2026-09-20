@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <cuda_runtime_api.h>
 #include "msxresident_core_cuda.h"
+#include "msxresident_active_stream.h"
 
 static int pass, fail, aggregateQueries, aggregateHits, aggregateRebuilds;
 #define OK(x) do { if (x) ++pass; else { ++fail; fprintf(stderr,"FAIL:%d: %s\n",__LINE__,#x); } } while (0)
@@ -233,6 +234,206 @@ static void t_stream_writer_large(void)
        MSXresidentGpu_sealActive(g, &w, 35) == MSX_RESIDENT_OK);
     MSXresidentGpu_close(g);
 }
+typedef struct {
+    MSXResidentActiveRow row[301];
+    uint32_t count, emitCount, position, nextCalls, identityCalls, auditCalls;
+    int nextFailAt, identityFailAt, duplicateAt, auditEvery, topologyChangeAt;
+    MSXResidentStatus nextStatus, beginStatus, validateStatus, countStatus;
+    uint64_t topologyVersion;
+} StreamSourceTest;
+
+static void streamSourceReset(StreamSourceTest *s)
+{
+    uint32_t i;
+    memset(s, 0, sizeof(*s));
+    s->count = s->emitCount = 257;
+    s->nextFailAt = s->identityFailAt = s->duplicateAt = -1;
+    s->topologyChangeAt = -1;
+    s->nextStatus = MSX_RESIDENT_ERR_OVERFLOW;
+    s->beginStatus = s->validateStatus = s->countStatus = MSX_RESIDENT_OK;
+    s->topologyVersion = 30;
+    for (i = 0; i < s->count; ++i)
+    {
+        s->row[i] = (MSXResidentActiveRow){1, i, i, 1, 0, 257, 1,
+                                           11, UINT64_C(5000) + i, 1.0};
+    }
+}
+static MSXResidentStatus streamSourceBegin(void *p)
+{ StreamSourceTest *s = (StreamSourceTest *)p; s->position = 0; return s->beginStatus; }
+static MSXResidentStatus streamSourceValidate(void *p)
+{ return ((StreamSourceTest *)p)->validateStatus; }
+static MSXResidentStatus streamSourceCount(void *p, uint32_t *n)
+{ StreamSourceTest *s = (StreamSourceTest *)p; *n = s->count; return s->countStatus; }
+static MSXResidentStatus streamSourceNext(void *p, MSXResidentActiveRow *row)
+{
+    StreamSourceTest *s = (StreamSourceTest *)p;
+    uint32_t i = s->position++;
+    ++s->nextCalls;
+    if (s->nextFailAt >= 0 && (int)i == s->nextFailAt) return s->nextStatus;
+    if (i >= s->emitCount) return MSX_RESIDENT_ITER_END;
+    *row = s->row[i];
+    if (s->duplicateAt >= 0 && (int)i == s->duplicateAt) *row = s->row[0];
+    return MSX_RESIDENT_OK;
+}
+static int streamSourceIdentity(void *p, const MSXResidentActiveRow *row)
+{
+    StreamSourceTest *s = (StreamSourceTest *)p;
+    (void)row;
+    return s->identityFailAt < 0 || (int)s->identityCalls++ != s->identityFailAt;
+}
+static int streamSourceAudit(void *p, const MSXResidentActiveRow *row)
+{
+    StreamSourceTest *s = (StreamSourceTest *)p;
+    (void)row;
+    ++s->auditCalls;
+    return s->auditEvery > 0 && (s->auditCalls - 1) % s->auditEvery == 0;
+}
+static uint64_t streamSourceTopology(void *p)
+{
+    StreamSourceTest *s = (StreamSourceTest *)p;
+    return s->topologyChangeAt >= 0 &&
+           (int)s->nextCalls >= s->topologyChangeAt ? s->topologyVersion + 1 :
+                                                        s->topologyVersion;
+}
+static MSXResidentActiveStreamSource streamSource(StreamSourceTest *s, int audit)
+{
+    MSXResidentActiveStreamSource source;
+    memset(&source, 0, sizeof(source));
+    source.context = s;
+    source.begin = streamSourceBegin;
+    source.validate = streamSourceValidate;
+    source.count = streamSourceCount;
+    source.next = streamSourceNext;
+    source.identity = streamSourceIdentity;
+    source.audit = audit ? streamSourceAudit : NULL;
+    source.topology = streamSourceTopology;
+    return source;
+}
+static MSXResidentGpu *openStreamFixture(void)
+{
+    static MSXResidentSlotPatch slots[300];
+    uint32_t cap[2] = {0, 300}, base[2] = {0, 0}, i;
+    MSXResidentGpuOpen open = {1, 300, S, cap, base};
+    MSXResidentDescriptorPatch d;
+    MSXResidentPatchBatch batch;
+    MSXResidentGpu *g = 0;
+    desc(&d, 1, 300, 257, 11, 1);
+    for (i = 0; i < 300; ++i)
+    {
+        if (i < 257) slot(&slots[i], 1, i, 1, UINT64_C(5000) + i, 1.0, i);
+        else { memset(&slots[i], 0, sizeof(slots[i])); slots[i].linkIndex = 1; slots[i].slot = i; }
+    }
+    batch = (MSXResidentPatchBatch){&d, 1, slots, 300};
+    OK(MSXresidentGpu_open(&open, &g) == MSX_RESIDENT_OK && g &&
+       MSXresidentGpu_initialUpload(g, &batch) == MSX_RESIDENT_OK);
+    return g;
+}
+static int sameTransfer(const MSXResidentGpuTransferStats *a,
+                        const MSXResidentGpuTransferStats *b)
+{
+    return a->h2dCalls == b->h2dCalls && a->h2dBytes == b->h2dBytes &&
+        a->d2hCalls == b->d2hCalls && a->d2hBytes == b->d2hBytes &&
+        a->hydH2DCalls == b->hydH2DCalls && a->hydH2DBytes == b->hydH2DBytes &&
+        a->hydApiCalls == b->hydApiCalls;
+}
+/* The shared production stream helper is exercised through injected source
+   callbacks.  This covers the real writer lifecycle without duplicating its
+   append/seal/prepare algorithm in the harness. */
+static void t_runtime_stream_contract(void)
+{
+    StreamSourceTest sourceState;
+    MSXResidentActiveStreamSource source;
+    MSXResidentActiveStreamReport report;
+    MSXResidentGpu *g = openStreamFixture();
+    MSXResidentGpuActiveWriter w;
+    MSXResidentGpuTransferStats before, after;
+    MSXResidentGpuDeviceView view;
+    MSXResidentGpuReactResult result;
+    MSXResidentHydView hyd;
+    double pipe[(size_t)2 * MSX_RESIDENT_HYD_STRIDE] = {0};
+    MSXResidentHydView badHyd;
+    uint32_t active;
+
+    hyd = (MSXResidentHydView){pipe, 1, MSX_RESIDENT_HYD_STRIDE,
+                               MSX_RESIDENT_HYD_PIPE_MAJOR};
+    streamSourceReset(&sourceState);
+    source = streamSource(&sourceState, 0);
+    memset(&w, 0, sizeof(w));
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK);
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active,
+                                     &report) == MSX_RESIDENT_OK);
+    OK(active == 257 && report.expectedCount == 257 &&
+       report.iteratorPasses == 2 && report.rowsAppended == 257 &&
+       report.chunkHighWater == 256 && report.builderAborts == 0 && w.sealed);
+    OK(MSXresidentGpu_prepareSealedActiveHyd(g, &w, &hyd, &view, &result) ==
+       MSX_RESIDENT_OK && view.itemCount == 257 &&
+       MSXresidentGpu_finishActive(g, &result) == MSX_RESIDENT_OK);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       after.hydH2DCalls == before.hydH2DCalls + 1);
+
+    /* Invalid prepare is a pre-submit failure and clears the sealed writer. */
+    streamSourceReset(&sourceState); source = streamSource(&sourceState, 0);
+    memset(&w, 0, sizeof(w)); badHyd = hyd; badHyd.hydLayout = MSX_RESIDENT_HYD_ACTIVE_MAJOR;
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active, &report) == 0);
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK &&
+       MSXresidentGpu_prepareSealedActiveHyd(g, &w, &badHyd, &view, &result) ==
+       MSX_RESIDENT_ERR_ARGUMENT && !w.owner &&
+       MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+
+    /* A next() error after an append/duplicate error keeps next-error
+       priority, but the already-reset writer is not aborted twice. */
+    streamSourceReset(&sourceState); sourceState.duplicateAt = 1;
+    sourceState.nextFailAt = 257; source = streamSource(&sourceState, 0);
+    memset(&w, 0, sizeof(w));
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK);
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active, &report) ==
+       MSX_RESIDENT_ERR_OVERFLOW && report.builderAborts == 1 &&
+       sourceState.nextCalls == 258 && !w.owner);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+
+    streamSourceReset(&sourceState); sourceState.identityFailAt = 256;
+    source = streamSource(&sourceState, 0); memset(&w, 0, sizeof(w));
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK);
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active, &report) ==
+       MSX_RESIDENT_ERR_GENERATION && report.builderAborts == 1 &&
+       report.rowsAppended == 256 && sourceState.nextCalls == 258 && !w.owner);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+
+    /* The audit continues after its first mismatch; every even row is
+       counted, while append/submit remains stopped after row zero. */
+    streamSourceReset(&sourceState); sourceState.auditEvery = 2;
+    source = streamSource(&sourceState, 1); memset(&w, 0, sizeof(w));
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK);
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active, &report) ==
+       MSX_RESIDENT_ERR_ARGUMENT && report.expectedCount == 257 &&
+       report.hydMismatches == 129 && sourceState.auditCalls == 257 &&
+       sourceState.nextCalls == 258 && report.builderAborts == 1 && !w.owner);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+
+    streamSourceReset(&sourceState); sourceState.emitCount = 256;
+    source = streamSource(&sourceState, 0); memset(&w, 0, sizeof(w));
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active, &report) ==
+       MSX_RESIDENT_ERR_CAPACITY && report.builderAborts == 1 && !w.owner);
+
+    streamSourceReset(&sourceState); sourceState.topologyChangeAt = 258;
+    source = streamSource(&sourceState, 0); memset(&w, 0, sizeof(w));
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active, &report) ==
+       MSX_RESIDENT_ERR_GENERATION && report.builderAborts == 1 && !w.owner);
+
+    streamSourceReset(&sourceState); sourceState.count = 301;
+    source = streamSource(&sourceState, 0); memset(&w, 0, sizeof(w));
+    OK(MSXresidentGpu_getTransferStats(g, &before) == MSX_RESIDENT_OK);
+    OK(MSXresident_activeStreamBuild(g, &w, 30, &source, &hyd, &active, &report) ==
+       MSX_RESIDENT_ERR_CAPACITY && report.expectedCount == 301 &&
+       sourceState.nextCalls == 0);
+    OK(MSXresidentGpu_getTransferStats(g, &after) == MSX_RESIDENT_OK &&
+       sameTransfer(&before, &after));
+    MSXresidentGpu_close(g);
+}
 /* P1 typed patches: META leaves the GPU concentration vectors untouched,
    INVALIDATE carries no concentration payload, and a later IMPORT reuses the
    slot with a new generation.  The descriptor patch is intentionally sparse. */
@@ -241,4 +442,4 @@ static void t_typed_patches(void) { MSXResidentGpu*g=initial4();MSXResidentGpuRe
    must preserve both GPU payloads; INVALIDATE carries no concentration arrays. */
 desc(&multi[0],1,2,2,8,1);desc(&multi[1],2,2,2,8,-1);slot(&typed[0],1,1,1,102,3,20);typed[0].kind=MSX_RESIDENT_PATCH_META;slot(&typed[1],2,0,1,201,4,30);typed[1].kind=MSX_RESIDENT_PATCH_META;b=(MSXResidentPatchBatch){multi,2,typed,2};OK(snap(g,&a,m)&&MSXresidentGpu_applyPatches(g,&b)==0&&snap(g,&z,n)&&same(&a,&z,m,n));desc(&multi[0],1,2,2,9,1);desc(&multi[1],2,2,1,9,-1);multi[1].descriptor.head=1;multi[1].descriptor.tail=1;slot(&typed[0],1,1,1,102,3,20);typed[0].kind=MSX_RESIDENT_PATCH_META;memset(&typed[1],0,sizeof(typed[1]));typed[1].linkIndex=2;typed[1].slot=0;typed[1].generation=1;typed[1].kind=MSX_RESIDENT_PATCH_INVALIDATE;b=(MSXResidentPatchBatch){multi,2,typed,2};OK(MSXresidentGpu_applyPatches(g,&b)==0&&snap(g,&z,n)&&z.activeCount==3);MSXresidentGpu_close(g);}
 static void t_active_sync(void) { MSXResidentGpu*g=initial4();MSXResidentGpuReduction z;double mass[S],hyd[MSX_RESIDENT_HYD_STRIDE]={0},c[S],l[S],h=77;MSXResidentActiveItem a={1,0,1,5,2,hyd};MSXResidentActiveBatch b={&a,1};MSXResidentGpuDeviceView v;MSXResidentGpuReactResult r;MSXResidentGpuActiveSyncRow row;MSXResidentGpuActiveSyncOutput o={&row,c,l,S};MSXResidentDescriptorPatch d;MSXResidentPatchBatch q;OK(MSXresidentGpu_prepareActive(g,&b,&v,&r)==0);c[0]=321;l[0]=654;OK(vcopy(&v,(void*)(uintptr_t)v.c,c,sizeof(c),cudaMemcpyHostToDevice)==cudaSuccess);OK(vcopy(&v,(void*)(uintptr_t)v.lastc,l,sizeof(l),cudaMemcpyHostToDevice)==cudaSuccess);OK(vcopy(&v,(void*)(uintptr_t)v.hstep,&h,sizeof(h),cudaMemcpyHostToDevice)==cudaSuccess);OK(MSXresidentGpu_finishActive(g,&r)==0);OK(MSXresidentGpu_reduce(g,mass,S,&z)==0&&mass[0]==321*2+20*3+30*4+40*5);memset(c,0,sizeof(c));memset(l,0,sizeof(l));OK(MSXresidentGpu_syncActive(g,&o,1)==0&&row.linkIndex==1&&row.globalRow==0&&row.generation==1&&row.descriptorEpoch==5&&row.hstep==77&&c[0]==321&&l[0]==654);OK(MSXresidentGpu_prepareActive(g,&b,&v,&r)==0&&MSXresidentGpu_finishActive(g,&r)==0);desc(&d,1,2,2,6,1);q=(MSXResidentPatchBatch){&d,1,0,0};OK(MSXresidentGpu_applyPatches(g,&q)==0);OK(MSXresidentGpu_syncActive(g,&o,1)==MSX_RESIDENT_ERR_GENERATION);MSXresidentGpu_close(g);}
-int main(void) { struct cudaDeviceProp p;int n=0;cudaError_t e=cudaGetDeviceCount(&n);printf("cuda_required=true\n");if(e!=cudaSuccess||n<1){printf("gpu_name=unavailable\nassertions_passed=0\nassertions_failed=1\n");return 2;}cudaGetDeviceProperties(&p,0);printf("gpu_name=%s\n",p.name);OK(MSXresidentGpu_isEnabled()==1);t_open();t_initial();t_scatter();t_descriptor_generation();t_fetch();t_fetch_batch_contract();t_reduce_lifecycle();t_hole_initial_fetch();t_ring_span_reject();t_wrap_active();t_stream_builder();t_stream_writer_large();t_active_view();t_pipe_hyd_contract();t_pipe_hyd_exact_bits();t_pipe_hyd_failure_invalidates();t_active_sync();t_active_error();t_active_empty();t_active_abort_and_query_guard();t_explicit_poison_query_guard();t_large_batch();t_typed_patches();printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0; }
+int main(void) { struct cudaDeviceProp p;int n=0;cudaError_t e=cudaGetDeviceCount(&n);printf("cuda_required=true\n");if(e!=cudaSuccess||n<1){printf("gpu_name=unavailable\nassertions_passed=0\nassertions_failed=1\n");return 2;}cudaGetDeviceProperties(&p,0);printf("gpu_name=%s\n",p.name);OK(MSXresidentGpu_isEnabled()==1);t_open();t_initial();t_scatter();t_descriptor_generation();t_fetch();t_fetch_batch_contract();t_reduce_lifecycle();t_hole_initial_fetch();t_ring_span_reject();t_wrap_active();t_stream_builder();t_stream_writer_large();t_runtime_stream_contract();t_active_view();t_pipe_hyd_contract();t_pipe_hyd_exact_bits();t_pipe_hyd_failure_invalidates();t_active_sync();t_active_error();t_active_empty();t_active_abort_and_query_guard();t_explicit_poison_query_guard();t_large_batch();t_typed_patches();printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0; }
