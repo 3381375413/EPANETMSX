@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 #include "msxsegment_storage.h"
 #include "msxresident_core.h"
@@ -190,6 +193,46 @@ enum {
 };
 static MSXRebalanceMetrics *HybridRebalanceMetrics = NULL;
 static int HybridRebalanceStage = HYBRID_REBALANCE_NONE;
+/* S00 audit-only seam.  It is disabled unless explicitly requested and is
+   never part of a formal off run.  The disabled path pays one cached
+   environment parse and a branch at the Resident rebalance entry. */
+static int HybridResidentScanAuditState = -1;
+static int HybridResidentScanAuditWritten = 0;
+
+static int hybridResidentScanAuditEnabled(void)
+{
+    if (HybridResidentScanAuditState < 0)
+    {
+        const char *value = getenv("MSX_RESIDENT_SCAN_AUDIT");
+        HybridResidentScanAuditState =
+            value && (strcmp(value, "1") == 0 ||
+                      _stricmp(value, "YES") == 0 ||
+                      _stricmp(value, "ON") == 0);
+    }
+    return HybridResidentScanAuditState;
+}
+
+static void hybridResidentScanAuditRecord(int teamSize)
+{
+    FILE *f;
+    if (HybridResidentScanAuditWritten || !hybridResidentScanAuditEnabled())
+        return;
+    f = fopen("resident_scan_team_size.txt", "wt");
+    if (!f) return;
+    fprintf(f, "phase=resident_rebalance_production_probe\n");
+    fprintf(f, "team_size=%d\n", teamSize);
+#if defined(_OPENMP)
+    fprintf(f, "omp_max_threads=%d\n", omp_get_max_threads());
+    fprintf(f, "omp_dynamic=%d\n", omp_get_dynamic());
+    fprintf(f, "omp_nested=%d\n", omp_get_nested());
+#else
+    fprintf(f, "omp_max_threads=not_compiled\n");
+    fprintf(f, "omp_dynamic=not_compiled\n");
+    fprintf(f, "omp_nested=not_compiled\n");
+#endif
+    fclose(f);
+    HybridResidentScanAuditWritten = 1;
+}
 
 static void hybridRebalanceAddPhaseInternal(int phase, double ms)
 {
@@ -2282,6 +2325,20 @@ void MSXsegStorage_hybridRebalanceAll(void)
     if (MSXresidentRuntime_isResident())
     {
         audit = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
+        if (hybridResidentScanAuditEnabled() && !HybridResidentScanAuditWritten)
+        {
+            int teamSize = 1;
+#if defined(_OPENMP)
+            /* Audit-only probe in the production Resident entry point.  The
+               formal path remains free of the extra team and file operation. */
+#pragma omp parallel
+            {
+#pragma omp single
+                teamSize = omp_get_num_threads();
+            }
+#endif
+            hybridResidentScanAuditRecord(teamSize);
+        }
         if (audit)
         {
             memset(&metrics, 0, sizeof(metrics));
