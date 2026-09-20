@@ -45,12 +45,20 @@ extern MSXproject MSX;
 #define GPU_MAX_SPECIES 64
 #define GPU_MAX_EQUIL   16
 #define GPU_MAX_STACK   128
-#define GPU_CACHE_VERSION "v23_hydpipe_abi1"
+#define GPU_CACHE_VERSION "v24_ros2_dims_hydpipe_abi1"
 #define GPU_ROS2_MAX_RATE_SPECIES 16
 #define RK5_FAST_BUCKETS 6
 #define GPU_CACHE_MAX_BYTES (200LL * 1024LL * 1024LL)
 #define GPU_CACHE_MAX_AGE_SECONDS (30LL * 24LL * 60LL * 60LL)
 #define GPU_PATH_MAX 1024
+
+typedef struct
+{
+    int nSpecies;
+    int nRate;
+    int nEquil;
+    int nFormula;
+} GpuSpecializedDimensions;
 
 typedef struct
 {
@@ -1921,19 +1929,74 @@ static uint64_t hashExpr(uint64_t h, MathExpr *expr)
     return h;
 }
 
+static int collectSpecializedDimensions(GpuSpecializedDimensions *dims)
+{
+    int m;
+
+    if (!dims) return ERR_GPU_UNSUPPORTED_FEATURE;
+    memset(dims, 0, sizeof(*dims));
+    dims->nSpecies = MSX.Nobjects[SPECIES];
+    if (dims->nSpecies < 1 || dims->nSpecies > GPU_MAX_SPECIES)
+        return ERR_GPU_UNSUPPORTED_FEATURE;
+    for (m = 1; m <= dims->nSpecies; m++)
+    {
+        if (MSX.Species[m].pipeExprType == RATE) dims->nRate++;
+        else if (MSX.Species[m].pipeExprType == EQUIL) dims->nEquil++;
+        else if (MSX.Species[m].pipeExprType == FORMULA) dims->nFormula++;
+    }
+    if (dims->nEquil > GPU_MAX_EQUIL)
+        return ERR_GPU_EQUIL_UNSUPPORTED;
+    if (dims->nRate > GPU_MAX_SPECIES)
+        return ERR_GPU_UNSUPPORTED_FEATURE;
+    if (MSX.GpuSolver == ROS2 &&
+        (dims->nRate < 1 || dims->nRate > GPU_ROS2_MAX_RATE_SPECIES))
+        return ERR_GPU_UNSUPPORTED_FEATURE;
+    return 0;
+}
+
 static uint64_t hashModelExpressions(void)
 {
     uint64_t h = 1469598103934665603ULL;
-    static const char hydAbi[] = "hyd-layout-active0-pipe1-generator1";
+    static const char generatorAbi[] = "specialized-model-dims-v1-kernel-abi1";
+    GpuSpecializedDimensions dims;
     int m;
-    h = fnv1aBytes(h, hydAbi, sizeof(hydAbi) - 1);
-    h = fnv1aBytes(h, &MSX.Nobjects[SPECIES], sizeof(MSX.Nobjects[SPECIES]));
+    int rateOrdinal = 0;
+    int equilOrdinal = 0;
+    int formulaOrdinal = 0;
+
+    h = fnv1aBytes(h, generatorAbi, sizeof(generatorAbi) - 1);
+    if (collectSpecializedDimensions(&dims))
+    {
+        const int invalid = -1;
+        h = fnv1aBytes(h, &invalid, sizeof(invalid));
+        return h;
+    }
+    h = fnv1aBytes(h, &dims.nSpecies, sizeof(dims.nSpecies));
+    h = fnv1aBytes(h, &dims.nRate, sizeof(dims.nRate));
+    h = fnv1aBytes(h, &dims.nEquil, sizeof(dims.nEquil));
+    h = fnv1aBytes(h, &dims.nFormula, sizeof(dims.nFormula));
     h = fnv1aBytes(h, &MSX.Nobjects[TERM], sizeof(MSX.Nobjects[TERM]));
     for (m = 1; m <= MSX.Nobjects[TERM]; m++)
         h = hashExpr(h, MSX.Term[m].expr);
-    for (m = 1; m <= MSX.Nobjects[SPECIES]; m++)
+    for (m = 1; m <= dims.nSpecies; m++)
     {
         h = fnv1aBytes(h, &MSX.Species[m].pipeExprType, sizeof(MSX.Species[m].pipeExprType));
+        h = fnv1aBytes(h, &m, sizeof(m));
+        if (MSX.Species[m].pipeExprType == RATE)
+        {
+            h = fnv1aBytes(h, &rateOrdinal, sizeof(rateOrdinal));
+            rateOrdinal++;
+        }
+        else if (MSX.Species[m].pipeExprType == EQUIL)
+        {
+            h = fnv1aBytes(h, &equilOrdinal, sizeof(equilOrdinal));
+            equilOrdinal++;
+        }
+        else if (MSX.Species[m].pipeExprType == FORMULA)
+        {
+            h = fnv1aBytes(h, &formulaOrdinal, sizeof(formulaOrdinal));
+            formulaOrdinal++;
+        }
         h = hashExpr(h, MSX.Species[m].pipeExpr);
     }
     return h;
@@ -2489,6 +2552,192 @@ static int sourceReplaceAll(const char *source, const char *needle,
     return 0;
 }
 
+/* Resize only numeric array extents in generated CUDA declarations.  The
+   source fragments retain their legacy interpreter text; this helper is
+   called exclusively for GPU_COMPILER YES after the model dimensions have
+   been validated. */
+static int replaceNamedArrayExtents(const char *source,
+                                    const char *const *names,
+                                    size_t nameCount,
+                                    int dimension,
+                                    int matrix,
+                                    char **out)
+{
+    GpuSourceBuilder sb = {0};
+    const char *p = source;
+
+    if (!source || !names || !nameCount || dimension < 1 || !out)
+        return ERR_GPU_UNSUPPORTED_FEATURE;
+    *out = NULL;
+    while (*p)
+    {
+        const char *name = NULL;
+        const char *close = NULL;
+        size_t nameLen = 0;
+        size_t i;
+        int value;
+
+        for (i = 0; i < nameCount; i++)
+        {
+            size_t len = strlen(names[i]);
+            const char *open;
+            const char *q;
+            char *end;
+            if (strncmp(p, names[i], len) != 0) continue;
+            open = p + len;
+            if (*open != '[' || !isdigit((unsigned char)open[1])) continue;
+            value = (int)strtol(open + 1, &end, 10);
+            if (value < 1 || end == open + 1 || *end != ']') continue;
+            q = end + 1;
+            if (matrix)
+            {
+                char *matrixEnd;
+                if (*q != '[' || !isdigit((unsigned char)q[1])) continue;
+                (void)strtol(q + 1, &matrixEnd, 10);
+                if (matrixEnd == q + 1 || *matrixEnd != ']') continue;
+                close = matrixEnd + 1;
+            }
+            else close = q;
+            name = names[i];
+            nameLen = len;
+            break;
+        }
+        if (!name)
+        {
+            if (sbAppendN(&sb, p, 1)) { sbFree(&sb); return ERR_MEMORY; }
+            p++;
+            continue;
+        }
+        if (sbAppendN(&sb, name, nameLen) ||
+            sbAppendFmt(&sb, "[%d]", dimension))
+        {
+            sbFree(&sb);
+            return ERR_MEMORY;
+        }
+        if (matrix && sbAppendFmt(&sb, "[%d]", dimension))
+        {
+            sbFree(&sb);
+            return ERR_MEMORY;
+        }
+        p = close;
+    }
+    *out = sb.data;
+    return 0;
+}
+
+static int specializeRos2CudaSource(const char *source,
+                                    const GpuSpecializedDimensions *dims,
+                                    char **out)
+{
+    static const char *stateArrays[] = { "old", "y", "yn" };
+    static const char *rateArrays[] = { "k1", "k2", "fp", "fm", "w", "ix" };
+    static const char *matrixArrays[] = { "a" };
+    char *current = NULL;
+    char *next = NULL;
+    int err;
+
+    if (!dims || dims->nRate < 1) return ERR_GPU_UNSUPPORTED_FEATURE;
+    err = replaceNamedArrayExtents(source, stateArrays,
+                                   sizeof(stateArrays) / sizeof(stateArrays[0]),
+                                   dims->nSpecies + 1, 0, &current);
+    if (err) return err;
+    err = replaceNamedArrayExtents(current, rateArrays,
+                                   sizeof(rateArrays) / sizeof(rateArrays[0]),
+                                   dims->nRate + 1, 0, &next);
+    free(current); current = NULL;
+    if (err) return err;
+    current = next; next = NULL;
+    err = replaceNamedArrayExtents(current, matrixArrays,
+                                   sizeof(matrixArrays) / sizeof(matrixArrays[0]),
+                                   dims->nRate + 1, 1, &next);
+    free(current);
+    if (err) return err;
+    *out = next;
+    return 0;
+}
+
+static int specializeEquilCudaSource(const char *source,
+                                     const GpuSpecializedDimensions *dims,
+                                     char **out)
+{
+    static const char *vectorArrays[] = { "x", "f", "w", "indx" };
+    static const char *matrixArrays[] = { "jmat", "a" };
+    char *current = NULL;
+    char *next = NULL;
+    int dimension;
+    int err;
+
+    if (!dims || dims->nEquil < 0) return ERR_GPU_UNSUPPORTED_FEATURE;
+    dimension = dims->nEquil + 1;
+    err = replaceNamedArrayExtents(source, vectorArrays,
+                                   sizeof(vectorArrays) / sizeof(vectorArrays[0]),
+                                   dimension, 0, &current);
+    if (err) return err;
+    err = replaceNamedArrayExtents(current, matrixArrays,
+                                   sizeof(matrixArrays) / sizeof(matrixArrays[0]),
+                                   dimension, 1, &next);
+    free(current);
+    if (err) return err;
+    *out = next;
+    return 0;
+}
+
+static void writeSpecializedFunctionAttributes(FILE *f, const char *name,
+                                               CUfunction function)
+{
+    int numRegs = -1;
+    int localSize = -1;
+    int sharedSize = -1;
+    int maxThreads = -1;
+    CUresult rRegs = cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, function);
+    CUresult rLocal = cuFuncGetAttribute(&localSize, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function);
+    CUresult rShared = cuFuncGetAttribute(&sharedSize, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function);
+    CUresult rThreads = cuFuncGetAttribute(&maxThreads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function);
+    fprintf(f, "function=%s,num_regs=%d,local_size_bytes=%d,shared_size_bytes=%d,max_threads_per_block=%d,status=%d/%d/%d/%d\n",
+            name, numRegs, localSize, sharedSize, maxThreads,
+            (int)rRegs, (int)rLocal, (int)rShared, (int)rThreads);
+}
+
+static void writeSpecializedMetadata(const char *cachePath, uint64_t cacheKey,
+                                     const GpuSpecializedDimensions *dims)
+{
+    char metadataPath[GPU_PATH_MAX + 16];
+    FILE *f;
+    int m;
+    int rateOrdinal = 0;
+    int equilOrdinal = 0;
+    int formulaOrdinal = 0;
+
+    if (!MSXgpu_profileDetailEnabled() || !cachePath || !dims) return;
+    if (snprintf(metadataPath, sizeof(metadataPath), "%s.meta", cachePath) < 0)
+        return;
+    f = fopen(metadataPath, "wt");
+    if (!f) return;
+    fprintf(f, "cache_version=%s\ncache_key=%016llx\nsolver=%d\n",
+            GPU_CACHE_VERSION, (unsigned long long)cacheKey, MSX.GpuSolver);
+    fprintf(f, "n_species=%d,n_rate=%d,n_equil=%d,n_formula=%d\n",
+            dims->nSpecies, dims->nRate, dims->nEquil, dims->nFormula);
+    fprintf(f, "species_index,type,ordinal\n");
+    for (m = 1; m <= dims->nSpecies; m++)
+    {
+        int ordinal = 0;
+        if (MSX.Species[m].pipeExprType == RATE) ordinal = ++rateOrdinal;
+        else if (MSX.Species[m].pipeExprType == EQUIL) ordinal = ++equilOrdinal;
+        else if (MSX.Species[m].pipeExprType == FORMULA) ordinal = ++formulaOrdinal;
+        fprintf(f, "%d,%d,%d\n", m, MSX.Species[m].pipeExprType, ordinal);
+    }
+    fprintf(f, "attributes\n");
+    if (MSX.GpuSolver == ROS2)
+        writeSpecializedFunctionAttributes(f, "ros2_kernel", GpuModule.ros2Kernel);
+    else if (MSX.GpuSolver == RK5)
+        writeSpecializedFunctionAttributes(f, "rk5_align_kernel", GpuModule.rk5Kernel);
+    else
+        writeSpecializedFunctionAttributes(f, "ode_kernel", GpuModule.odeKernel);
+    writeSpecializedFunctionAttributes(f, "equil_kernel", GpuModule.equilKernel);
+    writeSpecializedFunctionAttributes(f, "formula_kernel", GpuModule.formulaKernel);
+    fclose(f);
+}
+
 static int applyHydLayoutAbi(const char *source, char **out)
 {
     static const struct { const char *from, *to; } edits[] = {
@@ -2604,6 +2853,11 @@ static int ensureModule(void)
     size_t ptxSize = 0;
     double startMs = 0.0, timer = 0.0, phaseStartMs;
     int timing = MSXgpu_profileStageEnabled();
+    GpuSpecializedDimensions specializedDims;
+    uint64_t cacheKey = 0;
+    int haveSpecializedDims = 0;
+
+    memset(&specializedDims, 0, sizeof(specializedDims));
 
     if (GpuModule.ready && GpuModule.solver == MSX.GpuSolver &&
         (MSX.GpuSolver != RK5 || GpuModule.rk5Mode == MSX.GpuRk5Mode)) return 0;
@@ -2624,6 +2878,12 @@ static int ensureModule(void)
                   (MSX.GpuSolver == ROS2 ? "-DMSX_GPU_SOLVER_ROS2" : "-DMSX_GPU_SOLVER_EUL");
     if (MSX.GpuSolver == RK5 && MSX.GpuRk5Mode == GPU_RK5_FAST_BUCKET)
         modeMacro = "-DMSX_GPU_RK5_FAST_BUCKET";
+    if (MSX.GpuCompiler)
+    {
+        err = collectSpecializedDimensions(&specializedDims);
+        if (err) return err;
+        haveSpecializedDims = 1;
+    }
     err = checkCu(cuInit(0), ERR_GPU_NOT_ENABLED);
     if (err) return err;
     err = checkCu(cuDeviceGet(&dev, 0), ERR_GPU_NOT_ENABLED);
@@ -2649,9 +2909,9 @@ static int ensureModule(void)
 
     if (MSX.GpuCompiler)
     {
-        uint64_t h = hashModelExpressions();
+        cacheKey = hashModelExpressions();
         snprintf(cachePath, sizeof(cachePath), "%s/specialized_%s_%016llx_sm%d%d_%s.ptx",
-                 cacheDir, solverName, (unsigned long long)h, major, minor, GPU_CACHE_VERSION);
+                 cacheDir, solverName, (unsigned long long)cacheKey, major, minor, GPU_CACHE_VERSION);
     }
     else
     {
@@ -2672,6 +2932,8 @@ static int ensureModule(void)
     else
     {
         char *specializedSource = NULL;
+        char *dimensionedSource = NULL;
+        char *specializedRos2 = NULL;
         char *ros2Source = NULL;
         char *hydSource = NULL;
         const char *compileSource = GpuReactCudaSource;
@@ -2680,20 +2942,46 @@ static int ensureModule(void)
         {
             err = buildSpecializedCudaSource(&specializedSource);
             if (err) return err;
+            err = specializeEquilCudaSource(specializedSource, &specializedDims,
+                                            &dimensionedSource);
+            if (err)
+            {
+                free(specializedSource);
+                return err;
+            }
+            free(specializedSource);
+            specializedSource = dimensionedSource;
+            dimensionedSource = NULL;
             compileSource = specializedSource;
         }
         if (MSX.GpuSolver == ROS2)
         {
+            const char *ros2Fragment = GpuRos2CudaSource;
             size_t baseLen = strlen(compileSource);
-            size_t ros2Len = strlen(GpuRos2CudaSource);
+            size_t ros2Len;
+            if (MSX.GpuCompiler)
+            {
+                err = specializeRos2CudaSource(GpuRos2CudaSource, &specializedDims,
+                                               &specializedRos2);
+                if (err)
+                {
+                    free(specializedSource);
+                    free(dimensionedSource);
+                    return err;
+                }
+                ros2Fragment = specializedRos2;
+            }
+            ros2Len = strlen(ros2Fragment);
             ros2Source = (char*)malloc(baseLen + ros2Len + 1);
             if (!ros2Source)
             {
                 free(specializedSource);
+                free(dimensionedSource);
+                free(specializedRos2);
                 return ERR_MEMORY;
             }
             memcpy(ros2Source, compileSource, baseLen);
-            memcpy(ros2Source + baseLen, GpuRos2CudaSource, ros2Len + 1);
+            memcpy(ros2Source + baseLen, ros2Fragment, ros2Len + 1);
             compileSource = ros2Source;
         }
         err = applyHydLayoutAbi(compileSource, &hydSource);
@@ -2701,6 +2989,8 @@ static int ensureModule(void)
         free(hydSource);
         free(ros2Source);
         free(specializedSource);
+        free(dimensionedSource);
+        free(specializedRos2);
         if (timing)
         {
             phaseStartMs = MSXgpu_wallTimeMs() - timer;
@@ -2754,6 +3044,8 @@ static int ensureModule(void)
     GpuModule.ready = 1;
     GpuModule.solver = MSX.GpuSolver;
     GpuModule.rk5Mode = MSX.GpuRk5Mode;
+    if (haveSpecializedDims)
+        writeSpecializedMetadata(cachePath, cacheKey, &specializedDims);
     if (timing)
     {
         phaseStartMs = MSXgpu_wallTimeMs() - startMs;
