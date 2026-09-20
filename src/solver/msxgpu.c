@@ -1448,6 +1448,18 @@ void MSXgpu_addEquilTime(double ms) { addTime(&MSX.GpuTimingRecord.react_equil_m
 void MSXgpu_addFormulaTime(double ms) { addTime(&MSX.GpuTimingRecord.react_formula_ms, ms); }
 
 #ifndef EPANETMSX_CUDA_ENABLED
+static int cacheGpuModelBinding(void)
+{
+    memset(&GpuModel, 0, sizeof(GpuModel));
+    GpuModel.valid = 1;
+    return 0;
+}
+
+static void clearGpuModelBinding(void)
+{
+    memset(&GpuModel, 0, sizeof(GpuModel));
+}
+
 int MSXgpu_prepareResidentContext(void)
 {
     setGpuError(ERR_GPU_NOT_ENABLED, GPU_STAGE_NONE, -1, -1, -1, -1, -1, 0.0);
