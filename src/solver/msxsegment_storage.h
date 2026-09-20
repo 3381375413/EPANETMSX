@@ -105,20 +105,27 @@ int MSXsegStorage_hybridAuditSnapshot(int k,
                                       MSXHybridAuditRow *rows,
                                       uint32_t row_capacity,
                                       uint32_t *row_count);
+enum {
+    MSX_RESIDENT_SCAN_FULL_OMP8 = 0,
+    MSX_RESIDENT_SCAN_FULL_SERIAL = 1,
+    MSX_RESIDENT_SCAN_SPAN_OMP8 = 2,
+    MSX_RESIDENT_SCAN_SPAN_SERIAL = 3
+};
 #if defined(MSX_RESIDENT_SCAN_OMP_TEST)
 /* Test-only entry point for the production scan workshare.  It exposes no
    normal runtime configuration surface and is compiled only by the real
-   OpenMP audit target. */
-int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
+   OpenMP audit target.  ``scanMode`` accepts the four constants above;
+   values 0/1 retain the original FULL_OMP8/FULL_SERIAL contract. */
+int MSXsegStorage_testResidentScanOMP(int scanMode, int *teamSize,
                                       int *workerIds, int workerCapacity,
                                       MSXHybridAuditSnapshot *snapshots,
                                       int snapshotCapacity);
 /* Test-only seam for the production scan -> publish -> empty-init ordering.
    It is compiled only by CPU/OpenMP contract harnesses. */
-int MSXsegStorage_testResidentScanAndInitialize(int fullSerial, int *teamSize);
+int MSXsegStorage_testResidentScanAndInitialize(int scanMode, int *teamSize);
 /* Test-only seam for the post-scan Resident demote pool failure. */
 int MSXsegStorage_testResidentScanAndDemotePoolFailure(
-    int fullSerial, int *teamSize, int failureLink);
+    int scanMode, int *teamSize, int failureLink);
 #endif
 #if defined(MSX_RESIDENT_SCAN_OMP_TEST) || defined(MSX_RESIDENT_CORE_SPAN_TEST)
 /* Review-fix seams: prove normal publication does not invoke the full audit,

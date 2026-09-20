@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ResultDir,
-    [ValidateSet('FULL_OMP8', 'FULL_SERIAL')]
+    [ValidateSet('FULL_OMP8', 'FULL_SERIAL', 'SPAN_OMP8', 'SPAN_SERIAL')]
     [string]$ExpectedMode = 'FULL_OMP8'
 )
 
@@ -36,6 +36,10 @@ function Read-Sidecar([string]$Path) {
         }
         $values[$key] = $number
     }
+    if ($values.ContainsKey('sample_scope') -and
+        $values.sample_scope -ne 'first_rebalance') {
+        throw "Unsupported sample_scope '$($values.sample_scope)' in Resident scan audit sidecar: $Path"
+    }
     return $values
 }
 
@@ -48,7 +52,7 @@ foreach ($sidecar in @(@{Name = 'resident_scan_team_size.txt'; Data = $productio
     }
 }
 
-if ($ExpectedMode -eq 'FULL_OMP8') {
+if ($ExpectedMode -eq 'FULL_OMP8' -or $ExpectedMode -eq 'SPAN_OMP8') {
     foreach ($sidecar in @(@{Name = 'resident_scan_team_size.txt'; Data = $production},
                            @{Name = 'resident_scan_omp_team_size.txt'; Data = $omp})) {
         if ($sidecar.Data.team_size -ne 8 -or
@@ -59,7 +63,8 @@ if ($ExpectedMode -eq 'FULL_OMP8') {
     }
 }
 elseif ($production.team_size -ne 1 -or $omp.team_size -ne 1) {
-    throw "FULL_SERIAL audit must report team_size=1 in both sidecars"
+    throw "$ExpectedMode audit must report team_size=1 in both sidecars"
 }
 
-Write-Output "Resident scan audit gate PASS: mode=$ExpectedMode; production/team=$($production.team_size); omp/team=$($omp.team_size); dynamic=$($omp.omp_dynamic); nested=$($omp.omp_nested)"
+$scope = if ($omp.ContainsKey('sample_scope')) { $omp.sample_scope } else { 'legacy_unspecified' }
+Write-Output "Resident scan audit gate PASS: mode=$ExpectedMode; scope=$scope; production/team=$($production.team_size); omp/team=$($omp.team_size); dynamic=$($omp.omp_dynamic); nested=$($omp.omp_nested)"

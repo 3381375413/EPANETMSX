@@ -2,12 +2,14 @@
 
 This target compiles and calls the production `hybridScanResidentSnapshots`
 workshare through its test-only seam. It does not copy the scan algorithm. The
-harness requires `_OPENMP`, uses 64 non-empty links, checks that an 8-thread
-run assigns work to at least two workers, compares FULL_SERIAL fields, checks
-worker-id bounds, and verifies close/reopen audit-state reset and environment
-switching. `resident_phase2a` contains the Resident empty-init, reverse,
-fixed-capacity, pool-failure, and error-prefix tests; its CMake target enables
-the same production seam.
+harness requires `_OPENMP`, uses 64 links, and checks all four modes:
+FULL_OMP8/FULL_SERIAL and SPAN_OMP8/SPAN_SERIAL. It compares snapshot fields
+for certified CoreSpan and reverse orientation, checks that an 8-thread run
+assigns work to at least two workers, checks worker-id bounds, verifies stale
+certification fallback and invalid-structure errors, and verifies close/reopen
+audit-state reset and environment switching. `resident_phase2a` contains the
+Resident empty-init, reverse, fixed-capacity, pool-failure, and error-prefix
+tests; its CMake target enables the same production seam.
 
 ## Reproducible build and run
 
@@ -34,8 +36,14 @@ powershell -ExecutionPolicy Bypass -File tests/resident_scan_omp/ResidentScanAud
 ```
 
 The gate fails if either sidecar is missing, malformed, has a write-truncated
-key set, or does not prove `scan_mode=FULL_OMP8`, `team_size=8`,
-`omp_dynamic=0`, and `omp_nested=0`. A `FULL_SERIAL` smoke audit can be checked
-with `-ExpectedMode FULL_SERIAL`; it must report `team_size=1` in both files.
+key set, or does not prove the requested `scan_mode`. `FULL_OMP8` and
+`SPAN_OMP8` must prove `team_size=8`, `omp_dynamic=0`, and `omp_nested=0`.
+`FULL_SERIAL` and `SPAN_SERIAL` must report `team_size=1` in both files.
+SPAN sidecars additionally report hit/fallback counts and physical/core/
+boundary visit counts; `physical_pipe_scans` is the number of links assigned
+to the scan and `physical_segment_visits` is the number of CPU-list segments
+actually traversed. `sample_scope=first_rebalance` makes the write-once
+sidecars explicit: these counts describe the first rebalance scan only, not
+an accumulated 48 h total. Legacy sidecars without this key remain readable.
 Sidecar write failure is therefore a test/gate failure after the run, not a new
 production chemistry error.

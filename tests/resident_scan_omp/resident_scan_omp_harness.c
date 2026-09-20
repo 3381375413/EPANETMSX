@@ -103,6 +103,12 @@ static void buildTopology(void)
         {
             Pseg seg = (Pseg)calloc(1, sizeof(*seg));
             seg->hybridId = (uint64_t)k * 1000u + (uint64_t)i;
+            seg->c = (double *)calloc((size_t)MSX.Nobjects[SPECIES] + 1,
+                                      sizeof(double));
+            seg->lastc = (double *)calloc((size_t)MSX.Nobjects[SPECIES] + 1,
+                                          sizeof(double));
+            seg->privateC = seg->c;
+            seg->privateLastC = seg->lastc;
             seg->next = previous;
             if (previous) previous->prev = seg;
             else MSX.FirstSeg[k] = seg;
@@ -111,6 +117,39 @@ static void buildTopology(void)
             ++MSX.Link[k].nsegs;
         }
     }
+}
+
+static void appendSegment(int k, int ordinal)
+{
+    Pseg seg = (Pseg)calloc(1, sizeof(*seg));
+    if (!seg) return;
+    seg->hybridId = (uint64_t)k * 1000u + (uint64_t)ordinal;
+    seg->c = (double *)calloc((size_t)MSX.Nobjects[SPECIES] + 1,
+                              sizeof(double));
+    seg->lastc = (double *)calloc((size_t)MSX.Nobjects[SPECIES] + 1,
+                                  sizeof(double));
+    seg->privateC = seg->c;
+    seg->privateLastC = seg->lastc;
+    seg->next = MSX.LastSeg[k];
+    if (MSX.LastSeg[k]) MSX.LastSeg[k]->prev = seg;
+    else MSX.FirstSeg[k] = seg;
+    MSX.LastSeg[k] = seg;
+    ++MSX.Link[k].nsegs;
+}
+
+static void reverseTopology(int k)
+{
+    Pseg seg = MSX.FirstSeg[k], next;
+    Pseg oldFirst = MSX.FirstSeg[k];
+    while (seg)
+    {
+        next = seg->prev;
+        seg->prev = seg->next;
+        seg->next = next;
+        seg = next;
+    }
+    MSX.FirstSeg[k] = MSX.LastSeg[k];
+    MSX.LastSeg[k] = oldFirst;
 }
 
 static int uniqueWorkers(const int *workerIds)
@@ -149,6 +188,10 @@ int main(void)
     int invalidWorkers[LINK_COUNT + 1] = {0};
     int parallelWorkers[LINK_COUNT + 1], serialWorkers[LINK_COUNT + 1];
     MSXHybridAuditSnapshot parallel[LINK_COUNT], serial[LINK_COUNT];
+    MSXHybridAuditSnapshot fullCore[LINK_COUNT], spanOmp[LINK_COUNT];
+    MSXHybridAuditSnapshot spanSerial[LINK_COUNT], reverseFull[LINK_COUNT];
+    MSXHybridAuditSnapshot reverseSpan[LINK_COUNT];
+    int spanWorkers[LINK_COUNT + 1], reverseWorkers[LINK_COUNT + 1];
     Pseg first[LINK_COUNT + 1], last[LINK_COUNT + 1];
 
     _putenv_s("MSX_RESIDENT_SCAN_AUDIT", "1");
@@ -224,6 +267,140 @@ int main(void)
     CHECK(serialTeam == 1);
     CHECK(fileContains("resident_scan_omp_team_size.txt",
                       "scan_mode=FULL_SERIAL"));
+
+    /* The same seam now exercises all four modes against an already
+       certified, non-empty CoreSpan.  The initial 3-segment fixture is
+       extended through the ordinary CPU list API; no pointer is fabricated. */
+    {
+        uint32_t capacity[LINK_COUNT + 1], base[LINK_COUNT + 1];
+        uint32_t guard[LINK_COUNT + 1];
+        MSXResidentLayout layout;
+        int k, i, spanTeam = 0, reverseTeam = 0;
+        for (k = 1; k <= LINK_COUNT; ++k)
+        {
+            for (i = 3; i < 7; ++i) appendSegment(k, i);
+            capacity[k] = 16;
+            base[k] = 0;
+            guard[k] = 2;
+        }
+        layout.nLinks = LINK_COUNT;
+        layout.totalSlots = LINK_COUNT;
+        layout.speciesStride = MSX.Nobjects[SPECIES] + 1;
+        layout.capacity = capacity;
+        layout.base = base;
+        layout.guard = guard;
+        CHECK(MSXsegStorage_hybridReserve(&layout) == 0);
+        CHECK(MSXsegStorage_hybridizeAll() == 0);
+        CHECK(MSXsegStorage_hybridCoreCount(1) == 3);
+
+        CHECK(MSXsegStorage_testResidentScanOMP(
+            MSX_RESIDENT_SCAN_FULL_SERIAL, &serialTeam, serialWorkers,
+            LINK_COUNT + 1, fullCore, LINK_COUNT) == 0);
+        CHECK(serialTeam == 1);
+        CHECK(MSXsegStorage_testResidentScanOMP(
+            MSX_RESIDENT_SCAN_SPAN_OMP8, &spanTeam, spanWorkers,
+            LINK_COUNT + 1, spanOmp, LINK_COUNT) == 0);
+        CHECK(spanTeam == 8 && uniqueWorkers(spanWorkers) >= 2);
+        CHECK(MSXsegStorage_testResidentScanOMP(
+            MSX_RESIDENT_SCAN_SPAN_SERIAL, &serialTeam, serialWorkers,
+            LINK_COUNT + 1, spanSerial, LINK_COUNT) == 0);
+        CHECK(serialTeam == 1 && uniqueWorkers(serialWorkers) == 1);
+        for (i = 0; i < LINK_COUNT; ++i)
+        {
+            CHECK(spanOmp[i].total == fullCore[i].total &&
+                  spanOmp[i].core_count == fullCore[i].core_count &&
+                  spanOmp[i].downstream_boundary ==
+                      fullCore[i].downstream_boundary &&
+                  spanOmp[i].upstream_boundary ==
+                      fullCore[i].upstream_boundary &&
+                  spanOmp[i].first_core_slot ==
+                      fullCore[i].first_core_slot &&
+                  spanOmp[i].last_core_slot ==
+                      fullCore[i].last_core_slot &&
+                  spanOmp[i].orient == fullCore[i].orient &&
+                  spanOmp[i].first_core_id == fullCore[i].first_core_id &&
+                  spanOmp[i].last_core_id == fullCore[i].last_core_id);
+            CHECK(spanSerial[i].total == fullCore[i].total &&
+                  spanSerial[i].core_count == fullCore[i].core_count &&
+                  spanSerial[i].downstream_boundary ==
+                      fullCore[i].downstream_boundary &&
+                  spanSerial[i].upstream_boundary ==
+                      fullCore[i].upstream_boundary &&
+                  spanSerial[i].first_core_id == fullCore[i].first_core_id &&
+                  spanSerial[i].last_core_id == fullCore[i].last_core_id);
+        }
+
+        /* A stale but otherwise legal certification falls back to FULL and
+           must preserve the same snapshot. */
+        CHECK(MSXsegStorage_testResidentPublishFailure(1) ==
+              ERR_PIPE_RING_CAPACITY);
+        CHECK(MSXsegStorage_testResidentScanOMP(
+            MSX_RESIDENT_SCAN_SPAN_SERIAL, &serialTeam, serialWorkers,
+            LINK_COUNT + 1, spanSerial, LINK_COUNT) == 0);
+        CHECK(spanSerial[0].total == fullCore[0].total &&
+              spanSerial[0].core_count == fullCore[0].core_count &&
+              spanSerial[0].first_core_id == fullCore[0].first_core_id &&
+              spanSerial[0].last_core_id == fullCore[0].last_core_id);
+        CHECK(MSXsegStorage_testResidentScanAndInitialize(
+            MSX_RESIDENT_SCAN_SPAN_SERIAL, &serialTeam) == 0 &&
+              serialTeam == 1);
+        CHECK(MSXsegStorage_hybridAuditCoreSpan(1) == 0);
+
+        /* A certified endpoint contradiction is not a silent fallback. */
+        {
+            Pseg corrupt = MSXsegStorage_hybridCoreSegAt(1, 0);
+            CHECK(corrupt != NULL);
+            if (corrupt) corrupt->inHybridCore = FALSE;
+            MSX.ErrCode = 0;
+            CHECK(MSXsegStorage_testResidentScanAndInitialize(
+                MSX_RESIDENT_SCAN_SPAN_SERIAL, &serialTeam) ==
+                  ERR_PIPE_RING_CAPACITY &&
+                  MSX.ErrCode == ERR_PIPE_RING_CAPACITY);
+            if (corrupt) corrupt->inHybridCore = TRUE;
+            CHECK(MSXsegStorage_hybridAuditCoreSpan(1) == 0);
+        }
+
+        /* Reverse orientation must preserve all snapshot identity fields. */
+        for (k = 1; k <= LINK_COUNT; ++k)
+            reverseTopology(k);
+        for (k = 1; k <= LINK_COUNT; ++k)
+            CHECK(MSXsegStorage_hybridAfterListReorder(k) == 0);
+        CHECK(MSXsegStorage_testResidentScanOMP(
+            MSX_RESIDENT_SCAN_FULL_SERIAL, &reverseTeam, serialWorkers,
+            LINK_COUNT + 1, reverseFull, LINK_COUNT) == 0 &&
+              reverseTeam == 1);
+    CHECK(MSXsegStorage_testResidentScanOMP(
+            MSX_RESIDENT_SCAN_SPAN_OMP8, &reverseTeam, reverseWorkers,
+            LINK_COUNT + 1, reverseSpan, LINK_COUNT) == 0 &&
+              reverseTeam == 8 && uniqueWorkers(reverseWorkers) >= 2);
+        for (i = 0; i < LINK_COUNT; ++i)
+            CHECK(reverseSpan[i].total == reverseFull[i].total &&
+                  reverseSpan[i].core_count == reverseFull[i].core_count &&
+                  reverseSpan[i].downstream_boundary ==
+                      reverseFull[i].downstream_boundary &&
+                  reverseSpan[i].upstream_boundary ==
+                      reverseFull[i].upstream_boundary &&
+                  reverseSpan[i].orient == -1 &&
+                  reverseSpan[i].first_core_id == reverseFull[i].first_core_id &&
+                  reverseSpan[i].last_core_id == reverseFull[i].last_core_id);
+    }
+
+    /* Drop boundary ownership and detach the Core views before storage close.
+       The no-Resident harness deliberately has no metadata rows for
+       hybridClear's Resident mapping preflight; storage close owns the Core
+       view objects. */
+    for (i = 1; i <= LINK_COUNT; ++i)
+    {
+        Pseg seg = MSX.FirstSeg[i], next;
+        while (seg)
+        {
+            next = seg->prev;
+            if (!seg->inHybridCore) MSXqual_removeSeg(seg);
+            seg = next;
+        }
+        MSX.FirstSeg[i] = MSX.LastSeg[i] = NULL;
+        MSX.Link[i].nsegs = 0;
+    }
 
     printf("team_size=%d\nworkers=%d\nnonempty_links=%d\n"
            "serial_team_size=%d\nassertions_passed=%d\n"

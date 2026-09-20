@@ -51,6 +51,12 @@ typedef struct RebalanceSnapshot
     int orient;
     int guard;
     int spanValid;
+    int scanMode;
+    int spanHit;
+    int spanFallbackReason;
+    int physicalScans;
+    int coreVisits;
+    int boundaryVisits;
 } RebalanceSnapshot;
 
 typedef struct PipeRingStorage
@@ -195,6 +201,11 @@ enum {
     HYBRID_REBALANCE_VALIDATE_COMMIT,
     HYBRID_REBALANCE_PROMOTE
 };
+enum {
+    HYBRID_SCAN_FALLBACK_NONE = 0,
+    HYBRID_SCAN_FALLBACK_UNVERIFIED = 1,
+    HYBRID_SCAN_FALLBACK_INVALID = 2
+};
 static MSXRebalanceMetrics *HybridRebalanceMetrics = NULL;
 static int HybridRebalanceStage = HYBRID_REBALANCE_NONE;
 /* S00 audit-only seam.  It is disabled unless explicitly requested and is
@@ -202,7 +213,7 @@ static int HybridRebalanceStage = HYBRID_REBALANCE_NONE;
    environment parse and a branch at the Resident rebalance entry. */
 static int HybridResidentScanAuditState = -1;
 static int HybridResidentScanAuditWritten = 0;
-static int HybridResidentScanFullSerialState = -1;
+static int HybridResidentScanModeState = -1;
 static int HybridResidentScanOmpAuditWritten = 0;
 #if defined(MSX_RESIDENT_SCAN_OMP_TEST) || defined(MSX_RESIDENT_CORE_SPAN_TEST)
 static unsigned long HybridResidentSpanAuditCalls = 0;
@@ -216,7 +227,7 @@ static void hybridResidentScanAuditReset(void)
 {
     HybridResidentScanAuditState = -1;
     HybridResidentScanAuditWritten = 0;
-    HybridResidentScanFullSerialState = -1;
+    HybridResidentScanModeState = -1;
     HybridResidentScanOmpAuditWritten = 0;
 }
 
@@ -233,52 +244,29 @@ static int hybridResidentScanAuditEnabled(void)
     return HybridResidentScanAuditState;
 }
 
-static void hybridResidentScanAuditRecord(int teamSize, const char *scanMode)
+static void hybridResidentScanAuditRecord(int teamSize, const char *scanMode,
+                                          uint64_t spanHits,
+                                          uint64_t spanFallbacks,
+                                          uint64_t spanNoCore,
+                                          uint64_t spanFallbackUnverified,
+                                          uint64_t spanFallbackInvalid,
+                                          uint64_t physicalPipeScans,
+                                          uint64_t physicalSegmentVisits,
+                                          uint64_t coreVisits,
+                                          uint64_t boundaryVisits,
+                                          int ompSidecar)
 {
     FILE *f;
-    if (HybridResidentScanAuditWritten || !hybridResidentScanAuditEnabled())
+    int *written = ompSidecar ? &HybridResidentScanOmpAuditWritten :
+                                &HybridResidentScanAuditWritten;
+    const char *fileName = ompSidecar ? "resident_scan_omp_team_size.txt" :
+                                         "resident_scan_team_size.txt";
+    if (*written || !hybridResidentScanAuditEnabled())
         return;
-    f = fopen("resident_scan_team_size.txt", "wt");
-    if (!f) return;
-    fprintf(f, "phase=resident_rebalance_production_probe\n");
-    fprintf(f, "scan_mode=%s\n", scanMode ? scanMode : "UNKNOWN");
-    fprintf(f, "team_size=%d\n", teamSize);
-#if defined(_OPENMP)
-    fprintf(f, "omp_max_threads=%d\n", omp_get_max_threads());
-    fprintf(f, "omp_dynamic=%d\n", omp_get_dynamic());
-    fprintf(f, "omp_nested=%d\n", omp_get_nested());
-#else
-    fprintf(f, "omp_max_threads=not_compiled\n");
-    fprintf(f, "omp_dynamic=not_compiled\n");
-    fprintf(f, "omp_nested=not_compiled\n");
-#endif
-    fclose(f);
-    HybridResidentScanAuditWritten = 1;
-}
-
-static int hybridResidentScanFullSerial(void)
-{
-    if (HybridResidentScanFullSerialState < 0)
-    {
-        const char *value = getenv("MSX_RESIDENT_SCAN_MODE");
-        HybridResidentScanFullSerialState =
-            value && _stricmp(value, "FULL_SERIAL") == 0;
-    }
-    return HybridResidentScanFullSerialState;
-}
-
-/* The S02 audit is written after the parallel region by the caller thread;
-   scan workers only fill their per-link snapshot slots (plus test-only
-   worker IDs when the OpenMP audit target supplies them). */
-static void hybridResidentScanOmpAuditRecord(int teamSize,
-                                             const char *scanMode)
-{
-    FILE *f;
-    if (HybridResidentScanOmpAuditWritten ||
-        !hybridResidentScanAuditEnabled()) return;
-    f = fopen("resident_scan_omp_team_size.txt", "wt");
+    f = fopen(fileName, "wt");
     if (!f) return;
     fprintf(f, "phase=resident_rebalance_scan\n");
+    fprintf(f, "sample_scope=first_rebalance\n");
     fprintf(f, "scan_mode=%s\n", scanMode ? scanMode : "UNKNOWN");
     fprintf(f, "team_size=%d\n", teamSize);
 #if defined(_OPENMP)
@@ -290,8 +278,61 @@ static void hybridResidentScanOmpAuditRecord(int teamSize,
     fprintf(f, "omp_dynamic=not_compiled\n");
     fprintf(f, "omp_nested=not_compiled\n");
 #endif
+    fprintf(f, "span_hits=%llu\n", (unsigned long long)spanHits);
+    fprintf(f, "span_fallbacks=%llu\n", (unsigned long long)spanFallbacks);
+    fprintf(f, "span_no_core=%llu\n", (unsigned long long)spanNoCore);
+    fprintf(f, "span_fallback_unverified=%llu\n",
+            (unsigned long long)spanFallbackUnverified);
+    fprintf(f, "span_fallback_invalid=%llu\n",
+            (unsigned long long)spanFallbackInvalid);
+    fprintf(f, "physical_pipe_scans=%llu\n",
+            (unsigned long long)physicalPipeScans);
+    fprintf(f, "physical_segment_visits=%llu\n",
+            (unsigned long long)physicalSegmentVisits);
+    fprintf(f, "core_visits=%llu\n", (unsigned long long)coreVisits);
+    fprintf(f, "boundary_visits=%llu\n",
+            (unsigned long long)boundaryVisits);
     fclose(f);
-    HybridResidentScanOmpAuditWritten = 1;
+    *written = 1;
+}
+
+static int hybridResidentScanMode(void)
+{
+    if (HybridResidentScanModeState < 0)
+    {
+        const char *value = getenv("MSX_RESIDENT_SCAN_MODE");
+        HybridResidentScanModeState = MSX_RESIDENT_SCAN_FULL_OMP8;
+        if (value && _stricmp(value, "FULL_SERIAL") == 0)
+            HybridResidentScanModeState = MSX_RESIDENT_SCAN_FULL_SERIAL;
+        else if (value && _stricmp(value, "SPAN_OMP8") == 0)
+            HybridResidentScanModeState = MSX_RESIDENT_SCAN_SPAN_OMP8;
+        else if (value && _stricmp(value, "SPAN_SERIAL") == 0)
+            HybridResidentScanModeState = MSX_RESIDENT_SCAN_SPAN_SERIAL;
+    }
+    return HybridResidentScanModeState;
+}
+
+static int hybridResidentScanIsSerial(int scanMode)
+{
+    return scanMode == MSX_RESIDENT_SCAN_FULL_SERIAL ||
+           scanMode == MSX_RESIDENT_SCAN_SPAN_SERIAL;
+}
+
+static int hybridResidentScanIsSpan(int scanMode)
+{
+    return scanMode == MSX_RESIDENT_SCAN_SPAN_OMP8 ||
+           scanMode == MSX_RESIDENT_SCAN_SPAN_SERIAL;
+}
+
+static const char *hybridResidentScanModeName(int scanMode)
+{
+    switch (scanMode)
+    {
+    case MSX_RESIDENT_SCAN_FULL_SERIAL: return "FULL_SERIAL";
+    case MSX_RESIDENT_SCAN_SPAN_OMP8: return "SPAN_OMP8";
+    case MSX_RESIDENT_SCAN_SPAN_SERIAL: return "SPAN_SERIAL";
+    default: return "FULL_OMP8";
+    }
 }
 
 static void hybridRebalanceAddPhaseInternal(int phase, double ms)
@@ -1725,6 +1766,119 @@ static void hybridScanRebalanceSnapshot(int k, RebalanceSnapshot *s)
         (nCore == 0 && (p->head != -1 || p->tail != -1)) ||
         (nCore > 0 && (p->head != s->head || p->tail != s->tail)))
         s->spanValid = FALSE;
+    s->physicalScans = total;
+    s->coreVisits = nCore;
+    s->boundaryVisits = nDown + nUp;
+}
+
+/* Scan only the two physical boundary portions around a certified CoreSpan.
+   The dense Core count and endpoints come from the versioned certification;
+   no Core element is followed.  A stale certification is a legal state after
+   a mutation hook, so it falls back to the existing full scan.  A certified
+   endpoint/list contradiction is an actual structural error and is left
+   invalid for the existing publish error path. */
+static void hybridScanRebalanceSnapshotSpan(int k, RebalanceSnapshot *s)
+{
+    const HybridPipe *p = &Hybrid.pipe[k];
+    Pseg seg, firstCore, lastCore;
+    int down = 0, up = 0, foundFirst = FALSE;
+
+    memset(s, 0, sizeof(*s));
+    s->linkIndex = k;
+    s->head = -1;
+    s->tail = -1;
+    s->spanValid = TRUE;
+    s->orient = p->orient;
+    s->guard = hybridPipeGuard(p);
+
+    /* Empty Core has no certified interior to skip; it is the normal full
+       boundary walk and is not classified as a fallback. */
+    if (p->count == 0)
+    {
+        hybridScanRebalanceSnapshot(k, s);
+        return;
+    }
+    if (!p->spanVerified || p->spanVerifiedVersion != p->spanVersion)
+    {
+        hybridScanRebalanceSnapshot(k, s);
+        s->spanFallbackReason = s->spanValid ?
+                                HYBRID_SCAN_FALLBACK_UNVERIFIED :
+                                HYBRID_SCAN_FALLBACK_INVALID;
+        return;
+    }
+    if (p->cap <= 0 || p->head < 0 || p->head >= p->cap ||
+        p->tail < 0 || p->tail >= p->cap || !p->view || !p->used ||
+        !p->view[p->head] || !p->view[p->tail] ||
+        !p->used[p->head] || !p->used[p->tail])
+    {
+        s->spanValid = FALSE;
+        s->spanFallbackReason = HYBRID_SCAN_FALLBACK_INVALID;
+        return;
+    }
+
+    firstCore = p->view[p->head];
+    lastCore = p->view[p->tail];
+    s->firstCore = firstCore;
+    s->lastCore = lastCore;
+    s->firstCoreId = firstCore->hybridId;
+    s->lastCoreId = lastCore->hybridId;
+    s->head = p->head;
+    s->tail = p->tail;
+    if (!firstCore->inHybridCore || !lastCore->inHybridCore ||
+        firstCore->ownerLink != k || lastCore->ownerLink != k ||
+        !s->firstCoreId || !s->lastCoreId)
+    {
+        s->spanValid = FALSE;
+        s->spanFallbackReason = HYBRID_SCAN_FALLBACK_INVALID;
+        return;
+    }
+
+    /* FirstSeg -> prev reaches the first Core endpoint without entering the
+       certified interior. */
+    for (seg = MSX.FirstSeg[k]; seg && seg != firstCore; seg = seg->prev)
+    {
+        if (seg->inHybridCore)
+        {
+            s->spanValid = FALSE;
+            s->spanFallbackReason = HYBRID_SCAN_FALLBACK_INVALID;
+            return;
+        }
+        ++down;
+    }
+    if (seg != firstCore)
+    {
+        s->spanValid = FALSE;
+        s->spanFallbackReason = HYBRID_SCAN_FALLBACK_INVALID;
+        return;
+    }
+    foundFirst = TRUE;
+
+    /* The upstream boundary starts after lastCore; Core itself is never
+       walked here. */
+    for (seg = lastCore->prev; seg; seg = seg->prev)
+    {
+        if (seg->inHybridCore)
+        {
+            s->spanValid = FALSE;
+            s->spanFallbackReason = HYBRID_SCAN_FALLBACK_INVALID;
+            return;
+        }
+        ++up;
+    }
+    if (!foundFirst)
+    {
+        s->spanValid = FALSE;
+        s->spanFallbackReason = HYBRID_SCAN_FALLBACK_INVALID;
+        return;
+    }
+    s->coreCount = p->count;
+    s->downCount = down;
+    s->upCount = up;
+    s->total = down + s->coreCount + up;
+    s->spanHit = TRUE;
+    s->physicalScans = down + up;
+    s->coreVisits = 0;
+    s->boundaryVisits = down + up;
 }
 
 /* Publish one completed read-only scan.  This is intentionally separate from
@@ -1737,8 +1891,17 @@ static int hybridPublishRebalanceSnapshot(int k,
     if (!s || !MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
     p = &Hybrid.pipe[k];
     /* The scan has already traversed the CPU chain.  Publication must not
-       re-scan the dense ring or inverse maps; it only checks the certified
-       metadata and snapshot endpoints before making visible writes. */
+       re-scan the dense ring or inverse maps on the normal path.  A stale
+       CoreSpan is the explicit rare fallback: the serial publish phase
+       certifies that full scan before accepting its snapshot. */
+    if (s->spanFallbackReason == HYBRID_SCAN_FALLBACK_UNVERIFIED &&
+        s->spanValid &&
+        (!p->spanVerified || p->spanVerifiedVersion != p->spanVersion) &&
+        hybridVerifyCoreSpan(k))
+    {
+        hybridMarkCoreSpanDirty(p);
+        return ERR_PIPE_RING_CAPACITY;
+    }
     if (!s->spanValid || s->linkIndex != k ||
         !p->spanVerified || p->spanVerifiedVersion != p->spanVersion ||
         s->orient != p->orient || s->guard != hybridPipeGuard(p) ||
@@ -1766,34 +1929,45 @@ static int hybridPublishRebalanceSnapshot(int k,
     if (HybridRebalanceMetrics)
     {
         ++HybridRebalanceMetrics->scan_passes;
-        HybridRebalanceMetrics->core_visits += (uint64_t)s->coreCount;
+        HybridRebalanceMetrics->core_visits += (uint64_t)s->coreVisits;
         HybridRebalanceMetrics->boundary_visits +=
-            (uint64_t)s->downCount + (uint64_t)s->upCount;
+            (uint64_t)s->boundaryVisits;
     }
     return 0;
 }
 
-/* Scan every Resident link before any publication.  The default path uses
-   one static OpenMP workshare; FULL_SERIAL is an internal audit comparison
-   mode and deliberately invokes the same helper from the caller thread. */
+static void hybridScanOneResidentSnapshot(int k, int scanMode,
+                                          RebalanceSnapshot *snapshot)
+{
+    if (hybridResidentScanIsSpan(scanMode))
+        hybridScanRebalanceSnapshotSpan(k, snapshot);
+    else
+        hybridScanRebalanceSnapshot(k, snapshot);
+    snapshot->scanMode = scanMode;
+}
+
+/* Scan every Resident link before any publication.  FULL_OMP8 and SPAN_OMP8
+   use one static OpenMP workshare; the two SERIAL modes deliberately invoke
+   the same per-link helpers from the caller thread. */
 static int hybridInitializeResidentLink(int k, RebalanceSnapshot *s);
 
-static void hybridScanResidentSnapshots(int fullSerial, int *workerIds,
+static void hybridScanResidentSnapshots(int scanMode, int *workerIds,
                                         int *teamSize)
 {
     int k, observedTeam = 1;
-    if (fullSerial)
+    if (hybridResidentScanIsSerial(scanMode))
     {
         for (k = 1; k <= Hybrid.nLinks; ++k)
         {
-            hybridScanRebalanceSnapshot(k, &Hybrid.rebalanceSnapshot[k]);
+            hybridScanOneResidentSnapshot(
+                k, scanMode, &Hybrid.rebalanceSnapshot[k]);
             if (workerIds) workerIds[k] = 0;
         }
     }
 #if defined(_OPENMP)
     else
     {
-#pragma omp parallel default(none) shared(observedTeam, workerIds)
+#pragma omp parallel default(none) shared(observedTeam, workerIds, scanMode)
         {
 #pragma omp single
             {
@@ -1802,7 +1976,8 @@ static void hybridScanResidentSnapshots(int fullSerial, int *workerIds,
 #pragma omp for schedule(static)
             for (k = 1; k <= Hybrid.nLinks; ++k)
             {
-                hybridScanRebalanceSnapshot(k, &Hybrid.rebalanceSnapshot[k]);
+                hybridScanOneResidentSnapshot(
+                    k, scanMode, &Hybrid.rebalanceSnapshot[k]);
                 if (workerIds) workerIds[k] = omp_get_thread_num();
             }
         }
@@ -1812,31 +1987,73 @@ static void hybridScanResidentSnapshots(int fullSerial, int *workerIds,
     {
         for (k = 1; k <= Hybrid.nLinks; ++k)
         {
-            hybridScanRebalanceSnapshot(k, &Hybrid.rebalanceSnapshot[k]);
+            hybridScanOneResidentSnapshot(
+                k, scanMode, &Hybrid.rebalanceSnapshot[k]);
             if (workerIds) workerIds[k] = 0;
         }
     }
 #endif
     if (teamSize) *teamSize = observedTeam;
-    hybridResidentScanOmpAuditRecord(
-        observedTeam, fullSerial ? "FULL_SERIAL" : "FULL_OMP8");
+    if (hybridResidentScanAuditEnabled())
+    {
+        uint64_t spanHits = 0, spanFallbacks = 0, spanNoCore = 0;
+        uint64_t spanFallbackUnverified = 0, spanFallbackInvalid = 0;
+        uint64_t physicalPipeScans = 0, physicalSegmentVisits = 0;
+        uint64_t coreVisits = 0, boundaryVisits = 0;
+        for (k = 1; k <= Hybrid.nLinks; ++k)
+        {
+            const RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
+            ++physicalPipeScans;
+            physicalSegmentVisits += (uint64_t)s->physicalScans;
+            coreVisits += (uint64_t)s->coreVisits;
+            boundaryVisits += (uint64_t)s->boundaryVisits;
+            if (hybridResidentScanIsSpan(scanMode))
+            {
+                if (s->spanHit) ++spanHits;
+                if (!s->coreCount) ++spanNoCore;
+                if (s->spanFallbackReason != HYBRID_SCAN_FALLBACK_NONE)
+                {
+                    ++spanFallbacks;
+                    if (s->spanFallbackReason ==
+                        HYBRID_SCAN_FALLBACK_UNVERIFIED)
+                        ++spanFallbackUnverified;
+                    else if (s->spanFallbackReason ==
+                             HYBRID_SCAN_FALLBACK_INVALID)
+                        ++spanFallbackInvalid;
+                }
+            }
+        }
+        hybridResidentScanAuditRecord(
+            observedTeam, hybridResidentScanModeName(scanMode), spanHits,
+            spanFallbacks, spanNoCore, spanFallbackUnverified,
+            spanFallbackInvalid, physicalPipeScans, physicalSegmentVisits,
+            coreVisits, boundaryVisits, FALSE);
+        hybridResidentScanAuditRecord(
+            observedTeam, hybridResidentScanModeName(scanMode), spanHits,
+            spanFallbacks, spanNoCore, spanFallbackUnverified,
+            spanFallbackInvalid, physicalPipeScans, physicalSegmentVisits,
+            coreVisits, boundaryVisits, TRUE);
+    }
 }
 
 #if defined(MSX_RESIDENT_SCAN_OMP_TEST)
-int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
+int MSXsegStorage_testResidentScanOMP(int scanMode, int *teamSize,
                                       int *workerIds, int workerCapacity,
                                       MSXHybridAuditSnapshot *snapshots,
                                       int snapshotCapacity)
 {
     int k;
-    if (fullSerial < 0) fullSerial = hybridResidentScanFullSerial();
+    if (scanMode < 0) scanMode = hybridResidentScanMode();
+    if (scanMode < MSX_RESIDENT_SCAN_FULL_OMP8 ||
+        scanMode > MSX_RESIDENT_SCAN_SPAN_SERIAL)
+        scanMode = MSX_RESIDENT_SCAN_FULL_OMP8;
     if (!Hybrid.opened || !Hybrid.rebalanceSnapshot ||
         (workerIds && workerCapacity <= Hybrid.nLinks) ||
         (snapshots && snapshotCapacity < Hybrid.nLinks))
         return ERR_PIPE_RING_CAPACITY;
     if (workerIds)
         for (k = 0; k <= Hybrid.nLinks; ++k) workerIds[k] = -1;
-    hybridScanResidentSnapshots(fullSerial, workerIds, teamSize);
+    hybridScanResidentSnapshots(scanMode, workerIds, teamSize);
     if (snapshots)
         for (k = 1; k <= Hybrid.nLinks; ++k)
         {
@@ -2877,29 +3094,9 @@ void MSXsegStorage_hybridRebalanceAll(void)
            mode.  Both paths use the same read-only helper. */
         {
             double scanStart = audit ? MSXgpu_wallTimeMs() : 0.0;
-            int fullSerial = hybridResidentScanFullSerial();
-            if (hybridResidentScanAuditEnabled() &&
-                !HybridResidentScanAuditWritten)
-            {
-                int teamSize = 1;
-#if defined(_OPENMP)
-                /* Audit-only probe in the production Resident entry point.
-                   The formal path remains free of the extra team and file
-                   operation.  FULL_SERIAL has no active scan team. */
-                if (!fullSerial)
-                {
-#pragma omp parallel
-                    {
-#pragma omp single
-                        teamSize = omp_get_num_threads();
-                    }
-                }
-#endif
-                hybridResidentScanAuditRecord(
-                    teamSize, fullSerial ? "FULL_SERIAL" : "FULL_OMP8");
-            }
+            int scanMode = hybridResidentScanMode();
             if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
-            hybridScanResidentSnapshots(fullSerial, NULL, NULL);
+            hybridScanResidentSnapshots(scanMode, NULL, NULL);
             if (audit) metrics.rb_scan_ms += MSXgpu_wallTimeMs() - scanStart;
         }
         /* Initialization contains only fallible promote commits.  Complete
