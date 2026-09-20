@@ -154,4 +154,90 @@ static void t25(void){char b[512];MSXResidentLayout l;MSXHybridAuditSnapshot s,z
    audit requested them.  The production close path supplies the two inputs;
    this pure predicate keeps the regression independent of stderr capture. */
 static void t26(void){OK(!MSXresidentRuntime_diagnosticSummaryGate(0,0));OK(MSXresidentRuntime_diagnosticSummaryGate(1,0));OK(MSXresidentRuntime_diagnosticSummaryGate(0,1));OK(MSXresidentRuntime_diagnosticSummaryGate(1,1));}
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+/* 27: the S02 production seam preserves a later non-empty link's snapshot
+   identities while an earlier empty link is rebuilt.  The same fixture then
+   reverses the CPU list through its real storage hook, so orientation and
+   endpoint identity are checked without manufacturing invalid pointers. */
+static void reverseLinkForTest(int k)
+{
+    Pseg seg = MSX.FirstSeg[k], next, previous = NULL;
+    MSX.FirstSeg[k] = MSX.LastSeg[k];
+    MSX.LastSeg[k] = seg;
+    while (seg)
+    {
+        next = seg->prev;
+        seg->prev = previous;
+        seg->next = next;
+        previous = seg;
+        seg = next;
+    }
+}
+static void t27(void)
+{
+    char b[768];
+    MSXResidentLayout l;
+    MSXHybridAuditSnapshot before[2], after[2], reversed[2];
+    Pseg prev;
+    int k, i, team = 0;
+    uint64_t firstId, lastId;
+    setup(1,2);
+    MSX.SegmentStorage = SEG_STORAGE_HYBRID;
+    snprintf(b,sizeof(b),"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n"
+      "1,L1,16,16,1,2,%s\n2,L2,16,16,1,2,%s\n",UP,UP);
+    csv("resident_phase2a.csv",b);
+    OK(MSXresident_open("resident_phase2a.csv")==0);
+    MSXresident_setMode(MSX_RESIDENT_RESIDENT,1);
+    OK(MSXsegStorage_open()==0&&MSXresident_getLayout(&l)==0&&
+       MSXsegStorage_hybridReserve(&l)==0);
+    /* Build the already-non-empty link first.  Link 1 is added as an
+       ordinary, all-boundary CPU list after storage setup, which gives the
+       production scan a valid empty-Core link with total > 2*guard without
+       fabricating an invalid pointer or bypassing a storage mutation. */
+    k=2;
+    {
+        prev=NULL;
+        for(i=0;i<7;i++)
+        {
+            Pseg s=fseg(i+1,(uint64_t)(1600*k+i));
+            OK(s!=NULL);
+            s->next=prev;
+            if(prev)prev->prev=s; else MSX.FirstSeg[k]=s;
+            prev=s; MSX.LastSeg[k]=s; MSX.Link[k].nsegs++;
+        }
+    }
+    OK(MSXsegStorage_hybridizeAll()==0&&
+       MSXsegStorage_hybridCoreCount(1)==0&&MSXsegStorage_hybridCoreCount(2)>0);
+    k=1;
+    {
+        prev=NULL;
+        for(i=0;i<7;i++)
+        {
+            Pseg s=fseg(i+1,(uint64_t)(1600*k+i));
+            OK(s!=NULL);
+            s->next=prev;
+            if(prev)prev->prev=s; else MSX.FirstSeg[k]=s;
+            prev=s; MSX.LastSeg[k]=s; MSX.Link[k].nsegs++;
+        }
+    }
+    OK(MSXsegStorage_hybridCoreCount(1)==0&&MSXsegStorage_hybridCoreCount(2)>0);
+    memset(before,0,sizeof(before));
+    OK(MSXsegStorage_testResidentScanOMP(1,&team,NULL,0,before,2)==0&&
+       team==1&&before[1].core_count>0);
+    firstId=before[1].first_core_id;
+    lastId=before[1].last_core_id;
+    OK(firstId!=0&&lastId!=0&&firstId!=lastId);
+    OK(MSXsegStorage_testResidentScanAndInitialize(1,&team)==0&&team==1);
+    OK(MSXsegStorage_hybridCoreCount(1)>0);
+    memset(after,0,sizeof(after));
+    OK(MSXsegStorage_testResidentScanOMP(1,&team,NULL,0,after,2)==0&&
+       after[0].core_count>0&&after[1].first_core_id==firstId&&
+       after[1].last_core_id==lastId);
+    reverseLinkForTest(2);
+    OK(MSXsegStorage_hybridAfterListReorder(2)==0&&
+       MSXsegStorage_hybridOrientation(2)==-1);
+    memset(reversed,0,sizeof(reversed));
+    OK(MSXsegStorage_testResidentScanOMP(1,&team,NULL,0,reversed,2)==0&&
+       reversed[1].first_core_id==lastId&&reversed[1].last_core_id==firstId&&
+       reversed[1].orient==-1);
+}
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t27();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}

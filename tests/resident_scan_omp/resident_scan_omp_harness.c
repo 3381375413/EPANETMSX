@@ -109,23 +109,45 @@ static void buildTopology(void)
 static int uniqueWorkers(const int *workerIds)
 {
     int seen[LINK_COUNT] = {0};
-    int i, count = 0;
+    int i, count = 0, worker;
     for (i = 1; i <= LINK_COUNT; ++i)
-        if (!seen[workerIds[i]])
+    {
+        worker = workerIds[i];
+        if (worker < 0 || worker >= (int)(sizeof(seen) / sizeof(seen[0])))
+            return -1;
+        if (!seen[worker])
         {
-            seen[workerIds[i]] = 1;
+            seen[worker] = 1;
             ++count;
         }
+    }
     return count;
+}
+
+static int fileContains(const char *path, const char *needle)
+{
+    FILE *f = fopen(path, "rt");
+    char line[256];
+    int found = 0;
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f))
+        if (strstr(line, needle)) { found = 1; break; }
+    fclose(f);
+    return found;
 }
 
 int main(void)
 {
     int parallelTeam = 0, serialTeam = 0, i;
+    int invalidWorkers[LINK_COUNT + 1] = {0};
     int parallelWorkers[LINK_COUNT + 1], serialWorkers[LINK_COUNT + 1];
     MSXHybridAuditSnapshot parallel[LINK_COUNT], serial[LINK_COUNT];
     Pseg first[LINK_COUNT + 1], last[LINK_COUNT + 1];
 
+    _putenv_s("MSX_RESIDENT_SCAN_AUDIT", "1");
+    _putenv_s("MSX_RESIDENT_SCAN_MODE", "FULL_OMP8");
+    remove("resident_scan_team_size.txt");
+    remove("resident_scan_omp_team_size.txt");
     buildTopology();
     for (i = 1; i <= LINK_COUNT; ++i)
     {
@@ -138,6 +160,10 @@ int main(void)
         parallel, LINK_COUNT) == 0);
     CHECK(parallelTeam == 8);
     CHECK(uniqueWorkers(parallelWorkers) >= 2);
+    invalidWorkers[1] = -1;
+    CHECK(uniqueWorkers(invalidWorkers) == -1);
+    invalidWorkers[1] = LINK_COUNT;
+    CHECK(uniqueWorkers(invalidWorkers) == -1);
     for (i = 0; i < LINK_COUNT; ++i)
         CHECK(parallel[i].link_index == i + 1 &&
               parallel[i].total == SEGMENTS_PER_LINK &&
@@ -164,7 +190,33 @@ int main(void)
               serial[i].upstream_boundary == parallel[i].upstream_boundary &&
               serial[i].first_core_slot == parallel[i].first_core_slot &&
               serial[i].last_core_slot == parallel[i].last_core_slot &&
-              serial[i].orient == parallel[i].orient);
+              serial[i].orient == parallel[i].orient &&
+              serial[i].first_core_id == parallel[i].first_core_id &&
+              serial[i].last_core_id == parallel[i].last_core_id);
+
+    /* close/reopen resets both cached environment decisions and write-once
+       guards.  Switch the environment between lifetimes to catch stale
+       audit state in a single process. */
+    CHECK(fileContains("resident_scan_omp_team_size.txt",
+                      "scan_mode=FULL_OMP8"));
+    MSXsegStorage_close();
+    remove("resident_scan_omp_team_size.txt");
+    _putenv_s("MSX_RESIDENT_SCAN_AUDIT", "0");
+    CHECK(MSXsegStorage_open() == 0);
+    CHECK(MSXsegStorage_testResidentScanOMP(
+        0, &parallelTeam, parallelWorkers, LINK_COUNT + 1,
+        parallel, LINK_COUNT) == 0);
+    CHECK(!fileContains("resident_scan_omp_team_size.txt", "scan_mode="));
+    MSXsegStorage_close();
+    _putenv_s("MSX_RESIDENT_SCAN_AUDIT", "1");
+    _putenv_s("MSX_RESIDENT_SCAN_MODE", "FULL_SERIAL");
+    CHECK(MSXsegStorage_open() == 0);
+    CHECK(MSXsegStorage_testResidentScanOMP(
+        -1, &serialTeam, serialWorkers, LINK_COUNT + 1,
+        serial, LINK_COUNT) == 0);
+    CHECK(serialTeam == 1);
+    CHECK(fileContains("resident_scan_omp_team_size.txt",
+                      "scan_mode=FULL_SERIAL"));
 
     printf("team_size=%d\nworkers=%d\nnonempty_links=%d\n"
            "serial_team_size=%d\nassertions_passed=%d\n"
@@ -172,6 +224,10 @@ int main(void)
            uniqueWorkers(parallelWorkers), LINK_COUNT, serialTeam,
            passed, failed);
     MSXsegStorage_close();
+    _putenv_s("MSX_RESIDENT_SCAN_AUDIT", "");
+    _putenv_s("MSX_RESIDENT_SCAN_MODE", "");
+    remove("resident_scan_team_size.txt");
+    remove("resident_scan_omp_team_size.txt");
     freeTopology();
     return failed ? 1 : 0;
 }

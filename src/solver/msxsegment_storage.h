@@ -97,6 +97,8 @@ typedef struct
     int first_core_slot;
     int last_core_slot;
     int orient;
+    uint64_t first_core_id;
+    uint64_t last_core_id;
 } MSXHybridAuditSnapshot;
 int MSXsegStorage_hybridAuditSnapshot(int k,
                                       MSXHybridAuditSnapshot *snapshot,
@@ -111,6 +113,9 @@ int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
                                       int *workerIds, int workerCapacity,
                                       MSXHybridAuditSnapshot *snapshots,
                                       int snapshotCapacity);
+/* Test-only seam for the production scan -> publish -> empty-init ordering.
+   It is compiled only by CPU/OpenMP contract harnesses. */
+int MSXsegStorage_testResidentScanAndInitialize(int fullSerial, int *teamSize);
 #endif
 /* Make the selected physical endpoint CPU-readable before transport.  This
    may stage a single Resident demotion and returns a mapped error before any

@@ -201,6 +201,18 @@ static int HybridResidentScanAuditWritten = 0;
 static int HybridResidentScanFullSerialState = -1;
 static int HybridResidentScanOmpAuditWritten = 0;
 
+/* These values are cached only for one storage lifetime.  In particular,
+   close/reopen must re-read MSX_RESIDENT_SCAN_AUDIT and
+   MSX_RESIDENT_SCAN_MODE; otherwise a long-lived test process could carry an
+   audit decision from an earlier case into the next case. */
+static void hybridResidentScanAuditReset(void)
+{
+    HybridResidentScanAuditState = -1;
+    HybridResidentScanAuditWritten = 0;
+    HybridResidentScanFullSerialState = -1;
+    HybridResidentScanOmpAuditWritten = 0;
+}
+
 static int hybridResidentScanAuditEnabled(void)
 {
     if (HybridResidentScanAuditState < 0)
@@ -214,7 +226,7 @@ static int hybridResidentScanAuditEnabled(void)
     return HybridResidentScanAuditState;
 }
 
-static void hybridResidentScanAuditRecord(int teamSize)
+static void hybridResidentScanAuditRecord(int teamSize, const char *scanMode)
 {
     FILE *f;
     if (HybridResidentScanAuditWritten || !hybridResidentScanAuditEnabled())
@@ -222,6 +234,7 @@ static void hybridResidentScanAuditRecord(int teamSize)
     f = fopen("resident_scan_team_size.txt", "wt");
     if (!f) return;
     fprintf(f, "phase=resident_rebalance_production_probe\n");
+    fprintf(f, "scan_mode=%s\n", scanMode ? scanMode : "UNKNOWN");
     fprintf(f, "team_size=%d\n", teamSize);
 #if defined(_OPENMP)
     fprintf(f, "omp_max_threads=%d\n", omp_get_max_threads());
@@ -250,7 +263,8 @@ static int hybridResidentScanFullSerial(void)
 /* The S02 audit is written after the parallel region by the caller thread;
    scan workers only fill their per-link snapshot slots (plus test-only
    worker IDs when the OpenMP audit target supplies them). */
-static void hybridResidentScanOmpAuditRecord(int teamSize)
+static void hybridResidentScanOmpAuditRecord(int teamSize,
+                                             const char *scanMode)
 {
     FILE *f;
     if (HybridResidentScanOmpAuditWritten ||
@@ -258,6 +272,7 @@ static void hybridResidentScanOmpAuditRecord(int teamSize)
     f = fopen("resident_scan_omp_team_size.txt", "wt");
     if (!f) return;
     fprintf(f, "phase=resident_rebalance_scan\n");
+    fprintf(f, "scan_mode=%s\n", scanMode ? scanMode : "UNKNOWN");
     fprintf(f, "team_size=%d\n", teamSize);
 #if defined(_OPENMP)
     fprintf(f, "omp_max_threads=%d\n", omp_get_max_threads());
@@ -628,6 +643,7 @@ static void hybridClear(void)
     FREE(Hybrid.rebalanceSnapshot);
     FREE(Hybrid.pipe);
     memset(&Hybrid, 0, sizeof(Hybrid));
+    hybridResidentScanAuditReset();
 }
 
 static void hybridWriteTiming(void)
@@ -1535,6 +1551,8 @@ static void hybridPublishRebalanceSnapshot(int k,
 /* Scan every Resident link before any publication.  The default path uses
    one static OpenMP workshare; FULL_SERIAL is an internal audit comparison
    mode and deliberately invokes the same helper from the caller thread. */
+static int hybridInitializeResidentLink(int k, RebalanceSnapshot *s);
+
 static void hybridScanResidentSnapshots(int fullSerial, int *workerIds,
                                         int *teamSize)
 {
@@ -1575,7 +1593,8 @@ static void hybridScanResidentSnapshots(int fullSerial, int *workerIds,
     }
 #endif
     if (teamSize) *teamSize = observedTeam;
-    hybridResidentScanOmpAuditRecord(observedTeam);
+    hybridResidentScanOmpAuditRecord(
+        observedTeam, fullSerial ? "FULL_SERIAL" : "FULL_OMP8");
 }
 
 #if defined(MSX_RESIDENT_SCAN_OMP_TEST)
@@ -1585,6 +1604,7 @@ int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
                                       int snapshotCapacity)
 {
     int k;
+    if (fullSerial < 0) fullSerial = hybridResidentScanFullSerial();
     if (!Hybrid.opened || !Hybrid.rebalanceSnapshot ||
         (workerIds && workerCapacity <= Hybrid.nLinks) ||
         (snapshots && snapshotCapacity < Hybrid.nLinks))
@@ -1606,7 +1626,31 @@ int MSXsegStorage_testResidentScanOMP(int fullSerial, int *teamSize,
             snapshots[k - 1].last_core_slot =
                 s->coreCount ? s->tail : -1;
             snapshots[k - 1].orient = s->orient;
+            snapshots[k - 1].first_core_id = s->coreCount ? s->firstCoreId : 0;
+            snapshots[k - 1].last_core_id = s->coreCount ? s->lastCoreId : 0;
         }
+    return 0;
+}
+
+/* Test-only production seam for the S02 ordering contract.  It executes the
+   same scan -> publish -> empty-init sequence as the Resident entry point,
+   while leaving CUDA fetch/demote work out of the CPU-only Phase2a harness.
+   No second scan implementation is maintained here. */
+int MSXsegStorage_testResidentScanAndInitialize(int fullSerial, int *teamSize)
+{
+    int k, err;
+    if (!Hybrid.opened || !Hybrid.rebalanceSnapshot) return ERR_PIPE_RING_CAPACITY;
+    hybridScanResidentSnapshots(fullSerial, NULL, teamSize);
+    for (k = 1; k <= Hybrid.nLinks; ++k)
+    {
+        RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
+        hybridPublishRebalanceSnapshot(k, s);
+        if (s->coreCount == 0 && s->total > 2 * s->guard)
+        {
+            err = hybridInitializeResidentLink(k, s);
+            if (err) return err;
+        }
+    }
     return 0;
 }
 #endif
@@ -1751,6 +1795,10 @@ int MSXsegStorage_hybridAuditSnapshot(int k,
     }
     snapshot->first_core_slot = firstCore;
     snapshot->last_core_slot = lastCore;
+    snapshot->first_core_id =
+        firstCore >= 0 && p->view[firstCore] ? p->view[firstCore]->hybridId : 0;
+    snapshot->last_core_id =
+        lastCore >= 0 && p->view[lastCore] ? p->view[lastCore]->hybridId : 0;
     return 0;
 }
 
@@ -2452,20 +2500,6 @@ void MSXsegStorage_hybridRebalanceAll(void)
     if (MSXresidentRuntime_isResident())
     {
         audit = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
-        if (hybridResidentScanAuditEnabled() && !HybridResidentScanAuditWritten)
-        {
-            int teamSize = 1;
-#if defined(_OPENMP)
-            /* Audit-only probe in the production Resident entry point.  The
-               formal path remains free of the extra team and file operation. */
-#pragma omp parallel
-            {
-#pragma omp single
-                teamSize = omp_get_num_threads();
-            }
-#endif
-            hybridResidentScanAuditRecord(teamSize);
-        }
         if (audit)
         {
             memset(&metrics, 0, sizeof(metrics));
@@ -2479,6 +2513,26 @@ void MSXsegStorage_hybridRebalanceAll(void)
         {
             double scanStart = audit ? MSXgpu_wallTimeMs() : 0.0;
             int fullSerial = hybridResidentScanFullSerial();
+            if (hybridResidentScanAuditEnabled() &&
+                !HybridResidentScanAuditWritten)
+            {
+                int teamSize = 1;
+#if defined(_OPENMP)
+                /* Audit-only probe in the production Resident entry point.
+                   The formal path remains free of the extra team and file
+                   operation.  FULL_SERIAL has no active scan team. */
+                if (!fullSerial)
+                {
+#pragma omp parallel
+                    {
+#pragma omp single
+                        teamSize = omp_get_num_threads();
+                    }
+                }
+#endif
+                hybridResidentScanAuditRecord(
+                    teamSize, fullSerial ? "FULL_SERIAL" : "FULL_OMP8");
+            }
             if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
             hybridScanResidentSnapshots(fullSerial, NULL, NULL);
             if (audit) metrics.rb_scan_ms += MSXgpu_wallTimeMs() - scanStart;
