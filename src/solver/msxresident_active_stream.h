@@ -36,6 +36,8 @@ typedef struct {
     uint64_t (*topology)(void *);
 } MSXResidentActiveStreamSource;
 
+#define MSX_RESIDENT_ACTIVE_AUDIT_ENABLED(source) ((source)->audit != NULL)
+
 static MSXResidentStatus MSXresident_activeStreamRawCount(
     MSXResidentActiveStreamSource *source, uint64_t *raw, uint32_t *links)
 {
@@ -94,6 +96,8 @@ typedef struct {
     int stage;
     double enumerateStart, streamStart;
 } MSXResidentActiveStreamSource;
+
+#define MSX_RESIDENT_ACTIVE_AUDIT_ENABLED(source) ((source)->auditHyd != 0)
 
 #ifndef MSX_RESIDENT_ACTIVE_IDENTITY
 #define MSX_RESIDENT_ACTIVE_IDENTITY(source, row) 1
@@ -222,10 +226,11 @@ static MSXResidentStatus MSXresident_activeStreamBuild(
                 if (!MSXresident_activeStreamIdentity(source, &rows[i]))
                 { identityFail = i; haveIdentityFail = 1; break; }
         }
-        for (i = 0; i < batchCount; ++i)
-            if (MSXresident_activeStreamAudit(source, &rows[i]))
-            { if (!haveHydFail) hydFail = i; haveHydFail = 1;
-              if (report) ++report->hydMismatches; }
+        if (MSX_RESIDENT_ACTIVE_AUDIT_ENABLED(source))
+            for (i = 0; i < batchCount; ++i)
+                if (MSXresident_activeStreamAudit(source, &rows[i]))
+                { if (!haveHydFail) hydFail = i; haveHydFail = 1;
+                  if (report) ++report->hydMismatches; }
 
         if (deferred == MSX_RESIDENT_OK && writerLive)
         {
