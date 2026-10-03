@@ -18,6 +18,7 @@ extern "C" {
 int  MSXsegStorage_open(void);
 void MSXsegStorage_close(void);
 void MSXsegStorage_reset(void);
+int MSXsegStorage_hybridResetUncommitted(void);
 
 int  MSXsegStorage_preparePrivate(Pseg seg);
 void MSXsegStorage_initPrivateValues(Pseg seg, const double c[]);
@@ -111,6 +112,10 @@ int  MSXsegStorage_hybridEnsureEndpointBoundary(int k, int boundarySide);
    A returned segment remains owned by the pool until the CPU list removes it;
    this prevents the general MSX.FreeSeg allocator from consuming the pool. */
 int  MSXsegStorage_hybridAcquireBoundary(Pseg *segment);
+int  MSXsegStorage_hybridEnsureBoundaryPoolFree(uint32_t required);
+uint64_t MSXsegStorage_hybridCpuPoolGrowthCount(void);
+uint64_t MSXsegStorage_hybridFixedHostBytes(uint32_t,uint32_t,uint32_t);
+uint64_t MSXsegStorage_testAllocationBytes(void);
 int  MSXsegStorage_hybridReleaseBoundary(Pseg segment);
 /* Explicit audit seam: poison only dense Hybrid Core c/lastc mirrors. */
 int  MSXsegStorage_hybridAuditPoisonCoreMirrors(void);

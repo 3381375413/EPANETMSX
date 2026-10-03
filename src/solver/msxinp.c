@@ -788,6 +788,24 @@ int parseOption()
           MSX.GpuCoreGuard = k;
           break;
 
+      case GPU_CORE_OVERFLOW_OPTION:
+          k = MSXutils_findmatch(Tok[1], GpuCoreOverflowWords);
+          if (k < 0) return ERR_KEYWORD;
+          MSX.GpuCoreOverflow = k;
+          break;
+
+      case GPU_CORE_CAPACITY_MODE_OPTION:
+          k = MSXutils_findmatch(Tok[1], GpuCoreCapacityModeWords);
+          if (k < 0) return ERR_KEYWORD;
+          MSX.GpuCoreCapacityMode = k;
+          break;
+
+      case GPU_CORE_MEMORY_MB_OPTION:
+          if (!MSXutils_getDouble(Tok[1], &MSX.GpuCoreMemoryMB) ||
+              !isfinite(MSX.GpuCoreMemoryMB) || MSX.GpuCoreMemoryMB < 0.0)
+              return ERR_NUMBER;
+          break;
+
       case GPU_CORE_CAPACITY_FILE_OPTION:
           if ( strlen(Tok[1]) >= MAXFNAME ) return ERR_ITEMS;
           strcpy(MSX.GpuCoreCapacityFile, Tok[1]);

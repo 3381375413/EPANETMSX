@@ -40,6 +40,7 @@ typedef struct { uint32_t link,capacity,head,tail,count; int32_t orient; uint64_
 typedef struct { uint32_t link; DDesc descriptor; } DDescStage;
 typedef struct { uint32_t link,row,generation,used,kind,payloadRow; uint64_t id; double v,h,hr,ur,dr; } Stage;
 struct MSXResidentGpu {
+    MSXResidentMemoryEstimate fixedMemory;
     uint32_t n,slots,owned,stride,activeCount;
     int device,uploaded,poisoned,activePrepared,completionEnqueued,diagnostic,aggregateValid;
     int activeBuilding,activeSealed;
@@ -217,46 +218,133 @@ static void gone(MSXResidentGpu*g)
     freePinned(g->hAggLink);freePinned(g->hAggMass);free(g->aggregateMass);free(g);
 }
 extern "C" int MSXresidentGpu_isEnabled(void){return 1;}
-extern "C" MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen*o,MSXResidentGpu**out){MSXResidentGpu*g;size_t lb,rb,pipeHydBytes,owned=0;if(!out||*out||!o||!o->nLinks||!o->totalSlots||!o->speciesStride||!o->capacity||!o->base)return MSX_RESIDENT_ERR_ARGUMENT;if(!ck(cudaSetDevice(0))||!ck(cudaFree(0)))return MSX_RESIDENT_ERR_GPU;if(!mul((size_t)o->nLinks+1,sizeof(uint32_t),&lb)||!mul((size_t)o->totalSlots,o->speciesStride,&rb)||!mul(rb,sizeof(double),&rb)||!hydTableBytes(o->nLinks,&pipeHydBytes))return MSX_RESIDENT_ERR_OVERFLOW;for(uint32_t k=1;k<=o->nLinks;k++){if(!o->capacity[k]||o->base[k]>o->totalSlots||o->capacity[k]>o->totalSlots-o->base[k]||owned>o->totalSlots-o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;owned+=o->capacity[k];for(uint32_t q=1;q<k;q++)if(o->base[k]<o->base[q]+o->capacity[q]&&o->base[q]<o->base[k]+o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;}g=(MSXResidentGpu*)calloc(1,sizeof(*g));if(!g)return MSX_RESIDENT_ERR_MEMORY;g->device=0;g->n=o->nLinks;g->slots=o->totalSlots;g->owned=(uint32_t)owned;g->stride=o->speciesStride;g->cap=(uint32_t*)calloc(g->n+1,sizeof(uint32_t));g->base=(uint32_t*)calloc(g->n+1,sizeof(uint32_t));g->hu=(uint32_t*)calloc(g->slots,sizeof(uint32_t));g->hg=(uint32_t*)calloc(g->slots,sizeof(uint32_t));g->he=(uint64_t*)calloc(g->n+1,sizeof(uint64_t));g->hi=(uint64_t*)calloc(g->slots,sizeof(uint64_t));g->fetchSeen=(uint64_t*)calloc(g->slots,sizeof(uint64_t));g->activeSeen=(uint64_t*)calloc(g->slots,sizeof(uint64_t));if(!g->cap||!g->base||!g->hu||!g->hg||!g->he||!g->hi||!g->fetchSeen||!g->activeSeen)goto mem;memcpy(g->cap,o->capacity,lb);memcpy(g->base,o->base,lb);if(!ck(cudaHostAlloc(&g->hd,((size_t)g->n+1)*sizeof(DDesc),0))||!ck(cudaHostAlloc(&g->hPatch,(size_t)g->slots*sizeof(Stage),0))||!ck(cudaHostAlloc(&g->hGather,(size_t)g->slots*sizeof(Stage),0))||!ck(cudaHostAlloc(&g->hPatchC,rb,0))||!ck(cudaHostAlloc(&g->hPatchL,rb,0))||!ck(cudaHostAlloc(&g->hGatherC,rb,0))||!ck(cudaHostAlloc(&g->hGatherL,rb,0)))goto mem;
-if(!ck(cudaHostAlloc(&g->hPatchDesc,(size_t)g->n*sizeof(DDescStage),0)))goto mem;
-#define A(x,n) if(!da((void**)&g->x,n))goto mem
-A(dPatchDesc,(size_t)g->n*sizeof(DDescStage));
-A(dd,((size_t)g->n+1)*sizeof(DDesc));A(dPatchStage,(size_t)g->slots*sizeof(Stage));A(dGatherStage,(size_t)g->slots*sizeof(Stage));A(dPatchC,rb);A(dPatchL,rb);A(dGatherC,rb);A(dGatherL,rb);A(du,(size_t)g->slots*sizeof(uint32_t));A(dg,(size_t)g->slots*sizeof(uint32_t));A(di,(size_t)g->slots*sizeof(uint64_t));A(dv,(size_t)g->slots*sizeof(double));A(dh,(size_t)g->slots*sizeof(double));A(dhr,(size_t)g->slots*sizeof(double));A(dur,(size_t)g->slots*sizeof(double));A(ddr,(size_t)g->slots*sizeof(double));A(dc,rb);A(dl,rb);A(dmass,(size_t)g->stride*sizeof(double));A(dred,sizeof(*g->dred));
-#undef A
-g->haGen=(uint32_t*)calloc(g->owned,sizeof(uint32_t));
-/* Validation addresses haNf by global slot and haNj by one-based link index.
-   Active request/return arrays are pinned because their async transfers are
-   part of the resident stream lifecycle and must complete before readyEvent. */
-if(!ck(cudaHostAlloc(&g->haPipe,(size_t)g->owned*sizeof(uint32_t),0))||
-   !ck(cudaHostAlloc(&g->haRow,(size_t)g->owned*sizeof(uint32_t),0))||
-   !ck(cudaHostAlloc(&g->haNf,(size_t)g->slots*sizeof(uint32_t),0))||
-   !ck(cudaHostAlloc(&g->haNj,(size_t)(g->owned>g->n?g->owned:g->n+1)*sizeof(uint32_t),0))||
-   !ck(cudaHostAlloc(&g->haNa,(size_t)g->owned*sizeof(uint32_t),0))||
-   !ck(cudaHostAlloc(&g->haNr,(size_t)g->owned*sizeof(uint32_t),0))||
-   !ck(cudaHostAlloc(&g->haErr,sizeof(int),0))||
-   !ck(cudaHostAlloc(&g->haVol,(size_t)g->owned*sizeof(double),0))||
-   !ck(cudaHostAlloc(&g->haHyd,(size_t)g->owned*MSX_RESIDENT_HYD_STRIDE*sizeof(double),0))||
-   !ck(cudaHostAlloc(&g->hSubmittedHyd,pipeHydBytes,0))||
-   !ck(cudaHostAlloc(&g->haLast,(size_t)g->owned*sizeof(double),0))||
-   !ck(cudaHostAlloc(&g->haReacted,(size_t)(g->n+1)*g->stride*sizeof(double),0)))
-    goto mem;
-g->hCandidateHyd=(double*)calloc((size_t)(g->n+1)*MSX_RESIDENT_HYD_STRIDE,sizeof(double));
-if(!g->hCandidateHyd)goto mem;
-/* Every compared byte is initialized.  The separate valid bit still forces
-   the first reaction to upload even when the source table is all +0. */
-memset(g->hSubmittedHyd,0,pipeHydBytes);
-memset(g->haNf,0,(size_t)g->slots*sizeof(uint32_t));
-memset(g->haNj,0,(size_t)(g->owned>g->n?g->owned:g->n+1)*sizeof(uint32_t));
-g->haEpoch=(uint64_t*)calloc(g->owned,sizeof(uint64_t));
-g->haH=(double*)calloc(g->owned,sizeof(double));
-if(!ck(cudaHostAlloc(&g->hAggLink,((size_t)g->n+1)*sizeof(MSXResidentGpuReduction),0))||
-   !ck(cudaHostAlloc(&g->hAggMass,(size_t)(g->n+1)*g->stride*sizeof(double),0)))
-    goto mem;
-g->aggregateMass=(double*)calloc(g->stride,sizeof(double));
-if(!g->haGen||!g->haEpoch||!g->haH||!g->aggregateMass)goto mem;
-if(!da((void**)&g->daPipe,(size_t)g->owned*sizeof(uint32_t))||!da((void**)&g->daRow,(size_t)g->owned*sizeof(uint32_t))||!da((void**)&g->daVol,(size_t)g->owned*sizeof(double))||!da((void**)&g->daHyd,(size_t)g->owned*MSX_RESIDENT_HYD_STRIDE*sizeof(double))||!da((void**)&g->dPipeHyd,pipeHydBytes)||!da((void**)&g->daH,(size_t)g->owned*sizeof(double))||!da((void**)&g->daNf,(size_t)g->owned*sizeof(uint32_t))||!da((void**)&g->daNj,(size_t)g->owned*sizeof(uint32_t))||!da((void**)&g->daNa,(size_t)g->owned*sizeof(uint32_t))||!da((void**)&g->daNr,(size_t)g->owned*sizeof(uint32_t))||!da((void**)&g->daErr,(size_t)g->owned*sizeof(int))||!da((void**)&g->dError,sizeof(int))||!da((void**)&g->dAggLink,((size_t)g->n+1)*sizeof(MSXResidentGpuReduction))||!da((void**)&g->dAggMass,((size_t)g->n+1)*g->stride*sizeof(double))||!da((void**)&g->dBase,((size_t)g->n+1)*sizeof(uint32_t))||!da((void**)&g->daLast,(size_t)g->owned*sizeof(double))||!da((void**)&g->daReacted,((size_t)g->n+1)*g->stride*sizeof(double)))goto mem;
-if(!ck(cudaMemcpy(g->dBase,g->base,((size_t)g->n+1)*sizeof(uint32_t),cudaMemcpyHostToDevice)))goto mem;
-*out=g;return MSX_RESIDENT_OK;mem:gone(g);return MSX_RESIDENT_ERR_MEMORY;}
+/* One allocation-size ledger serves both dry-run budgeting and allocation. */
+template<class T> static MSXResidentStatus fixedAlloc(T **ptr,size_t bytes,int kind,int dry,
+                                        MSXResidentMemoryEstimate *m)
+{
+ uint64_t *sum=kind==2?&m->deviceBytes:kind==1?&m->pinnedBytes:&m->hostBytes;
+ if(bytes>UINT64_MAX-*sum)return MSX_RESIDENT_ERR_OVERFLOW;*sum+=bytes;
+ if(dry)return MSX_RESIDENT_OK;
+ if(kind==2){cudaError_t e=cudaMalloc((void**)ptr,bytes);
+  return e==cudaSuccess?MSX_RESIDENT_OK:e==cudaErrorMemoryAllocation?MSX_RESIDENT_ERR_MEMORY:MSX_RESIDENT_ERR_GPU;}
+ if(kind==1){cudaError_t e=cudaHostAlloc((void**)ptr,bytes,0);
+  return e==cudaSuccess?MSX_RESIDENT_OK:e==cudaErrorMemoryAllocation?MSX_RESIDENT_ERR_MEMORY:MSX_RESIDENT_ERR_GPU;}
+ *ptr=(T*)calloc(1,bytes);return *ptr?MSX_RESIDENT_OK:MSX_RESIDENT_ERR_MEMORY;
+}
+static MSXResidentStatus fixedBuffers(MSXResidentGpu *g,int dry,MSXResidentMemoryEstimate *m)
+{
+ size_t rb,pipeHydBytes;
+ memset(m,0,sizeof(*m));m->hostBytes=sizeof(*g);
+ if(!mul((size_t)g->slots,g->stride,&rb)||!mul(rb,sizeof(double),&rb)||
+    !hydTableBytes(g->n,&pipeHydBytes))return MSX_RESIDENT_ERR_OVERFLOW;
+ {MSXResidentStatus z=fixedAlloc(&g->hd,((size_t)g->n+1)*sizeof(DDesc),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hPatch,(size_t)g->slots*sizeof(Stage),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hGather,(size_t)g->slots*sizeof(Stage),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hPatchC,rb,1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hPatchL,rb,1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hGatherC,rb,1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hGatherL,rb,1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hPatchDesc,(size_t)g->n*sizeof(DDescStage),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haPipe,(size_t)g->owned*sizeof(uint32_t),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haRow,(size_t)g->owned*sizeof(uint32_t),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haNf,(size_t)g->slots*sizeof(uint32_t),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haNj,(size_t)(g->owned>g->n?g->owned:g->n+1)*sizeof(uint32_t),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haNa,(size_t)g->owned*sizeof(uint32_t),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haNr,(size_t)g->owned*sizeof(uint32_t),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haErr,sizeof(int),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haVol,(size_t)g->owned*sizeof(double),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haHyd,(size_t)g->owned*MSX_RESIDENT_HYD_STRIDE*sizeof(double),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hSubmittedHyd,pipeHydBytes,1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haLast,(size_t)g->owned*sizeof(double),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haReacted,(size_t)(g->n+1)*g->stride*sizeof(double),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hAggLink,((size_t)g->n+1)*sizeof(MSXResidentGpuReduction),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hAggMass,(size_t)(g->n+1)*g->stride*sizeof(double),1,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dPatchDesc,(size_t)g->n*sizeof(DDescStage),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dd,((size_t)g->n+1)*sizeof(DDesc),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dPatchStage,(size_t)g->slots*sizeof(Stage),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dGatherStage,(size_t)g->slots*sizeof(Stage),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dPatchC,rb,2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dPatchL,rb,2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dGatherC,rb,2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dGatherL,rb,2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->du,(size_t)g->slots*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dg,(size_t)g->slots*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->di,(size_t)g->slots*sizeof(uint64_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dv,(size_t)g->slots*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dh,(size_t)g->slots*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dhr,(size_t)g->slots*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dur,(size_t)g->slots*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->ddr,(size_t)g->slots*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dc,rb,2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dl,rb,2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dmass,(size_t)g->stride*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dred,sizeof(*g->dred),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daPipe,(size_t)g->owned*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daRow,(size_t)g->owned*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daVol,(size_t)g->owned*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daHyd,(size_t)g->owned*MSX_RESIDENT_HYD_STRIDE*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dPipeHyd,pipeHydBytes,2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daH,(size_t)g->owned*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daNf,(size_t)g->owned*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daNj,(size_t)g->owned*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daNa,(size_t)g->owned*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daNr,(size_t)g->owned*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daErr,(size_t)g->owned*sizeof(int),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dError,sizeof(int),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dAggLink,((size_t)g->n+1)*sizeof(MSXResidentGpuReduction),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dAggMass,((size_t)g->n+1)*g->stride*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->dBase,((size_t)g->n+1)*sizeof(uint32_t),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daLast,(size_t)g->owned*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->daReacted,((size_t)g->n+1)*g->stride*sizeof(double),2,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->cap,(g->n+1)*(sizeof(uint32_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->base,(g->n+1)*(sizeof(uint32_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hu,(g->slots)*(sizeof(uint32_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hg,(g->slots)*(sizeof(uint32_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->he,(g->n+1)*(sizeof(uint64_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hi,(g->slots)*(sizeof(uint64_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->fetchSeen,(g->slots)*(sizeof(uint64_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->activeSeen,(g->slots)*(sizeof(uint64_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haGen,(g->owned)*(sizeof(uint32_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->hCandidateHyd,((size_t)(g->n+1)*MSX_RESIDENT_HYD_STRIDE)*(sizeof(double)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haEpoch,(g->owned)*(sizeof(uint64_t)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->haH,(g->owned)*(sizeof(double)),0,dry,m);if(z)return z;}
+ {MSXResidentStatus z=fixedAlloc(&g->aggregateMass,(g->stride)*(sizeof(double)),0,dry,m);if(z)return z;}
+ return MSX_RESIDENT_OK;
+}
+extern "C" MSXResidentStatus MSXresidentGpu_estimateMemory(uint32_t links,uint32_t slots,uint32_t stride,MSXResidentMemoryEstimate *m)
+{
+ MSXResidentGpu g={};if(!links||links>INT_MAX||slots<links||!stride||stride>INT_MAX||!m)return MSX_RESIDENT_ERR_ARGUMENT;
+ g.n=links;g.slots=g.owned=slots;g.stride=stride;return fixedBuffers(&g,1,m);
+}
+extern "C" MSXResidentStatus MSXresidentGpu_availableMemory(uint64_t *bytes)
+{size_t available,total;if(!bytes)return MSX_RESIDENT_ERR_ARGUMENT;
+ if(!ck(cudaSetDevice(0))||!ck(cudaFree(0))||!ck(cudaMemGetInfo(&available,&total)))return MSX_RESIDENT_ERR_GPU;
+ *bytes=available;return MSX_RESIDENT_OK;}
+extern "C" MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen *o,MSXResidentGpu **out)
+{
+ size_t owned=0;MSXResidentGpu *g;MSXResidentMemoryEstimate memory;
+ if(!out||*out||!o||!o->nLinks||!o->totalSlots||!o->speciesStride||!o->capacity||!o->base)return MSX_RESIDENT_ERR_ARGUMENT;
+ if(!ck(cudaSetDevice(0))||!ck(cudaFree(0)))return MSX_RESIDENT_ERR_GPU;
+ for(uint32_t k=1;k<=o->nLinks;++k){
+  if(!o->capacity[k]||o->base[k]>o->totalSlots||o->capacity[k]>o->totalSlots-o->base[k]||owned>o->totalSlots-o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;
+  owned+=o->capacity[k];
+  for(uint32_t q=1;q<k;++q)if(o->base[k]<o->base[q]+o->capacity[q]&&o->base[q]<o->base[k]+o->capacity[k])return MSX_RESIDENT_ERR_ARGUMENT;
+ }
+ g=(MSXResidentGpu*)calloc(1,sizeof(*g));if(!g)return MSX_RESIDENT_ERR_MEMORY;
+ g->device=0;g->n=o->nLinks;g->slots=o->totalSlots;g->owned=(uint32_t)owned;g->stride=o->speciesStride;
+ MSXResidentStatus status=fixedBuffers(g,0,&memory);
+ if(status!=MSX_RESIDENT_OK){gone(g);return status;}
+ g->fixedMemory=memory;
+ memcpy(g->cap,o->capacity,((size_t)g->n+1)*sizeof(uint32_t));
+ memcpy(g->base,o->base,((size_t)g->n+1)*sizeof(uint32_t));
+ memset(g->hSubmittedHyd,0,((size_t)g->n+1)*MSX_RESIDENT_HYD_STRIDE*sizeof(double));
+ memset(g->haNf,0,(size_t)g->slots*sizeof(uint32_t));
+ memset(g->haNj,0,(size_t)(g->owned>g->n?g->owned:g->n+1)*sizeof(uint32_t));
+ if(!ck(cudaMemcpy(g->dBase,g->base,((size_t)g->n+1)*sizeof(uint32_t),cudaMemcpyHostToDevice))){gone(g);return MSX_RESIDENT_ERR_TRANSFER;}
+ *out=g;return MSX_RESIDENT_OK;
+}
+extern "C" MSXResidentStatus MSXresidentGpu_getFixedMemory(const MSXResidentGpu *g,MSXResidentMemoryEstimate *m)
+{if(!g||!m)return MSX_RESIDENT_ERR_ARGUMENT;*m=g->fixedMemory;return MSX_RESIDENT_OK;}
 /* haNf/haNj are preallocated active-result buffers.  They are only scratch
    while no active batch is prepared, so validation needs no steady-state
    allocation.  Each global row maps to one array element. */

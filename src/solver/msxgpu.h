@@ -104,6 +104,7 @@ int MSXgpu_reactPipeSegments(double dt);
 int MSXgpu_prepareResidentContext(void);
 int MSXgpu_openResidentPrograms(void);
 void MSXgpu_closeResidentPrograms(void);
+int MSXgpu_getResidentProgramMemory(MSXResidentMemoryEstimate *);
 typedef struct {
     int code;
     int stage;

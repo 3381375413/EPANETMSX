@@ -16,6 +16,7 @@
 #include "msxtypes.h"
 #include "msxutils.h"
 #include "msxfuncs.h"
+#include "msxresident_hash.h"
 
 // --- define WINDOWS
 
@@ -150,6 +151,11 @@ int MSXcompiler_open()
 		err = MSXfuncs_load(libFile);
 	    if ( err == 1 ) return ERR_COMPILE_FAILED;
 		if ( err == 2 ) return ERR_COMPILED_LOAD;
+        {char sourceHash[65],dllHash[65];FILE *manifest;
+         if(MSXresident_sha256File(srcFile,sourceHash)&&MSXresident_sha256File(libFile,dllHash)){
+          manifest=fopen("msx_chemistry_manifest.json","wb");
+          if(manifest){fprintf(manifest,"{\"compiler\":\"%s\",\"source_sha256\":\"%s\",\"generated_library_sha256\":\"%s\"}\n",MSX.Compiler==VC?"VC":"GC",sourceHash,dllHash);fclose(manifest);}
+         }}
 	} 
 	else 
 	{

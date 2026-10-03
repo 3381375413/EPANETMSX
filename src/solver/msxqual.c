@@ -22,13 +22,15 @@
 #include "msxsegment_storage.h"
 #include "msxsegment_profile.h"
 #include "msxresident_runtime.h"
+#include "msxresident_capacity.h"
+#include "msxqual_shared.h"
 
 // Macros to identify upstream & downstream nodes of a link
 // under the current flow and to compute link volume
 //
 #define   UP_NODE(x)   ( (MSX.FlowDir[(x)]==POSITIVE) ? MSX.Link[(x)].n1 : MSX.Link[(x)].n2 )
 #define   DOWN_NODE(x) ( (MSX.FlowDir[(x)]==POSITIVE) ? MSX.Link[(x)].n2 : MSX.Link[(x)].n1 )
-#define   LINKVOL(k)   ( 0.785398*MSX.Link[(k)].len*SQR(MSX.Link[(k)].diam) )
+#define   LINKVOL(k)   MSXqual_pipeVolume(&MSX.Link[(k)])
 
 //  External variables
 //--------------------
@@ -47,7 +49,7 @@ extern MSXproject  MSX;                // MSX project data
 //static alloc_handle_t *QualPool;       // memory pool
 
 // Stagnant flow tolerance
-const double Q_STAGNANT = 0.005 / GPMperCFS;     // 0.005 gpm = 1.114e-5 cfs
+const double Q_STAGNANT = MSX_Q_STAGNANT;
 
 //  Imported functions
 //--------------------
@@ -318,6 +320,13 @@ int  MSXqual_init()
 
     freeLinkQualitySnapshot();
 
+    /* Reinitialization must close the old GPU image before the CPU quality
+       pool is reset; no previous ownership survives MSXinit. */
+    MSXresidentRuntime_close();
+    MSXresidentCapacity_close();
+    if (MSX.GpuCoreCapacityMode && MSXresidentCapacity_prepare())
+        return MSX.ErrCode ? MSX.ErrCode : ERR_READ_HYD_FILE;
+
 // --- initialize node concentrations, tank volumes, & source mass flows
 
     MSX.ErrCode = 0;
@@ -375,9 +384,16 @@ int  MSXqual_init()
 // --- reset memory pool
 
     AllocSetPool(MSX.QualPool);
+    /* Return reserved CPU boundaries while their pool is still live. Then
+       discard free-list pointers before rewinding the quality allocator. */
+    MSXsegStorage_reset();
     MSX.FreeSeg = NULL;
     AllocReset();
-    MSXsegStorage_reset();
+    for (i=1; i<=MSX.Nobjects[LINK]+MSX.Nobjects[TANK]; ++i)
+    {
+        MSX.FirstSeg[i]=MSX.LastSeg[i]=MSX.NewSeg[i]=NULL;
+        if(i<=MSX.Nobjects[LINK])MSX.Link[i].nsegs=0;
+    }
     MSXsegProfile_reset();
 
 // --- re-position hydraulics file
@@ -989,6 +1005,8 @@ int MSXqual_close()
     /* GPU mirror must close while chemistry and the primary CUDA context are valid. */
     MSXresidentRuntime_close();
     MSXsegProfile_close();
+    MSXresidentCapacity_writeProcessMetrics();
+    MSXresidentCapacity_close();
     MSXchem_close();
     MSXcpu_closeTiming();
     MSXgpu_closeTiming();
@@ -1084,9 +1102,8 @@ int  getHydVars()
     if (fread(MSX.S + 1, sizeof(REAL4), n, MSX.HydFile.file) < (unsigned)n) //03/17/2022
         return ERR_READ_HYD_FILE;
     
-    for (int pi = 1; pi <= n; pi++)    //06/10/2021 Shang
-        if (fabs(MSX.Q[pi]) < Q_STAGNANT)
-            MSX.Q[pi] = 0.0;
+    for (int pi = 1; pi <= n; pi++)
+        MSX.Q[pi] = (REAL4)MSXqual_effectiveFlow(MSX.Q[pi]);
 
 // --- skip over link settings
 
@@ -1190,6 +1207,8 @@ int  transport(int64_t tstep)
            query cannot observe the previous report snapshot. */
         MSXqual_invalidateLinkQualitySnapshot();
         errcode = MSXchem_react(dt);        // react species in each pipe & tank
+        if (!errcode && MSXResidentCapacityAuditEnabled)
+            errcode = MSXresidentCapacity_auditFinish();
         MSXgpu_reactEnd();
         if (profileStage)
         {

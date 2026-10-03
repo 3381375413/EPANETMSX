@@ -7,6 +7,7 @@
 #include "msxsegment_storage.h"
 #include "msxgpu.h"
 #include "msxtypes.h"
+#include "msxresident_capacity.h"
 
 extern MSXproject MSX;
 
@@ -26,6 +27,14 @@ typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; 
     MSXResidentRuntimeToken flight;
     char status[96], resolvedCapacity[MAXFNAME]; } Runtime;
 static Runtime R;
+uint64_t MSXresidentRuntime_fixedHostBytes(uint32_t links,uint32_t slots,uint32_t stride)
+{
+ uint64_t l=(uint64_t)links+1,s=slots;
+ return l*(MSX_RESIDENT_HYD_STRIDE*sizeof(double)+sizeof(MSXResidentHandoffPlan)+
+   sizeof(MSXResidentHandoffTransaction)+1+sizeof(uint32_t))+
+   s*(sizeof(MSXResidentActiveRow)+sizeof(MSXResidentHandoffItem)+
+   sizeof(MSXResidentHandoffResult)+(uint64_t)2*stride*sizeof(double));
+}
 
 #define MSX_RESIDENT_RUNTIME_TOKEN_MAGIC UINT64_C(0x52544f4b454e5033)
 
@@ -45,6 +54,8 @@ static int fail(MSXResidentStatus s, const char *where)
 {
     int e = map(s);
     snprintf(R.status, sizeof(R.status), "%s:%d", where, (int)s);
+    if (!(s==MSX_RESIDENT_ERR_MEMORY && MSX.GpuCoreCapacityMode &&
+          MSXresidentCapacity_startupAttempt()==0))
     fprintf(stderr, "RESIDENT_ERROR,stage=%s,status=%d,mapped=%d\n",
             where ? where : "unknown", (int)s, e);
     fflush(stderr);
@@ -131,26 +142,31 @@ static void runtimeFreeBuffers(void)
     R.rows=0; R.pipeHyd=0; R.plan=0; R.item=0; R.out=0; R.c=0; R.lastc=0;
     R.tx=0; R.fallback=0; R.offset=0;
 }
+static uint64_t RuntimeAllocationBytes;
+static void *runtime_calloc(size_t n,size_t size)
+{if(n&&size>SIZE_MAX/n)return NULL;RuntimeAllocationBytes+=(uint64_t)n*size;return calloc(n,size);}
 static int runtimeAllocateBuffers(const MSXResidentLayout *l)
 {
-    size_t hydValues;
+    size_t hydValues;RuntimeAllocationBytes=0;
     if (!l || (size_t)l->nLinks + 1u > SIZE_MAX / MSX_RESIDENT_HYD_STRIDE)
         return fail(MSX_RESIDENT_ERR_OVERFLOW,"runtime_hyd_size");
     hydValues=((size_t)l->nLinks+1u)*MSX_RESIDENT_HYD_STRIDE;
     if (hydValues > SIZE_MAX / sizeof(double))
         return fail(MSX_RESIDENT_ERR_OVERFLOW,"runtime_hyd_bytes");
-    R.rows=(MSXResidentActiveRow*)calloc(l->totalSlots,sizeof(*R.rows));
-    R.pipeHyd=(double*)calloc(hydValues,sizeof(*R.pipeHyd));
-    R.plan=(MSXResidentHandoffPlan*)calloc((size_t)l->nLinks+1,sizeof(*R.plan));
-    R.item=(MSXResidentHandoffItem*)calloc(l->totalSlots,sizeof(*R.item));
-    R.out=(MSXResidentHandoffResult*)calloc(l->totalSlots,sizeof(*R.out));
-    R.c=(double*)calloc((size_t)l->totalSlots*l->speciesStride,sizeof(*R.c));
-    R.lastc=(double*)calloc((size_t)l->totalSlots*l->speciesStride,sizeof(*R.lastc));
-    R.tx=(MSXResidentHandoffTransaction*)calloc((size_t)l->nLinks+1,sizeof(*R.tx));
-    R.fallback=(unsigned char*)calloc((size_t)l->nLinks+1,1);
-    R.offset=(uint32_t*)calloc((size_t)l->nLinks+1,sizeof(*R.offset));
+    R.rows=(MSXResidentActiveRow*)runtime_calloc(l->totalSlots,sizeof(*R.rows));
+    R.pipeHyd=(double*)runtime_calloc(hydValues,sizeof(*R.pipeHyd));
+    R.plan=(MSXResidentHandoffPlan*)runtime_calloc((size_t)l->nLinks+1,sizeof(*R.plan));
+    R.item=(MSXResidentHandoffItem*)runtime_calloc(l->totalSlots,sizeof(*R.item));
+    R.out=(MSXResidentHandoffResult*)runtime_calloc(l->totalSlots,sizeof(*R.out));
+    R.c=(double*)runtime_calloc((size_t)l->totalSlots*l->speciesStride,sizeof(*R.c));
+    R.lastc=(double*)runtime_calloc((size_t)l->totalSlots*l->speciesStride,sizeof(*R.lastc));
+    R.tx=(MSXResidentHandoffTransaction*)runtime_calloc((size_t)l->nLinks+1,sizeof(*R.tx));
+    R.fallback=(unsigned char*)runtime_calloc((size_t)l->nLinks+1,1);
+    R.offset=(uint32_t*)runtime_calloc((size_t)l->nLinks+1,sizeof(*R.offset));
     if(!R.rows||!R.pipeHyd||!R.plan||!R.item||!R.out||!R.c||!R.lastc||!R.tx||!R.fallback||!R.offset)
     { runtimeFreeBuffers(); return fail(MSX_RESIDENT_ERR_MEMORY,"runtime_buffers"); }
+    if(RuntimeAllocationBytes!=MSXresidentRuntime_fixedHostBytes(l->nLinks,l->totalSlots,l->speciesStride))
+    {runtimeFreeBuffers();return fail(MSX_RESIDENT_ERR_OVERFLOW,"runtime_size_ledger");}
     R.activeCap=R.itemCap=l->totalSlots; R.stride=l->speciesStride;
     return 0;
 }
@@ -165,7 +181,7 @@ static void makeConfig(MSXResidentConfig *c, const char *hash)
 /* All fallible Resident/Shadow setup happens before HYBRID changes Pseg
    topology.  The initial GPU image deliberately contains every owned slot
    with used=0; afterHybridInit only publishes real Core patches. */
-int MSXresidentRuntime_preHybridInit(void)
+static int preHybridAttempt(void)
 {
     MSXResidentConfig c; MSXResidentStatus s; MSXResidentLayout l;
     MSXResidentPatchBatch b; MSXResidentGpuOpen o; char actual[65];
@@ -175,17 +191,19 @@ int MSXresidentRuntime_preHybridInit(void)
     R.auditHyd = auditHydRequested();
     R.auditAggregateFail = auditAggregateMode();
     if (!MSX.InpFileName[0]) return fail(MSX_RESIDENT_ERR_PATH,"missing_inp_path");
-    if (!resolveCapacityPath(R.resolvedCapacity,MSX.GpuCoreCapacityFile,MSX.MsxFile.name))
+    if (!MSX.GpuCoreCapacityMode && !resolveCapacityPath(R.resolvedCapacity,MSX.GpuCoreCapacityFile,MSX.MsxFile.name))
         return fail(MSX_RESIDENT_ERR_PATH,"capacity_path");
     if (!MSXresident_caseHashFiles(MSX.InpFileName,MSX.MsxFile.name,actual))
         return fail(MSX_RESIDENT_ERR_CASE_HASH,"case_hash");
     makeConfig(&c,actual);
     s=MSXresident_validateConfig(&c); if(s!=MSX_RESIDENT_OK)return fail(s,"pre_validate");
-    s=MSXresident_open(c.capacityFile); if(s!=MSX_RESIDENT_OK)return fail(s,"pre_open");
+    s=MSX.GpuCoreCapacityMode ? MSXresidentCapacity_openPlan(actual) : MSXresident_open(c.capacityFile);
+    if(s!=MSX_RESIDENT_OK)return fail(s,"pre_open");
     R.opened=1; MSXresident_setMode(c.mode,c.strict);
     if((s=MSXresident_verifyCaseHash(actual))!=MSX_RESIDENT_OK) { MSXresidentRuntime_close(); return fail(s,"pre_verify"); }
     if((s=MSXresident_getLayout(&l))!=MSX_RESIDENT_OK) { MSXresidentRuntime_close(); return fail(s,"pre_layout"); }
-    if(MSXsegStorage_hybridReserve(&l)) { MSXresidentRuntime_close(); return fail(MSX_RESIDENT_ERR_CAPACITY,"pre_reserve"); }
+    { int reserveError=MSXsegStorage_hybridReserve(&l);
+      if(reserveError) { MSXresidentRuntime_close(); return fail(reserveError==ERR_MEMORY?MSX_RESIDENT_ERR_MEMORY:MSX_RESIDENT_ERR_CAPACITY,"pre_reserve"); } }
     if(runtimeAllocateBuffers(&l)) { MSXresidentRuntime_close(); return MSX.ErrCode; }
     if(c.mode==MSX_RESIDENT_SHADOW) { R.lastStatus=MSX_RESIDENT_OK; strcpy(R.status,"shadow-preopened"); return 0; }
     if((s=MSXresident_beginInitialImage())!=MSX_RESIDENT_OK) { MSXresidentRuntime_close(); return fail(s,"pre_initial_begin"); }
@@ -196,7 +214,14 @@ int MSXresidentRuntime_preHybridInit(void)
     { MSXresidentRuntime_close(); return fail(MSX_RESIDENT_ERR_ARGUMENT,"pre_layout"); }
     o.nLinks=l.nLinks;o.totalSlots=l.totalSlots;o.speciesStride=l.speciesStride;o.capacity=l.capacity;o.base=l.base;
     if(MSXgpu_prepareResidentContext()){MSXresidentRuntime_close();return fail(MSX_RESIDENT_ERR_GPU,"pre_context");}
+    {uint64_t freeDevice;
+     s=MSXresidentGpu_availableMemory(&freeDevice);
+     if(s!=MSX_RESIDENT_OK){MSXresidentRuntime_close();return fail(s,"pre_memory_query");}
+     MSXresidentCapacity_setDeviceBaseline(freeDevice);}
     s=MSXresidentGpu_open(&o,&R.gpu);
+    if(s==MSX_RESIDENT_OK && (initialFault("allocation_oom") ||
+       (initialFault("allocation_oom_once") && MSXresidentCapacity_startupAttempt()==0)))
+        s=MSX_RESIDENT_ERR_MEMORY;
     if(s==MSX_RESIDENT_OK && initialFault("initial_upload")) s=MSX_RESIDENT_ERR_TRANSFER;
     if(s==MSX_RESIDENT_OK)
     {
@@ -218,6 +243,25 @@ int MSXresidentRuntime_preHybridInit(void)
     if(MSXgpu_openResidentPrograms()){MSXresidentRuntime_close();return fail(MSX_RESIDENT_ERR_GPU,"pre_program_open");}
     R.lastStatus=MSX_RESIDENT_OK; strcpy(R.status,"resident-preopened-image-staged");
     return 0;
+}
+
+int MSXresidentRuntime_preHybridInit(void)
+{
+    int error=preHybridAttempt();
+    if(error && MSX.GpuCoreCapacityMode &&
+       (error==ERR_MEMORY || error==ERR_GPU_MEMORY_ALLOCATION_FAILED) &&
+       MSXresidentCapacity_retryBudget())
+    {
+        /* No topology has been committed. Destroy all staging arenas before
+           the one permitted smaller fixed-layout attempt. */
+        MSXresidentRuntime_close();
+        error=MSXsegStorage_hybridResetUncommitted();
+        if(error)return fail(error==ERR_MEMORY?MSX_RESIDENT_ERR_MEMORY:MSX_RESIDENT_ERR_POISONED,"retry_staging_reset");
+        MSX.ErrCode=0; MSX.OutOfMemory=0;
+        memset(&MSX.GpuError,0,sizeof(MSX.GpuError));
+        error=preHybridAttempt();
+    }
+    return error;
 }
 
 int MSXresidentRuntime_afterHybridInit(void)
@@ -416,6 +460,7 @@ MSXResidentStatus MSXresidentRuntime_fetchBatch(
 
 void MSXresidentRuntime_close(void)
 {
+    if (R.resident && MSX.GpuCoreOverflow) MSXresidentCapacity_writeUsage();
     int emitDiagnosticSummary = 0;
     if (R.auditPoisonCpuMirrors || R.auditHyd || R.auditAggregateFail)
         emitDiagnosticSummary = 1;
@@ -437,6 +482,8 @@ void MSXresidentRuntime_close(void)
     if (R.gpu)
     {
         MSXResidentGpuTransferStats hydStats;
+        if(MSXresidentGpu_getTransferStats(R.gpu,&hydStats)==MSX_RESIDENT_OK)
+            MSXresidentCapacity_writeTransferStats(&hydStats);
         if (emitDiagnosticSummary &&
             MSXresidentGpu_getTransferStats(R.gpu, &hydStats) == MSX_RESIDENT_OK)
             fprintf(stderr,
@@ -465,7 +512,7 @@ void MSXresidentRuntime_close(void)
     MSXsegStorage_hybridAbortInitialImage();
     MSXresident_abortInitialImage();
     if (R.opened || MSXresident_isOpen()) MSXresident_close();
-    free(R.rows); free(R.plan); free(R.item); free(R.out); free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset); memset(&R,0,sizeof(R));
+    runtimeFreeBuffers(); memset(&R,0,sizeof(R));
 }
 int MSXresidentRuntime_residentNotReady(void)
 { return R.resident && !R.dispatchReady; }
@@ -630,8 +677,9 @@ int MSXresidentRuntime_beginStep(double dt)
         off += R.plan[k].itemCount;
     }
     R.itemCount = off;
+    MSXresidentCapacity_recordOwnership();
     if (handoffDetail) R.handoffPlanMs = MSXgpu_wallTimeMs() - planTimer;
-    return 0;
+    return MSX.ErrCode;
 }
 int MSXresidentRuntime_completeHandoffs(void)
 {
@@ -751,6 +799,9 @@ static MSXResidentStatus runtimeBuildActive(MSXResidentGpuActiveWriter *writer,
             return MSX_RESIDENT_ERR_GENERATION;
         }
         s=MSXresidentGpu_appendActive(R.gpu,writer,&R.rows[i]);
+        if(s==MSX_RESIDENT_OK && MSXResidentCapacityAuditEnabled &&
+           MSXresidentCapacity_auditReact(R.rows[i].linkIndex,R.rows[i].parcelId,1))
+            s=MSX_RESIDENT_ERR_GENERATION;
         if(s!=MSX_RESIDENT_OK)
         {
             R.activeBuilderAborts++;
@@ -869,6 +920,7 @@ int MSXresidentRuntime_finishCore(MSXResidentRuntimeToken *token)
             MSX.Link[i].reacted[m]+=out.reacted[(size_t)i*out.reactedStride+m];
     if(stage)MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_REACTED_MERGE,
                                     MSXgpu_wallTimeMs()-phaseStart);
+    MSXresidentCapacity_recordDeviceMemory();
     if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_after_react"))
         return MSX.ErrCode;
     return 0;

@@ -36,11 +36,13 @@ typedef struct { uint32_t linkIndex,slot,generation,boundarySide; uint64_t pipeE
 typedef struct { void *opaque; } MSXResidentHandoffTransaction;
 typedef struct { uint64_t descriptorPatches,slotUploads,slotInvalidates,reverses,handoffRequests,fallbacks,generationFailures; } MSXResidentStats;
 /* Indexed by link like capacity/base; parsed from the authoritative CSV. */
-typedef struct { uint32_t nLinks,totalSlots,speciesStride; const uint32_t *capacity,*base,*guard; } MSXResidentLayout;
+typedef struct { uint32_t nLinks,totalSlots,speciesStride; const uint32_t *capacity,*base,*guard,*admissionLimit; } MSXResidentLayout;
 /* Read-only snapshot of one published resident row.  It deliberately exposes
    no CPU topology pointer: callers may only build GPU active batches. */
 typedef struct { uint32_t linkIndex,slot,globalRow,generation,descriptorHead,descriptorCount; int32_t descriptorOrient; uint64_t descriptorEpoch,parcelId; double volume; } MSXResidentActiveRow;
 MSXResidentStatus MSXresident_open(const char*); void MSXresident_close(void); int MSXresident_isOpen(void);
+MSXResidentStatus MSXresident_openPlan(uint32_t,const uint32_t *,const uint32_t *,const char *);
+uint64_t MSXresident_fixedHostBytes(uint32_t,uint32_t,uint32_t);
 void MSXresident_setMode(MSXResidentMode,int); MSXResidentMode MSXresident_mode(void);
 MSXResidentStatus MSXresident_validateFeatures(int,int); MSXResidentStatus MSXresident_verifyCaseHash(const char*);
 /* Pure configuration check: no CUDA allocation, topology mutation, or fallback. */
@@ -124,6 +126,7 @@ const MSXResidentStats *MSXresident_stats(void);
 /* Test seam: counts allocations made by this module.  The fault index is
    relative to the next module allocation; -1 disables injection. */
 uint64_t MSXresident_testAllocationCount(void);
+uint64_t MSXresident_testAllocationBytes(void);
 void MSXresident_testResetAllocationCount(void);
 void MSXresident_testFailAllocationAfter(int64_t allocationIndex);
 #ifdef __cplusplus

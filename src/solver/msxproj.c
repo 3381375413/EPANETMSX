@@ -373,6 +373,9 @@ void setDefaults()
     MSX.PipeRingCap = 5000;
     MSX.GpuCoreMode = 0;              // GPU_CORE_MODE OFF
     MSX.GpuCoreGuard = 2;
+    MSX.GpuCoreOverflow = 0;
+    MSX.GpuCoreCapacityMode = 0;
+    MSX.GpuCoreMemoryMB = 0.0;
     MSX.InpFileName[0] = '\0';
     MSX.GpuCoreCapacityFile[0] = '\0';
     memset(&MSX.GpuTimingRecord, 0, sizeof(MSX.GpuTimingRecord));

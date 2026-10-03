@@ -23,6 +23,7 @@
 #include "msxsegment_storage.h"
 #include "msxsegment_profile.h"
 #include "msxresident_runtime.h"
+#include "msxresident_capacity.h"
 
 //  External variables
 //--------------------
@@ -922,17 +923,23 @@ static int evalPipeHybridReactions(int k, double dt)
 static int evalPipeHybridBoundaryReactions(int k, double dt)
 {
     int errcode = 0;
+    double capacityStart=MSX.GpuCoreOverflow?MSXgpu_wallTimeMs():0.0;
     Pseg seg = MSX.FirstSeg[k];
     MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
     while (seg)
     {
         if (!MSXsegStorage_isHybridCoreSegment(seg))
         {
+            if (MSXResidentCapacityAuditEnabled &&
+                MSXresidentCapacity_auditReact((uint32_t)k,seg->hybridId,0))
+                return ERR_GPU_SEGMENT_PACK_FAILED;
             errcode = evalPipeSegmentReaction(k, dt, seg);
             if (errcode) return errcode;
         }
         seg = seg->prev;
     }
+    if(MSX.GpuCoreOverflow)
+        MSXresidentCapacity_addCpuReactMs((uint32_t)k,MSXgpu_wallTimeMs()-capacityStart);
     return 0;
 }
 

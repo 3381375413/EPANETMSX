@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <malloc.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -25,6 +26,7 @@
 #endif
 
 #include "msxgpu.h"
+#include "msxresident_hash.h"
 
 typedef char MSXresidentHydStrideAbiAssert[
     (MSX_RESIDENT_HYD_STRIDE == MAX_HYD_VARS) ? 1 : -1];
@@ -1440,6 +1442,8 @@ void MSXgpu_closeResidentPrograms(void)
 {
     /* Non-CUDA builds have no program cache. */
 }
+int MSXgpu_getResidentProgramMemory(MSXResidentMemoryEstimate *m)
+{if(m)memset(m,0,sizeof(*m));return ERR_GPU_NOT_ENABLED;}
 
 static int mapResidentStatus(MSXResidentStatus status)
 {
@@ -1623,7 +1627,7 @@ static CUcontext GpuContext = NULL;
 
 /* Immutable NH2CL chemistry/program tables.  Parameter changes after open
    are unsupported in this phase; Phase 3 uses a fixed compiled case. */
-typedef struct { int ready,nLinks,nSpecies,nParams,nConsts,rateCount,eqCount,formulaCount,nInstr; int *rateSpecies,*eqSpecies,*formulaSpecies,*speciesType; double *rateAtol,*rateRtol,*params,*consts,*linkDiam; GpuInstrHost *instr; GpuProgramHost *speciesProg,*termProg; CUdeviceptr d_rateAtol,d_rateRtol,d_rateSpecies,d_eqSpecies,d_formulaSpecies,d_speciesType,d_params,d_consts,d_linkDiam,d_instr,d_speciesProg,d_termProg,d_err; GpuErrorHost *h_err; CUevent evStart[3],evStop[3],readyEvent; unsigned long long allocCount; } ResidentPrograms;
+typedef struct { int ready,nLinks,nSpecies,nParams,nConsts,rateCount,eqCount,formulaCount,nInstr; int *rateSpecies,*eqSpecies,*formulaSpecies,*speciesType; double *rateAtol,*rateRtol,*params,*consts,*linkDiam; GpuInstrHost *instr; GpuProgramHost *speciesProg,*termProg; CUdeviceptr d_rateAtol,d_rateRtol,d_rateSpecies,d_eqSpecies,d_formulaSpecies,d_speciesType,d_params,d_consts,d_linkDiam,d_instr,d_speciesProg,d_termProg,d_err; GpuErrorHost *h_err; CUevent evStart[3],evStop[3],readyEvent; unsigned long long allocCount; MSXResidentMemoryEstimate fixedMemory; } ResidentPrograms;
 static ResidentPrograms ResidentProgram;
 
 static int checkCu(CUresult r, int code)
@@ -2592,6 +2596,7 @@ static int compileSourceToPtx(const char *source, const char *arch, const char *
 static int ensureModule(void)
 {
     int err;
+    int capacityCacheHit=0;
     CUdevice dev;
     int major = 0, minor = 0;
     char arch[64];
@@ -2662,6 +2667,7 @@ static int ensureModule(void)
     if (timing) timer = MSXgpu_wallTimeMs();
     if (readFileBytes(cachePath, &ptx, &ptxSize))
     {
+        capacityCacheHit=1;
         if (timing)
         {
             phaseStartMs = MSXgpu_wallTimeMs() - timer;
@@ -2720,6 +2726,15 @@ static int ensureModule(void)
     }
     free(ptx);
     if (err) return err;
+
+    if(MSX.GpuCoreMode==MSX_RESIDENT_RESIDENT){
+        char ptxHash[65];const char *key=strrchr(cachePath,'/');FILE *manifest;
+        if(!key)key=strrchr(cachePath,'\\');key=key?key+1:cachePath;
+        if(MSXresident_sha256File(cachePath,ptxHash)){
+            manifest=fopen("resident_gpu_cache.jsonl","ab");
+            if(manifest){fprintf(manifest,"{\"key\":\"%s\",\"hit\":%s,\"ptx_sha256\":\"%s\",\"gpu_compiler\":\"%s\"}\n",key,capacityCacheHit?"true":"false",ptxHash,MSX.GpuCompiler?"YES":"NO");fclose(manifest);}
+        }
+    }
 
     if (timing) timer = MSXgpu_wallTimeMs();
     if (MSX.GpuSolver == RK5)
@@ -2892,6 +2907,10 @@ void MSXgpu_closeResidentPrograms(void)
     memset(&ResidentProgram, 0, sizeof(ResidentProgram));
 }
 
+static int checkResidentAllocation(CUresult result)
+{return checkCu(result,result==CUDA_ERROR_OUT_OF_MEMORY?ERR_GPU_MEMORY_ALLOCATION_FAILED:ERR_GPU_KERNEL_RUNTIME_ERROR);}
+int MSXgpu_getResidentProgramMemory(MSXResidentMemoryEstimate *m)
+{if(!m||!ResidentProgram.ready)return ERR_GPU_NOT_ENABLED;*m=ResidentProgram.fixedMemory;return 0;}
 int MSXgpu_openResidentPrograms(void)
 {
     int err, nLinks, nSpecies, nParams, nConsts, rateCount = 0, eqCount = 0, formulaCount = 0;
@@ -2909,20 +2928,20 @@ int MSXgpu_openResidentPrograms(void)
     for(m=1;m<=nConsts;m++)ResidentProgram.consts[m]=MSX.Const[m].value;
     for(k=1;k<=nLinks;k++){ResidentProgram.linkDiam[k]=MSX.Link[k].diam;for(m=1;m<=nParams;m++)ResidentProgram.params[k*(nParams+1)+m]=MSX.Link[k].param[m];}
     err=buildPrograms(&ResidentProgram.instr,&nInstr,&ResidentProgram.speciesProg,&ResidentProgram.termProg); if(err)goto fail; ResidentProgram.nInstr=nInstr; memset(&zeroErr,0,sizeof(zeroErr));
-#define RP_ALLOC_COPY(x,h,n) do { err=checkCu(cuMemAlloc(&ResidentProgram.x,(n)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.x,(h),(n),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;} while(0)
+#define RP_ALLOC_COPY(x,h,n) do { ResidentProgram.fixedMemory.deviceBytes+=(uint64_t)(n); err=checkResidentAllocation(cuMemAlloc(&ResidentProgram.x,(n)));if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.x,(h),(n),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto fail;} while(0)
     RP_ALLOC_COPY(d_rateAtol,ResidentProgram.rateAtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateRtol,ResidentProgram.rateRtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateSpecies,ResidentProgram.rateSpecies,(rateCount+1)*sizeof(int)); RP_ALLOC_COPY(d_eqSpecies,ResidentProgram.eqSpecies,(eqCount+1)*sizeof(int)); RP_ALLOC_COPY(d_formulaSpecies,ResidentProgram.formulaSpecies,(formulaCount+1)*sizeof(int)); RP_ALLOC_COPY(d_speciesType,ResidentProgram.speciesType,(nSpecies+1)*sizeof(int)); RP_ALLOC_COPY(d_params,ResidentProgram.params,(size_t)(nLinks+1)*(nParams+1)*sizeof(double)); RP_ALLOC_COPY(d_consts,ResidentProgram.consts,(nConsts+1)*sizeof(double)); RP_ALLOC_COPY(d_linkDiam,ResidentProgram.linkDiam,(nLinks+1)*sizeof(double)); RP_ALLOC_COPY(d_instr,ResidentProgram.instr,(nInstr?nInstr:1)*sizeof(GpuInstrHost)); RP_ALLOC_COPY(d_speciesProg,ResidentProgram.speciesProg,(nSpecies+1)*sizeof(GpuProgramHost)); RP_ALLOC_COPY(d_termProg,ResidentProgram.termProg,(MSX.Nobjects[TERM]+1)*sizeof(GpuProgramHost));
 #undef RP_ALLOC_COPY
-    err=checkCu(cuMemAlloc(&ResidentProgram.d_err,sizeof(zeroErr)),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.d_err,&zeroErr,sizeof(zeroErr),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+    ResidentProgram.fixedMemory.deviceBytes+=sizeof(zeroErr);err=checkResidentAllocation(cuMemAlloc(&ResidentProgram.d_err,sizeof(zeroErr)));if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.d_err,&zeroErr,sizeof(zeroErr),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto fail;
     /* The error copy is enqueued before the ready event.  Keep its host
        destination pinned for the complete resident-program lifetime: the
        caller's lifecycle token is commonly stack storage and is not valid as
        an asynchronous Driver-API destination. */
-    err=checkCu(cuMemHostAlloc((void **)&ResidentProgram.h_err,sizeof(zeroErr),CU_MEMHOSTALLOC_PORTABLE),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+    ResidentProgram.fixedMemory.pinnedBytes+=sizeof(zeroErr);err=checkResidentAllocation(cuMemHostAlloc((void **)&ResidentProgram.h_err,sizeof(zeroErr),CU_MEMHOSTALLOC_PORTABLE));if(err)goto fail;
     memset(ResidentProgram.h_err,0,sizeof(zeroErr));
     /* The resident CUDA core owns the Runtime stream.  This Driver event is
        recorded on the exact stream handle returned by prepareActive; it is
        a dependency token, not a second stream. */
-    err=checkCu(cuEventCreate(&ResidentProgram.readyEvent,CU_EVENT_DISABLE_TIMING),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+    err=checkResidentAllocation(cuEventCreate(&ResidentProgram.readyEvent,CU_EVENT_DISABLE_TIMING));if(err)goto fail;
     /* Completion is provided by the stream/context synchronize below.  These
        events exist only for detail-mode device timing. */
     if (MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM))
@@ -2930,10 +2949,22 @@ int MSXgpu_openResidentPrograms(void)
         int i;
         for (i = 0; i < 3; i++)
         {
-            err=checkCu(cuEventCreate(&ResidentProgram.evStart[i],CU_EVENT_DEFAULT),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
-            err=checkCu(cuEventCreate(&ResidentProgram.evStop[i],CU_EVENT_DEFAULT),ERR_GPU_MEMORY_ALLOCATION_FAILED);if(err)goto fail;
+            err=checkResidentAllocation(cuEventCreate(&ResidentProgram.evStart[i],CU_EVENT_DEFAULT));if(err)goto fail;
+            err=checkResidentAllocation(cuEventCreate(&ResidentProgram.evStop[i],CU_EVENT_DEFAULT));if(err)goto fail;
         }
     }
+    if(ResidentProgram.rateSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.rateSpecies);
+    if(ResidentProgram.eqSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.eqSpecies);
+    if(ResidentProgram.formulaSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.formulaSpecies);
+    if(ResidentProgram.speciesType)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.speciesType);
+    if(ResidentProgram.rateAtol)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.rateAtol);
+    if(ResidentProgram.rateRtol)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.rateRtol);
+    if(ResidentProgram.params)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.params);
+    if(ResidentProgram.consts)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.consts);
+    if(ResidentProgram.linkDiam)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.linkDiam);
+    if(ResidentProgram.instr)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.instr);
+    if(ResidentProgram.speciesProg)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.speciesProg);
+    if(ResidentProgram.termProg)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.termProg);
     ResidentProgram.ready=1; ResidentProgram.allocCount++; return 0;
 fail: MSXgpu_closeResidentPrograms(); return err;
 }

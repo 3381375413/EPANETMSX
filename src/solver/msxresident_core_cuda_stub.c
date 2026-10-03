@@ -1,5 +1,11 @@
 #include "msxresident_core_cuda.h"
+MSXResidentStatus MSXresidentGpu_estimateMemory(uint32_t n,uint32_t s,uint32_t t,MSXResidentMemoryEstimate *m)
+{ (void)n;(void)s;(void)t;(void)m;return MSX_RESIDENT_ERR_GPU; }
+MSXResidentStatus MSXresidentGpu_availableMemory(uint64_t *b)
+{ (void)b;return MSX_RESIDENT_ERR_GPU; }
 #include <string.h>
+MSXResidentStatus MSXresidentGpu_getFixedMemory(const MSXResidentGpu *g,MSXResidentMemoryEstimate *m)
+{(void)g;(void)m;return MSX_RESIDENT_ERR_GPU;}
 /* Fail closed: a non-CUDA build must never claim a resident GPU mirror. */
 int MSXresidentGpu_isEnabled(void){return 0;}
 MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen*a,MSXResidentGpu**b){(void)a;if(b)*b=0;return MSX_RESIDENT_DISABLED;}

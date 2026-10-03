@@ -228,7 +228,10 @@ typedef  float REAL4;
                   PIPE_RING_CAP_OPTION,
                   GPU_CORE_MODE_OPTION,
                   GPU_CORE_GUARD_OPTION,
-                  GPU_CORE_CAPACITY_FILE_OPTION};
+                  GPU_CORE_CAPACITY_FILE_OPTION,
+                  GPU_CORE_OVERFLOW_OPTION,
+                  GPU_CORE_CAPACITY_MODE_OPTION,
+                  GPU_CORE_MEMORY_MB_OPTION};
 
  enum SegmentStorageType              // Pipe segment concentration storage
                  {SEG_STORAGE_PSEG,
@@ -835,7 +838,10 @@ typedef struct                         // MSX PROJECT VARIABLES
           SegmentStorage,              // SEGMENT_STORAGE option
           PipeRingCap,                 // fixed slots per pipe for PIPE_RING
           GpuCoreMode,                 // OFF, SHADOW, or RESIDENT
-          GpuCoreGuard;                // requested resident boundary guard
+          GpuCoreGuard,                // requested resident boundary guard
+          GpuCoreOverflow,             // ERROR (0) or CPU (1) admission policy
+          GpuCoreCapacityMode;         // FILE (0) or HYD_MINFLOW (1)
+   double GpuCoreMemoryMB;
    char   InpFileName[MAXFNAME],       // actual EPANET input path, not reconstructed
           GpuCoreCapacityFile[MAXFNAME]; // resident capacity CSV path
    int    MaxSegments;                 // Maximum number of segments in a link  

@@ -71,6 +71,10 @@ typedef struct { uint64_t segPipe,segRow,segVol,hstep,c,lastc,hyd,reacted,ros2Nf
 typedef struct { double activeUploadMs,gatherMs,ros2Ms,equilMs,formulaMs,diagDownloadMs,syncMs; uint64_t ros2Nfcn,ros2Njac,ros2Naccept,ros2Nreject; double ros2LastHstep; int ros2Error; uint32_t nanCount,infCount; const double *reacted; uint32_t reactedStride,reactedLinkCount; } MSXResidentGpuReactResult;
 
 MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen *, MSXResidentGpu **);
+typedef struct { uint64_t deviceBytes,pinnedBytes,hostBytes; } MSXResidentMemoryEstimate;
+MSXResidentStatus MSXresidentGpu_estimateMemory(uint32_t,uint32_t,uint32_t,MSXResidentMemoryEstimate *);
+MSXResidentStatus MSXresidentGpu_availableMemory(uint64_t *);
+MSXResidentStatus MSXresidentGpu_getFixedMemory(const MSXResidentGpu *,MSXResidentMemoryEstimate *);
 MSXResidentStatus MSXresidentGpu_initialUpload(MSXResidentGpu *, const MSXResidentPatchBatch *);
 MSXResidentStatus MSXresidentGpu_applyPatches(MSXResidentGpu *, const MSXResidentPatchBatch *);
 MSXResidentStatus MSXresidentGpu_fetchHandoffs(MSXResidentGpu *, const MSXResidentHandoffPlan *, MSXResidentGpuFetchOutput *, uint32_t);

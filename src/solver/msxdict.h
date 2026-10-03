@@ -28,7 +28,9 @@ static char *OptionTypeWords[] = {"AREA_UNITS", "RATE_UNITS", "SOLVER", "COUPLIN
                                   "GPU_RK5_MODE", "GPU_TIMING_DETAIL", "GPU_TIMING",
                                   "CPU_TIMING",
                                   "SEGMENT_STORAGE", "PIPE_RING_CAP", "GPU_CORE_MODE",
-                                  "GPU_CORE_GUARD", "GPU_CORE_CAPACITY_FILE", NULL};
+                                  "GPU_CORE_GUARD", "GPU_CORE_CAPACITY_FILE",
+                                  "GPU_CORE_OVERFLOW", "GPU_CORE_CAPACITY_MODE",
+                                  "GPU_CORE_MEMORY_MB", NULL};
 static char *CompilerWords[]   = {"NONE", "VC", "GC", NULL};                      
 static char *SourceTypeWords[] = {"CONC", "MASS", "SETPOINT", "FLOW", NULL};      
 static char *MixingTypeWords[] = {"MIXED", "2COMP", "FIFO", "LIFO", NULL};
@@ -41,6 +43,8 @@ static char *GpuReactScopeWords[] = {"PIPE_SEGMENT", "FULL_REACT", NULL};
 static char *GpuRk5ModeWords[] = {"CPU_ALIGN", "FAST_BUCKET", NULL};
 static char *SegmentStorageWords[] = {"PSEG", "PIPE_RING", "HYBRID", NULL};
 static char *GpuCoreModeWords[] = {"OFF", "SHADOW", "RESIDENT", NULL};
+static char *GpuCoreOverflowWords[] = {"ERROR", "CPU", NULL};
+static char *GpuCoreCapacityModeWords[] = {"FILE", "HYD_MINFLOW", NULL};
 static char *ExprTypeWords[]   = {"", "RATE", "FORMULA", "EQUIL", NULL};
 static char *HydVarWords[]     = {"", "D", "Q", "U", "Re",
                                   "Us", "Ff", "Av", "Kc", "Len", NULL};	/*Len added Feng Shang 01/27/2023*/

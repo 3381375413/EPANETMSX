@@ -14,22 +14,24 @@ extern MSXproject MSX;
 extern void MSXqual_removeSeg(Pseg seg);
 #define NONE UINT32_MAX
 static uint64_t ResidentAllocationCount;
+static uint64_t ResidentAllocationBytes;
 static int64_t ResidentAllocationFailAfter = -1;
 static void *resident_malloc(size_t n)
-{ if (ResidentAllocationFailAfter == 0) return NULL; if (ResidentAllocationFailAfter > 0) ResidentAllocationFailAfter--; ResidentAllocationCount++; return malloc(n); }
+{ if (ResidentAllocationFailAfter == 0) return NULL; if (ResidentAllocationFailAfter > 0) ResidentAllocationFailAfter--; ResidentAllocationCount++; ResidentAllocationBytes+=n; return malloc(n); }
 static void *resident_calloc(size_t n, size_t z)
-{ if (ResidentAllocationFailAfter == 0) return NULL; if (ResidentAllocationFailAfter > 0) ResidentAllocationFailAfter--; ResidentAllocationCount++; return calloc(n,z); }
+{ if (n&&z>SIZE_MAX/n) return NULL; if (ResidentAllocationFailAfter == 0) return NULL; if (ResidentAllocationFailAfter > 0) ResidentAllocationFailAfter--; ResidentAllocationCount++; ResidentAllocationBytes+=(uint64_t)n*z; return calloc(n,z); }
 #define malloc resident_malloc
 #define calloc resident_calloc
-typedef struct { MSXResidentPipeDesc d; uint32_t guard; unsigned char *used; uint32_t *gen,*patch,*obsI2s,*obsKeep; uint64_t *id; double *row; } Pipe;
+typedef struct { MSXResidentPipeDesc d; uint32_t guard,admissionLimit; unsigned char *used; uint32_t *gen,*patch,*obsI2s,*obsKeep; uint64_t *id; double *row; } Pipe;
 /* One reusable transaction arena is owned by each resident link.  Runtime
    prepares at most one transaction per link before the all-link validation. */
 typedef struct { MSXResidentHandoffPlan plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *result; Pseg *boundary; double *c,*lastc; uint32_t count,capacity,patchReserve; int active; MSXHybridResidentMaterialization storage; } Tx;
-typedef struct { int open,strict,initialStaging,initialCommitted,poisoned; MSXResidentMode mode; uint32_t nlinks,stride,rowWidth; size_t slots; char hash[65]; Pipe *p; uint32_t *dirty,*capacity,*base,*guard; MSXResidentDescriptorPatch *desc,*initialDesc; MSXResidentSlotPatch *slot,*initialSlot; MSXResidentHandoffItem *hand; Tx *tx; uint32_t ndesc,nslot,nh; MSXResidentStats stat; } State;
+typedef struct { int open,strict,initialStaging,initialCommitted,poisoned; MSXResidentMode mode; uint32_t nlinks,stride,rowWidth; size_t slots; char hash[65]; Pipe *p; uint32_t *dirty,*capacity,*base,*guard,*admissionLimit; MSXResidentDescriptorPatch *desc,*initialDesc; MSXResidentSlotPatch *slot,*initialSlot; MSXResidentHandoffItem *hand; Tx *tx; uint32_t ndesc,nslot,nh; MSXResidentStats stat; } State;
 static State S={0};
+uint64_t MSXresident_testAllocationBytes(void){return ResidentAllocationBytes;}
 static int mul(size_t a,size_t b,size_t*o){if(a&&b>SIZE_MAX/a)return 0;*o=a*b;return 1;}
 static void txreset(Tx *t);
-static void freestate(void){uint32_t k;if(S.tx){for(k=1;k<=S.nlinks;k++){txreset(&S.tx[k]);free(S.tx[k].item);free(S.tx[k].result);free(S.tx[k].boundary);free(S.tx[k].c);free(S.tx[k].lastc);}free(S.tx);}if(S.p)for(k=1;k<=S.nlinks;k++){free(S.p[k].used);free(S.p[k].gen);free(S.p[k].patch);free(S.p[k].obsI2s);free(S.p[k].obsKeep);free(S.p[k].id);free(S.p[k].row);}free(S.p);free(S.dirty);free(S.capacity);free(S.base);free(S.guard);free(S.desc);free(S.initialDesc);free(S.slot);free(S.initialSlot);free(S.hand);memset(&S,0,sizeof(S));}
+static void freestate(void){uint32_t k;if(S.tx){for(k=1;k<=S.nlinks;k++){txreset(&S.tx[k]);free(S.tx[k].item);free(S.tx[k].result);free(S.tx[k].boundary);free(S.tx[k].c);free(S.tx[k].lastc);}free(S.tx);}if(S.p)for(k=1;k<=S.nlinks;k++){free(S.p[k].used);free(S.p[k].gen);free(S.p[k].patch);free(S.p[k].obsI2s);free(S.p[k].obsKeep);free(S.p[k].id);free(S.p[k].row);}free(S.p);free(S.dirty);free(S.capacity);free(S.base);free(S.guard);free(S.admissionLimit);free(S.desc);free(S.initialDesc);free(S.slot);free(S.initialSlot);free(S.hand);memset(&S,0,sizeof(S));}
 static int hashok(const char*s){int i;if(!s)return 0;for(i=0;i<64;i++)if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='A'&&s[i]<='F')||(s[i]>='a'&&s[i]<='f')))return 0;return s[64]==0;}
 static void hashupper(char*s){int i;for(i=0;i<64;i++)if(s[i]>='a'&&s[i]<='f')s[i]=(char)(s[i]-'a'+'A');}
 static int hashcmp(const char*a,const char*b){char x[65],y[65];if(!hashok(a)||!hashok(b))return 1;memcpy(x,a,65);memcpy(y,b,65);hashupper(x);hashupper(y);return strcmp(x,y);}
@@ -39,7 +41,7 @@ static MSXResidentStatus validatecsv(const char *path,int guard,const char *hash
 { FILE*f;char line[1024],id[EN_MAXID+1],want[EN_MAXID+1],h[65],first[65],*e;uint32_t row=0,k,cap,core,burst,g,n=(uint32_t)MSX.Nobjects[LINK];
   f=fopen(path,"rb");if(!f)return MSX_RESIDENT_ERR_PATH;
   if(!fgets(line,sizeof(line),f)||strcmp(line,"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n")&&strcmp(line,"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\r\n")){fclose(f);return MSX_RESIDENT_ERR_CSV;}
-  while(fgets(line,sizeof(line),f)){e=strpbrk(line,"\r\n");if(!e||(*e=='\r'&&e[1]!='\n')||e[1+(*e=='\r')]){fclose(f);return MSX_RESIDENT_ERR_CSV;}*e=0;if(!csv(line,&k,id,&cap,&core,&burst,&g,h)||k!=row+1||!k||k>n||!cap||core>cap||(g!=2&&g!=4)||cap>(uint32_t)MSX.MaxSegments){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(guard&&g<(uint32_t)guard){fclose(f);return MSX_RESIDENT_ERR_GUARD;}want[0]=0;if(ENgetlinkid((int)k,want)||strcmp(id,want)){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(!row)strcpy(first,h);else if(strcmp(first,h)){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(hash&&hashcmp(h,hash)){fclose(f);return MSX_RESIDENT_ERR_CSV;}row++;}
+  while(fgets(line,sizeof(line),f)){e=strpbrk(line,"\r\n");if(!e||(*e=='\r'&&e[1]!='\n')||e[1+(*e=='\r')]){fclose(f);return MSX_RESIDENT_ERR_CSV;}*e=0;if(!csv(line,&k,id,&cap,&core,&burst,&g,h)||k!=row+1||!k||k>n||(!cap&&!MSX.GpuCoreOverflow)||core>cap||(g!=2&&g!=4)||cap>(uint32_t)MSX.MaxSegments){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(guard&&g<(uint32_t)guard){fclose(f);return MSX_RESIDENT_ERR_GUARD;}want[0]=0;if(ENgetlinkid((int)k,want)||strcmp(id,want)){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(!row)strcpy(first,h);else if(strcmp(first,h)){fclose(f);return MSX_RESIDENT_ERR_CSV;}if(hash&&hashcmp(h,hash)){fclose(f);return MSX_RESIDENT_ERR_CSV;}row++;}
   if(ferror(f)||row!=n){fclose(f);return MSX_RESIDENT_ERR_CSV;}fclose(f);return MSX_RESIDENT_OK; }
 static MSXResidentStatus pipeok(uint32_t k,Pipe**p){if(!S.open)return MSX_RESIDENT_DISABLED;if(S.poisoned)return MSX_RESIDENT_ERR_POISONED;if(!k||k>S.nlinks)return MSX_RESIDENT_ERR_ARGUMENT;*p=&S.p[k];return MSX_RESIDENT_OK;}
 /* slot layout is [5 scalar + stride c][5 scalar + stride lastc]. */
@@ -62,7 +64,60 @@ static int payloadConcentrationEqual(const Pipe *p,uint32_t s,const MSXResidentP
 static void writePayload(Pipe *p,uint32_t s,const MSXResidentPayload *x)
 { double*r=crow(p,s);uint32_t m;r[0]=x->volume;r[1]=x->hstep;r[2]=x->hresponse;r[3]=x->uresponse;r[4]=x->dresponse;p->id[s]=x->parcelId;for(m=0;m<S.stride;m++){r[5+m]=x->c[m];lrow(p,s)[5+m]=x->lastc[m];} }
 
-MSXResidentStatus MSXresident_open(const char*path){FILE*f;char line[1024],id[EN_MAXID+1],want[EN_MAXID+1],h[65],*e;uint32_t row=0,k,cap,core,burst,guard,base=0;size_t b,n;Pipe*p;if(!path)return MSX_RESIDENT_ERR_ARGUMENT;freestate();f=fopen(path,"rb");if(!f)return MSX_RESIDENT_ERR_CSV;if(!fgets(line,sizeof(line),f))goto bad;e=strpbrk(line,"\r\n");if(!e||strcmp(line,"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n")&&strcmp(line,"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\r\n"))goto bad;S.nlinks=(uint32_t)MSX.Nobjects[LINK];if(!mul((size_t)S.nlinks+1,sizeof(Pipe),&b))goto ov;S.p=(Pipe*)calloc(1,b);if(!S.p)goto mem;while(fgets(line,sizeof(line),f)){e=strpbrk(line,"\r\n");if(!e||(*e=='\r'&&e[1]!='\n')||e[1+( *e=='\r')])goto bad;*e=0;if(!csv(line,&k,id,&cap,&core,&burst,&guard,h)||k!=row+1||!k||k>S.nlinks||!cap||core>cap||(guard!=2&&guard!=4)||cap>(uint32_t)MSX.MaxSegments)goto bad;want[0]=0;if(ENgetlinkid((int)k,want)||strcmp(id,want))goto bad;if(!row)strcpy(S.hash,h);else if(strcmp(S.hash,h))goto bad;if(S.slots>(size_t)UINT32_MAX-cap)goto ov;S.slots+=(size_t)cap;p=&S.p[k];p->d.linkIndex=k;p->d.capacity=cap;p->d.head=p->d.tail=NONE;p->d.orient=1;row++;}fclose(f);if(row!=S.nlinks)goto clean;S.stride=(uint32_t)MSX.Nobjects[SPECIES]+1;if(S.stride>UINT32_MAX-5)goto ov2;S.rowWidth=5+S.stride;if(!mul((size_t)S.nlinks+1,sizeof(uint32_t),&b))goto ov2;S.dirty=(uint32_t*)malloc(b);S.capacity=(uint32_t*)calloc(1,b);S.base=(uint32_t*)calloc(1,b);if(!S.dirty||!S.capacity||!S.base)goto mem2;for(k=0;k<=S.nlinks;k++)S.dirty[k]=NONE;for(k=1;k<=S.nlinks;k++){S.capacity[k]=S.p[k].d.capacity;S.base[k]=base;base+=S.capacity[k];}if(!mul(S.nlinks,sizeof(*S.desc),&b))goto ov2;S.desc=(MSXResidentDescriptorPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.slot),&b))goto ov2;S.slot=(MSXResidentSlotPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.hand),&b))goto ov2;S.hand=(MSXResidentHandoffItem*)calloc(1,b);if(!S.desc||!S.slot||!S.hand)goto mem2;S.tx=(Tx*)calloc((size_t)S.nlinks+1,sizeof(*S.tx));if(!S.tx)goto mem2;for(k=1;k<=S.nlinks;k++){Tx*t=&S.tx[k];p=&S.p[k];t->capacity=p->d.capacity;t->item=(MSXResidentHandoffItem*)calloc(t->capacity,sizeof(*t->item));t->result=(MSXResidentHandoffResult*)calloc(t->capacity,sizeof(*t->result));t->boundary=(Pseg*)calloc(t->capacity,sizeof(*t->boundary));t->c=(double*)calloc((size_t)t->capacity*S.stride,sizeof(*t->c));t->lastc=(double*)calloc((size_t)t->capacity*S.stride,sizeof(*t->lastc));if(!t->item||!t->result||!t->boundary||!t->c||!t->lastc)goto mem2;if(!mul(p->d.capacity,2*(size_t)S.rowWidth,&n)||!mul(n,sizeof(double),&b))goto ov2;p->row=(double*)calloc(1,b);p->used=(unsigned char*)calloc(p->d.capacity,1);p->gen=(uint32_t*)calloc(p->d.capacity,sizeof(uint32_t));p->id=(uint64_t*)calloc(p->d.capacity,sizeof(uint64_t));p->patch=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsI2s=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsKeep=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));if(!p->row||!p->used||!p->gen||!p->id||!p->patch||!p->obsI2s||!p->obsKeep)goto mem2;for(n=0;n<p->d.capacity;n++)p->patch[n]=NONE;}S.open=1;S.mode=MSX_RESIDENT_OFF;return MSX_RESIDENT_OK;bad:fclose(f);clean:freestate();return MSX_RESIDENT_ERR_CSV;ov:fclose(f);freestate();return MSX_RESIDENT_ERR_OVERFLOW;mem:fclose(f);freestate();return MSX_RESIDENT_ERR_MEMORY;ov2:freestate();return MSX_RESIDENT_ERR_OVERFLOW;mem2:freestate();return MSX_RESIDENT_ERR_MEMORY;}
+/* FILE and automatic plans share the same validated fixed layout allocator. */
+uint64_t MSXresident_fixedHostBytes(uint32_t links,uint32_t slots,uint32_t stride)
+{
+ uint64_t l=(uint64_t)links+1,s=slots;
+ return l*(sizeof(Pipe)+5*sizeof(uint32_t)+sizeof(Tx))+
+  (uint64_t)links*sizeof(MSXResidentDescriptorPatch)+
+  s*(sizeof(MSXResidentSlotPatch)+2*sizeof(MSXResidentHandoffItem)+
+     sizeof(MSXResidentHandoffResult)+sizeof(Pseg)+1+4*sizeof(uint32_t)+sizeof(uint64_t)+
+     ((uint64_t)4*stride+10)*sizeof(double));
+}
+MSXResidentStatus MSXresident_openPlan(uint32_t links,const uint32_t *limit,
+                                      const uint32_t *guards,const char *hash)
+{
+ uint32_t k,base=0;size_t b,n;Pipe *p;
+ if(!links||links!=(uint32_t)MSX.Nobjects[LINK]||!limit||!guards||!hashok(hash))
+   return MSX_RESIDENT_ERR_ARGUMENT;
+ freestate();S.nlinks=links;strcpy(S.hash,hash);hashupper(S.hash);
+ if(!mul((size_t)links+1,sizeof(Pipe),&b))goto ov;
+ S.p=(Pipe*)calloc(1,b);if(!S.p)goto mem;
+ for(k=1;k<=links;++k){
+   uint32_t cap=limit[k]?limit[k]:1;
+   if((!limit[k]&&!MSX.GpuCoreOverflow)||limit[k]>(uint32_t)MSX.MaxSegments||
+      (guards[k]!=2&&guards[k]!=4))goto bad;
+   if(S.slots>(size_t)UINT32_MAX-cap)goto ov;
+   S.slots+=cap;p=&S.p[k];p->guard=guards[k];p->admissionLimit=limit[k];
+   p->d.linkIndex=k;p->d.capacity=cap;p->d.head=p->d.tail=NONE;p->d.orient=1;
+ }
+S.stride=(uint32_t)MSX.Nobjects[SPECIES]+1;if(S.stride>UINT32_MAX-5)goto ov;S.rowWidth=5+S.stride;if(!mul((size_t)S.nlinks+1,sizeof(uint32_t),&b))goto ov;S.dirty=(uint32_t*)malloc(b);S.capacity=(uint32_t*)calloc(1,b);S.base=(uint32_t*)calloc(1,b);S.admissionLimit=(uint32_t*)calloc(1,b);if(!S.dirty||!S.capacity||!S.base||!S.admissionLimit)goto mem;for(k=0;k<=S.nlinks;k++)S.dirty[k]=NONE;for(k=1;k<=S.nlinks;k++){S.admissionLimit[k]=S.p[k].admissionLimit;S.capacity[k]=S.p[k].d.capacity;S.base[k]=base;base+=S.capacity[k];}if(!mul(S.nlinks,sizeof(*S.desc),&b))goto ov;S.desc=(MSXResidentDescriptorPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.slot),&b))goto ov;S.slot=(MSXResidentSlotPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.hand),&b))goto ov;S.hand=(MSXResidentHandoffItem*)calloc(1,b);if(!S.desc||!S.slot||!S.hand)goto mem;S.tx=(Tx*)calloc((size_t)S.nlinks+1,sizeof(*S.tx));if(!S.tx)goto mem;for(k=1;k<=S.nlinks;k++){Tx*t=&S.tx[k];p=&S.p[k];t->capacity=p->d.capacity;t->item=(MSXResidentHandoffItem*)calloc(t->capacity,sizeof(*t->item));t->result=(MSXResidentHandoffResult*)calloc(t->capacity,sizeof(*t->result));t->boundary=(Pseg*)calloc(t->capacity,sizeof(*t->boundary));t->c=(double*)calloc((size_t)t->capacity*S.stride,sizeof(*t->c));t->lastc=(double*)calloc((size_t)t->capacity*S.stride,sizeof(*t->lastc));if(!t->item||!t->result||!t->boundary||!t->c||!t->lastc)goto mem;if(!mul(p->d.capacity,2*(size_t)S.rowWidth,&n)||!mul(n,sizeof(double),&b))goto ov;p->row=(double*)calloc(1,b);p->used=(unsigned char*)calloc(p->d.capacity,1);p->gen=(uint32_t*)calloc(p->d.capacity,sizeof(uint32_t));p->id=(uint64_t*)calloc(p->d.capacity,sizeof(uint64_t));p->patch=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsI2s=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsKeep=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));if(!p->row||!p->used||!p->gen||!p->id||!p->patch||!p->obsI2s||!p->obsKeep)goto mem;for(n=0;n<p->d.capacity;n++)p->patch[n]=NONE;}
+ S.open=1;S.mode=MSX_RESIDENT_OFF;return MSX_RESIDENT_OK;
+bad:freestate();return MSX_RESIDENT_ERR_ARGUMENT;
+ov:freestate();return MSX_RESIDENT_ERR_OVERFLOW;
+mem:freestate();return MSX_RESIDENT_ERR_MEMORY;
+}
+MSXResidentStatus MSXresident_open(const char *path)
+{
+ FILE *f;char line[1024],id[EN_MAXID+1],h[65],hash[65],*e;
+ uint32_t k,cap,core,burst,guard,row=0,links=(uint32_t)MSX.Nobjects[LINK];
+ uint32_t *limit=NULL,*guards=NULL;MSXResidentStatus z;
+ freestate();if(!path)return MSX_RESIDENT_ERR_ARGUMENT;z=validatecsv(path,0,NULL);if(z)return z;
+ f=fopen(path,"rb");if(!f)return MSX_RESIDENT_ERR_PATH;
+ limit=(uint32_t*)calloc((size_t)links+1,sizeof(*limit));
+ guards=(uint32_t*)calloc((size_t)links+1,sizeof(*guards));
+ if(!limit||!guards){z=MSX_RESIDENT_ERR_MEMORY;goto done;}
+ if(!fgets(line,sizeof(line),f)){z=MSX_RESIDENT_ERR_CSV;goto done;}
+ while(fgets(line,sizeof(line),f)){
+  e=strpbrk(line,"\r\n");if(e)*e=0;
+  if(!csv(line,&k,id,&cap,&core,&burst,&guard,h)||k!=row+1||k>links){z=MSX_RESIDENT_ERR_CSV;goto done;}
+  limit[k]=cap;guards[k]=guard;strcpy(hash,h);++row;
+ }
+ if(ferror(f)||row!=links){z=MSX_RESIDENT_ERR_CSV;goto done;}
+ z=MSXresident_openPlan(links,limit,guards,hash);
+done:fclose(f);free(limit);free(guards);return z;
+}
+
 void MSXresident_close(void){freestate();}int MSXresident_isOpen(void){return S.open;}void MSXresident_setMode(MSXResidentMode m,int strict){S.mode=m<=MSX_RESIDENT_RESIDENT?m:MSX_RESIDENT_OFF;S.strict=!!strict;}MSXResidentMode MSXresident_mode(void){return S.mode;}
 MSXResidentStatus MSXresident_validateFeatures(int w,int d){if(!S.open)return MSX_RESIDENT_DISABLED;return w?MSX_RESIDENT_ERR_UNSUPPORTED_WALL:d?MSX_RESIDENT_ERR_UNSUPPORTED_DISPERSION:MSX_RESIDENT_OK;}MSXResidentStatus MSXresident_verifyCaseHash(const char*h){char want[65];if(!S.open||!h||!hashok(h))return MSX_RESIDENT_ERR_CASE_HASH;memcpy(want,h,65);hashupper(want);return!strcmp(want,S.hash)?MSX_RESIDENT_OK:MSX_RESIDENT_ERR_CASE_HASH;}
 static MSXResidentStatus checkcsv(const char *path,int guard,const char *want)
@@ -71,7 +126,8 @@ MSXResidentStatus MSXresident_validateConfig(const MSXResidentConfig *c)
 { char want[65]; MSXResidentStatus z;
   if(!c || c->mode<MSX_RESIDENT_OFF || c->mode>MSX_RESIDENT_RESIDENT)return MSX_RESIDENT_ERR_CONFIG;
   if(c->mode==MSX_RESIDENT_OFF)return MSX_RESIDENT_OK;
-  if(!c->capacityFile || !c->capacityFile[0])return MSX_RESIDENT_ERR_PATH;
+  if(MSX.GpuCoreOverflow && c->mode!=MSX_RESIDENT_RESIDENT)return MSX_RESIDENT_ERR_CONFIG;
+  if(!MSX.GpuCoreCapacityMode && (!c->capacityFile || !c->capacityFile[0]))return MSX_RESIDENT_ERR_PATH;
   if(c->guard!=2 && c->guard!=4)return MSX_RESIDENT_ERR_GUARD;
   if(c->segmentStorage!=SEG_STORAGE_HYBRID)return MSX_RESIDENT_ERR_CONFIG;
   if(c->solver!=ROS2 || c->gpuSolver!=ROS2)return MSX_RESIDENT_ERR_SOLVER;
@@ -81,7 +137,9 @@ MSXResidentStatus MSXresident_validateConfig(const MSXResidentConfig *c)
   if(c->hasDispersion)return MSX_RESIDENT_ERR_UNSUPPORTED_DISPERSION;
   if(!c->caseHash || !hashok(c->caseHash))return MSX_RESIDENT_ERR_CASE_HASH;
   memcpy(want,c->caseHash,65);hashupper(want);
-  z=checkcsv(c->capacityFile,c->guard,want);if(z)return z;
+  if(MSX.GpuCoreCapacityMode){
+    if(MSX.GpuCoreCapacityMode!=1||!MSX.GpuCoreOverflow||c->mode!=MSX_RESIDENT_RESIDENT||MSX.GpuCoreCapacityFile[0])return MSX_RESIDENT_ERR_CONFIG;
+  }else{z=checkcsv(c->capacityFile,c->guard,want);if(z)return z;}
   if(S.open)return MSXresident_verifyCaseHash(want);
   return MSX_RESIDENT_OK; }
 MSXResidentStatus MSXresident_observePipe(uint32_t k,const uint64_t*id,const MSXResidentPayload*in,uint32_t count,int32_t orient)
@@ -90,7 +148,7 @@ MSXResidentStatus MSXresident_observePipe(uint32_t k,const uint64_t*id,const MSX
     int topologyChanged = 0;
     if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
     z = pipeok(k, &p); if (z) return z;
-    if ((count && (!id || !in)) || count > p->d.capacity ||
+    if ((count && (!id || !in)) || count > p->admissionLimit ||
         (orient != 1 && orient != -1)) return MSX_RESIDENT_ERR_ARGUMENT;
     i2s = p->obsI2s; keep = p->obsKeep;
     memset(keep, 0, (size_t)p->d.capacity * sizeof(*keep));
@@ -194,7 +252,7 @@ MSXResidentStatus MSXresident_stageInsert(uint32_t k,int side,const MSXResidentP
     if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
     z = pipeok(k, &p); if (z) return z;
     if (find(p, x->parcelId) >= 0) return MSX_RESIDENT_ERR_ARGUMENT;
-    if (p->d.count >= p->d.capacity || p->d.epoch == UINT64_MAX)
+    if (p->d.count >= p->admissionLimit || p->d.epoch == UINT64_MAX)
         return p->d.epoch == UINT64_MAX ? MSX_RESIDENT_ERR_OVERFLOW : MSX_RESIDENT_ERR_CAPACITY;
     if (p->d.count == 0) s = 0;
     else s = side ? nextslot(p, p->d.tail, p->d.orient) : prevslot(p, p->d.head, p->d.orient);
@@ -423,7 +481,7 @@ void MSXresident_testFailAllocationAfter(int64_t allocationIndex){ResidentAlloca
 MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*b){if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;b->descriptor=S.desc;b->descriptorCount=S.ndesc;b->slot=S.slot;b->slotCount=S.nslot;return MSX_RESIDENT_OK;}
 void MSXresident_clearPatches(void)
 { uint32_t i,k,s; if(!S.open)return; for(i=0;i<S.ndesc;i++){k=S.desc[i].linkIndex;if(k&&k<=S.nlinks)S.dirty[k]=NONE;} for(i=0;i<S.nslot;i++){k=S.slot[i].linkIndex;s=S.slot[i].slot;if(k&&k<=S.nlinks&&s<S.p[k].d.capacity)S.p[k].patch[s]=NONE;} S.ndesc=S.nslot=0; }
-MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *o){uint32_t k;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(!S.open||!S.capacity||!S.base)return MSX_RESIDENT_DISABLED;if(!S.guard){S.guard=(uint32_t*)resident_calloc((size_t)S.nlinks+1,sizeof(*S.guard));if(!S.guard)return MSX_RESIDENT_ERR_MEMORY;for(k=1;k<=S.nlinks;k++)S.guard[k]=S.p[k].guard;}o->nLinks=S.nlinks;o->totalSlots=(uint32_t)S.slots;o->speciesStride=S.stride;o->capacity=S.capacity;o->base=S.base;o->guard=S.guard;return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *o){uint32_t k;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(!S.open||!S.capacity||!S.base)return MSX_RESIDENT_DISABLED;if(!S.guard){S.guard=(uint32_t*)resident_calloc((size_t)S.nlinks+1,sizeof(*S.guard));if(!S.guard)return MSX_RESIDENT_ERR_MEMORY;for(k=1;k<=S.nlinks;k++)S.guard[k]=S.p[k].guard;}o->nLinks=S.nlinks;o->totalSlots=(uint32_t)S.slots;o->speciesStride=S.stride;o->capacity=S.capacity;o->base=S.base;o->guard=S.guard;o->admissionLimit=S.admissionLimit;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,uint32_t cap,uint32_t *count)
 { uint32_t k,s,n=0,total=0,base=0; if(!count||(!rows&&cap))return MSX_RESIDENT_ERR_ARGUMENT;*count=0;if(!S.open)return MSX_RESIDENT_DISABLED;
   for(k=1;k<=S.nlinks;k++){Pipe*p=&S.p[k];uint32_t seen=0;if(p->d.count>p->d.capacity||(p->d.count&&p->d.head>=p->d.capacity))return MSX_RESIDENT_ERR_CAPACITY;s=p->d.head;while(seen<p->d.count){if(s>=p->d.capacity||!p->used[s])return MSX_RESIDENT_ERR_GENERATION;if(n>=cap)return MSX_RESIDENT_ERR_CAPACITY;rows[n].linkIndex=k;rows[n].slot=s;rows[n].globalRow=base+s;rows[n].generation=p->gen[s];rows[n].descriptorHead=p->d.head;rows[n].descriptorCount=p->d.count;rows[n].descriptorOrient=p->d.orient;rows[n].descriptorEpoch=p->d.epoch;rows[n].parcelId=p->id[s];rows[n].volume=crow(p,s)[0];n++;seen++;s=(uint32_t)(((int64_t)s+p->d.orient+(int64_t)p->d.capacity)%(int64_t)p->d.capacity);}if(base>UINT32_MAX-p->d.capacity)return MSX_RESIDENT_ERR_OVERFLOW;base+=p->d.capacity;total+=seen;}
@@ -496,6 +554,7 @@ MSXResidentStatus MSXresident_prepareHandoffTransaction(const MSXResidentHandoff
     z = txvalidate(plan, r, n); if (z) return z;
     t = &S.tx[plan->linkIndex];
     if (t->active || n > t->capacity) return MSX_RESIDENT_ERR_CAPACITY;
+    if (MSXsegStorage_hybridEnsureBoundaryPoolFree(n)) return MSX_RESIDENT_ERR_MEMORY;
     /* All mutable transaction rows were allocated in MSXresident_open(). */
     t->active = 1;
     t->plan = *plan; t->plan.item = t->item;

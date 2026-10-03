@@ -9,6 +9,12 @@
 #include "msxresident_runtime.h"
 #include "msxgpu.h"
 #include "msxtypes.h"
+#include "msxresident_capacity.h"
+int MSXgpu_prepareResidentContext(void){return 0;}
+int MSXgpu_openResidentPrograms(void){return 0;}
+int MSXgpu_getResidentProgramMemory(MSXResidentMemoryEstimate *m){memset(m,0,sizeof(*m));return 0;}
+int MSXresidentRuntime_isResident(void){return 0;}
+uint64_t MSXresidentRuntime_fixedHostBytes(uint32_t n,uint32_t s,uint32_t t){(void)n;(void)s;(void)t;return 0;}
 MSXproject MSX; static int pass,fail; static int segmentAllocFail; static uint64_t segmentAllocCalls;
 #define OK(x) do{if(x)pass++;else{fail++;fprintf(stderr,"FAIL:%s:%d: %s\n",__FILE__,__LINE__,#x);}}while(0)
 int ENgetlinkid(int i,char*id){sprintf(id,"L%d",i);return 0;} int ENwriteline(char*s){(void)s;return 0;}
@@ -154,4 +160,136 @@ static void t25(void){char b[512];MSXResidentLayout l;MSXHybridAuditSnapshot s;M
    audit requested them.  The production close path supplies the two inputs;
    this pure predicate keeps the regression independent of stderr capture. */
 static void t26(void){OK(!MSXresidentRuntime_diagnosticSummaryGate(0,0));OK(MSXresidentRuntime_diagnosticSummaryGate(1,0));OK(MSXresidentRuntime_diagnosticSummaryGate(0,1));OK(MSXresidentRuntime_diagnosticSummaryGate(1,1));}
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+/* Arbitrarily undersized FILE plans retain every independent parcel and
+   its adaptive solver state; zero admission still reserves one physical row. */
+static void t_cpu_spill(void)
+{
+ char b[512]; int cap,i,mode; MSXResidentLayout l;
+ for(mode=0;mode<=1;++mode) for(cap=0;cap<=6;++cap) {
+  Pseg prev=NULL,first,s; uint64_t id=2000; int count=0,cores=0;
+  setup(1,1);MSX.SegmentStorage=SEG_STORAGE_HYBRID;MSX.GpuCoreOverflow=mode;
+  onecsv(b,sizeof(b),UP,(uint32_t)cap);csv("resident_phase2a.csv",b);
+  if(!mode&&!cap){OK(MSXresident_open("resident_phase2a.csv")==MSX_RESIDENT_ERR_CSV);continue;}
+  OK(MSXresident_open("resident_phase2a.csv")==0);
+  MSXresident_setMode(MSX_RESIDENT_RESIDENT,1);
+  OK(MSXresident_getLayout(&l)==0&&l.capacity[1]==(uint32_t)(cap?cap:1)&&l.admissionLimit[1]==(uint32_t)cap);
+  OK(MSXsegStorage_open()==0&&MSXsegStorage_hybridReserve(&l)==0);
+  for(i=0;i<10;++i){s=fseg(i+1,id+i);s->hstep=7;s->hresponse=8;s->uresponse=9;s->dresponse=10;
+   s->next=prev;if(prev)prev->prev=s;else MSX.FirstSeg[1]=s;prev=s;MSX.LastSeg[1]=s;++MSX.Link[1].nsegs;}
+  first=MSX.FirstSeg[1];OK(MSXresident_beginInitialImage()==0);
+  if(!mode&&cap<6){OK(MSXsegStorage_hybridPrepareInitialImage()==ERR_PIPE_RING_CAPACITY&&MSX.FirstSeg[1]==first&&MSXsegStorage_hybridCoreCount(1)==0);continue;}
+  OK(MSXsegStorage_hybridPrepareInitialImage()==0&&MSXsegStorage_hybridStageInitialImage()==0);
+  OK(MSXsegStorage_hybridCommitInitialImage()==0&&MSXresident_commitInitialImage()==0);
+  OK(MSXsegStorage_hybridCoreCount(1)==cap);
+  OK(MSXsegStorage_hybridizeAll()==0&&MSXsegStorage_hybridCoreCount(1)==cap);
+  for(s=MSX.FirstSeg[1];s;s=s->prev,++count){OK(s->hybridId==id+count&&s->v==count+1&&s->hstep==7&&s->hresponse==8&&s->uresponse==9&&s->dresponse==10);cores+=s->inHybridCore?1:0;}
+  OK(count==10&&cores==cap&&MSX.Link[1].nsegs==10);
+ }
+}
+/* Historical leases can exceed GPU slots. Failed growth leaves the old
+   free-list and object addresses usable, then successful growth reuses them. */
+static void t_cpu_pool_growth(void)
+{
+ char b[512];MSXResidentLayout l;Pseg held[260]={0},q=NULL;int i;
+ setup(1,1);MSX.SegmentStorage=SEG_STORAGE_HYBRID;MSX.GpuCoreOverflow=1;
+ onecsv(b,sizeof(b),UP,1);csv("resident_phase2a.csv",b);OK(MSXresident_open("resident_phase2a.csv")==0);
+ MSXresident_setMode(MSX_RESIDENT_RESIDENT,1);OK(MSXsegStorage_open()==0&&MSXresident_getLayout(&l)==0&&MSXsegStorage_hybridReserve(&l)==0);
+ OK(MSXsegStorage_hybridAcquireBoundary(&held[0])==0);
+ segmentAllocFail=1;OK(MSXsegStorage_hybridEnsureBoundaryPoolFree(2)==ERR_MEMORY&&MSXsegStorage_hybridCpuPoolGrowthCount()==0);
+ segmentAllocFail=0;OK(MSXsegStorage_hybridEnsureBoundaryPoolFree(259)==0&&MSXsegStorage_hybridCpuPoolGrowthCount()==1);
+ for(i=1;i<260;++i)OK(MSXsegStorage_hybridAcquireBoundary(&held[i])==0&&held[i]!=held[0]);
+ for(i=0;i<260;++i)OK(MSXsegStorage_hybridReleaseBoundary(held[i])==1);
+ OK(MSXsegStorage_hybridAcquireBoundary(&q)==0&&q==held[259]);OK(MSXsegStorage_hybridReleaseBoundary(q)==1);
+ OK(MSXsegStorage_hybridCpuPoolGrowthCount()==1);
+}
+static void t_predictor(void)
+{
+ int64_t a,b,step,minimum;uint64_t count,oracle;MSXResidentCapacityPipe p;
+ /* Independent enumeration of the grid/event union, including short events. */
+ for(step=1;step<=37;step+=3)for(a=0;a<80;a+=7)for(b=a;b<120;b+=11){
+  int64_t now=a,next,shortest=b-a;oracle=0;
+  while(now<b){next=(now/step+1)*step;if(next>b)next=b;
+   if(next-now<shortest)shortest=next-now;now=next;++oracle;}
+  OK(MSXresidentCapacity_interval(a,b,step,&count,&minimum)&&count==oracle&&minimum==(oracle?shortest:0));
+ }
+ OK(MSXresidentCapacity_interval(100000,500000,150000,&count,&minimum)&&count==4&&minimum==50000);
+ OK(!MSXresidentCapacity_interval(-1,10,2,&count,&minimum));
+ memset(&p,0,sizeof(p));p.volume=100;p.initial=100;p.guard=2;
+ OK(MSXresidentCapacity_predict(&p,5000)&&p.requested==96&&p.upper==100);
+ p.positiveSteps=576;p.vmin=1e-300;
+ OK(MSXresidentCapacity_predict(&p,5000)&&p.predicted==676&&p.requested==672);
+ p.positiveSteps=UINT64_MAX;
+ OK(MSXresidentCapacity_predict(&p,5000)&&p.upper==5000&&p.requested==4996);
+ p.positiveSteps=1;p.vmin=1e300;
+ OK(MSXresidentCapacity_predict(&p,5000)&&p.predicted==100&&p.requested==97);
+ p.vmin=0;OK(!MSXresidentCapacity_predict(&p,5000));
+ p.positiveSteps=0;p.initial=2;
+ OK(MSXresidentCapacity_predict(&p,2)&&p.requested==0);
+}
+static void t_hyd_scan(void)
+{
+ FILE *f;INT4 header[8]={MAGICNUMBER,20012,1,1,0,0,0,500};
+ INT4 time[4]={0,100,200,500},step[4]={100,100,300,0};
+ REAL4 values[5]={0,1,1,1,0},oldQ[2]={0,123};MSXResidentCapacityPipe p;int i;
+ setup(1,1);MSX.Nobjects[NODE]=1;MSX.GpuCoreCapacityMode=1;
+ MSX.GpuCoreMode=MSX_RESIDENT_RESIDENT;MSX.GpuCoreOverflow=1;MSX.GpuCoreGuard=2;
+ MSX.Qstep=150000;MSX.Dur=500000;MSX.HydOffset=sizeof(header);
+ MSX.Link[1].len=100;MSX.Link[1].diam=1;MSX.Q=oldQ;MSX.Qtime=77;MSX.Htime=88;
+ strcpy(MSX.HydFile.name,"test_capacity.hyd");strcpy(MSX.InpFileName,"test_capacity.inp");strcpy(MSX.MsxFile.name,"test_capacity.msx");
+ csv(MSX.InpFileName,"fixture");csv(MSX.MsxFile.name,"fixture");
+ f=fopen(MSX.HydFile.name,"wb");fwrite(header,sizeof(header),1,f);
+ for(i=0;i<4;++i){values[2]=i==1?0:i==2?-2:1;
+  fwrite(&time[i],sizeof(time[i]),1,f);fwrite(values,sizeof(values),1,f);fwrite(&step[i],sizeof(step[i]),1,f);}
+ fputc(0x1a,f);fclose(f);MSX.HydFile.file=fopen(MSX.HydFile.name,"rb");fseek(MSX.HydFile.file,7,SEEK_SET);
+ OK(MSXresidentCapacity_prepare()==0&&ftell(MSX.HydFile.file)==7&&MSX.Q[1]==123&&MSX.Qtime==77&&MSX.Htime==88);
+ OK(MSXresidentCapacity_getPrediction(1,&p)&&p.initial==16&&p.positiveSteps==4&&p.reversals==1&&p.zeroMs==100000&&p.vmin==100);
+ fclose(MSX.HydFile.file);MSX.HydFile.file=NULL;
+ /* Valid EPANET final hydraulic step may extend beyond quality Duration. */
+ header[7]=400;MSX.Dur=400000;
+ f=fopen(MSX.HydFile.name,"r+b");fwrite(header,sizeof(header),1,f);fclose(f);
+ OK(MSXresidentCapacity_prepare()==0);
+ OK(MSXresidentCapacity_getPrediction(1,&p)&&p.positiveSteps==3&&p.vmin==100);
+ header[7]=500;MSX.Dur=500000;
+ f=fopen(MSX.HydFile.name,"r+b");fwrite(header,sizeof(header),1,f);fclose(f);
+ /* A backwards time and a truncated record must fail without moving the
+    existing reader or accepting default flows. */
+ f=fopen(MSX.HydFile.name,"r+b");time[1]=99;fseek(f,(long)sizeof(header)+sizeof(INT4)+sizeof(values)+sizeof(INT4),SEEK_SET);fwrite(&time[1],sizeof(INT4),1,f);fclose(f);
+ MSX.HydFile.file=fopen(MSX.HydFile.name,"rb");fseek(MSX.HydFile.file,9,SEEK_SET);
+ OK(MSXresidentCapacity_prepare()==ERR_READ_HYD_FILE&&ftell(MSX.HydFile.file)==9&&oldQ[1]==123&&MSX.Qtime==77);
+ fclose(MSX.HydFile.file);MSX.HydFile.file=NULL;
+ csv(MSX.HydFile.name,"truncated");OK(MSXresidentCapacity_prepare()==ERR_READ_HYD_FILE);
+ MSXresidentCapacity_close();remove(MSX.HydFile.name);remove(MSX.InpFileName);remove(MSX.MsxFile.name);
+}
+static void t_host_size_ledger(void)
+{
+ uint32_t limit[3]={0,2,3},guard[3]={0,2,4};MSXResidentLayout layout;
+ uint64_t coreBefore,hybridBefore;int stride;
+ for(stride=2;stride<=18;stride+=4){
+  setup(stride-1,2);MSX.SegmentStorage=SEG_STORAGE_HYBRID;
+  coreBefore=MSXresident_testAllocationBytes();
+  OK(MSXresident_openPlan(2,limit,guard,UP)==0&&MSXresident_getLayout(&layout)==0);
+  OK(MSXresident_testAllocationBytes()-coreBefore==MSXresident_fixedHostBytes(2,5,(uint32_t)stride));
+  hybridBefore=MSXsegStorage_testAllocationBytes();
+  OK(MSXsegStorage_open()==0&&MSXsegStorage_hybridReserve(&layout)==0);
+  /* Fake CPU allocator's five pool objects are external to storage.c. */
+  OK(MSXsegStorage_testAllocationBytes()-hybridBefore+
+     5*(sizeof(struct Sseg)+(uint64_t)2*stride*sizeof(double))==
+     MSXsegStorage_hybridFixedHostBytes(2,5,(uint32_t)stride));
+ }
+}
+static void t_retry_identities(void)
+{
+ Pseg initial,fresh;uint64_t identity;
+ setup(1,1);MSX.SegmentStorage=SEG_STORAGE_HYBRID;
+ OK(MSXsegStorage_open()==0);
+ initial=fseg(1,0);MSX.FirstSeg[1]=MSX.LastSeg[1]=initial;MSX.Link[1].nsegs=1;
+ MSXsegStorage_hybridAssignIdentity(1,initial);identity=initial->hybridId;
+ OK(identity!=0&&MSXsegStorage_hybridResetUncommitted()==0);
+ OK(MSX.FirstSeg[1]==initial&&initial->hybridId==identity);
+ fresh=fseg(1,0);MSXsegStorage_hybridAssignIdentity(1,fresh);
+ OK(fresh->hybridId>identity);
+ initial->inHybridCore=1;
+ OK(MSXsegStorage_hybridResetUncommitted()==ERR_PIPE_RING_CAPACITY);
+ initial->inHybridCore=0;MSXqual_removeSeg(fresh);
+}
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t_cpu_spill();t_cpu_pool_growth();t_predictor();t_hyd_scan();t_host_size_ledger();t_retry_identities();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}

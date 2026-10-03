@@ -2,6 +2,7 @@
 #define MSXRESIDENT_RUNTIME_H
 
 #include "msxresident_core.h"
+uint64_t MSXresidentRuntime_fixedHostBytes(uint32_t,uint32_t,uint32_t);
 #include "msxresident_core_cuda.h"
 #include "msxgpu.h"
 
