@@ -16,8 +16,12 @@
 */
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <limits.h>
 
 #include "mempool.h"
+#include "msxresident_budget.h"
 
 /*
 **  ALLOC_BLOCK_SIZE - adjust this size to suit your installation - it
@@ -36,6 +40,7 @@ typedef struct alloc_hdr_s
     char               *block,  /* Start of block      */
                        *free,   /* Next free in block  */
                        *end;    /* block + block size  */
+    MSXBudgetAllocation backing;
 }  alloc_hdr_t;
 
 /*
@@ -46,6 +51,10 @@ typedef struct alloc_root_s
 {
     alloc_hdr_t *first,    /* First header in pool */
                 *current;  /* Current header       */
+    AllocPoolStats stats;
+    FILE *audit;
+    MSXBudgetAllocation backing;
+    char owner[24];
 }  alloc_root_t;
 
 /*
@@ -53,6 +62,23 @@ typedef struct alloc_root_s
 */
 
 static alloc_root_t *root;
+static uint64_t nextPoolId;
+
+static void auditPool(alloc_root_t *pool, const char *event)
+{
+    AllocPoolStats *s = &pool->stats;
+    if (!pool->audit) return;
+    fprintf(pool->audit, "%llu,%s,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+        (unsigned long long)s->poolId, pool->owner, event,
+        (unsigned long long)s->blockCount, (unsigned long long)s->backingBytes,
+        (unsigned long long)s->peakBackingBytes,
+        (unsigned long long)s->allocationCalls, (unsigned long long)s->requestedBytes,
+        (unsigned long long)s->alignedBytes, (unsigned long long)s->resetCount,
+        (unsigned long long)s->failedAllocations);
+    /* Multiple pools share the audit file; flush before another handle opens
+       it so the header and event ordering remain unambiguous. Audit only. */
+    fflush(pool->audit);
+}
 
 
 /*
@@ -61,21 +87,48 @@ static alloc_root_t *root;
 **  Private routine to allocate a header and memory block.
 */
 
-static alloc_hdr_t *AllocHdr(void);
+static alloc_hdr_t *AllocHdr(alloc_root_t *pool);
                 
-static alloc_hdr_t * AllocHdr()
+static alloc_hdr_t * AllocHdr(alloc_root_t *pool)
 {
     alloc_hdr_t     *hdr;
     char            *block;
+    MSXBudgetTicket ticket = {0};
+    MSXResidentBudget *budget = MSXresidentBudget_global();
+
+    if (MSXresidentBudget_reserve(budget, MSX_MEMORY_PAGEABLE,
+            ALLOC_BLOCK_SIZE + sizeof(*hdr), &ticket) != MSX_BUDGET_OK)
+    {
+        ++pool->stats.failedAllocations;
+        auditPool(pool, "block_budget_rejected");
+        return NULL;
+    }
 
     block = (char *) malloc(ALLOC_BLOCK_SIZE);
     hdr   = (alloc_hdr_t *) malloc(sizeof(alloc_hdr_t));
 
-    if (hdr == NULL || block == NULL) return(NULL);
+    if (hdr == NULL || block == NULL)
+    {
+        free(hdr);
+        free(block);
+        MSXresidentBudget_cancelReservation(budget, &ticket);
+        ++pool->stats.failedAllocations;
+        auditPool(pool, "block_failed");
+        return(NULL);
+    }
     hdr->block = block;
     hdr->free  = block;
     hdr->next  = NULL;
     hdr->end   = block + ALLOC_BLOCK_SIZE;
+    memset(&hdr->backing, 0, sizeof(hdr->backing));
+    MSXresidentBudget_commitAllocation(budget, &ticket,
+        ALLOC_BLOCK_SIZE + sizeof(*hdr), &hdr->backing);
+    MSXresidentBudget_auditAllocation(budget, &hdr->backing, pool->owner, __LINE__, ALLOC_BLOCK_SIZE);
+
+    ++pool->stats.blockCount;
+    pool->stats.backingBytes += ALLOC_BLOCK_SIZE + sizeof(alloc_hdr_t);
+    pool->stats.peakBackingBytes = pool->stats.backingBytes;
+    auditPool(pool, "block_allocated");
 
     return(hdr);
 }
@@ -89,15 +142,56 @@ static alloc_hdr_t * AllocHdr()
 */
 
 alloc_handle_t * AllocInit()
-{
-    alloc_handle_t *newpool;
+{ return AllocInitNamed("unspecified"); }
 
-    root = (alloc_root_t *) malloc(sizeof(alloc_root_t));
-    if (root == NULL) return(NULL);
-    if ( (root->first = AllocHdr()) == NULL) return(NULL);
-    root->current = root->first;
-    newpool = (alloc_handle_t *) root;
-    return(newpool);
+alloc_handle_t * AllocInitNamed(const char *owner)
+{
+    alloc_root_t *pool;
+    MSXBudgetTicket ticket = {0};
+    MSXResidentBudget *budget = MSXresidentBudget_global();
+    const char *audit = getenv("MSX_RESIDENT_MEMORY_AUDIT");
+    if (MSXresidentBudget_reserve(budget, MSX_MEMORY_PAGEABLE,
+            sizeof(*pool), &ticket) != MSX_BUDGET_OK) return NULL;
+    pool = (alloc_root_t *)calloc(1, sizeof(*pool));
+    if (!pool)
+    {
+        MSXresidentBudget_cancelReservation(budget, &ticket);
+        return NULL;
+    }
+    MSXresidentBudget_commitAllocation(budget, &ticket, sizeof(*pool), &pool->backing);
+    /* Labels are fixed identifiers, not arbitrary CSV text. */
+    if (owner && strlen(owner)<sizeof(pool->owner) && !strpbrk(owner,",\r\n"))
+        strcpy(pool->owner,owner);
+    else strcpy(pool->owner,"unspecified");
+    MSXresidentBudget_auditAllocation(budget, &pool->backing, pool->owner, __LINE__, sizeof(*pool));
+    pool->stats.poolId = ++nextPoolId;
+    pool->stats.backingBytes = pool->stats.peakBackingBytes = sizeof(*pool);
+    if (audit && !strcmp(audit, "1"))
+    {
+        long length;
+        pool->audit = fopen("resident_pool_backing.csv", "a+");
+        if (pool->audit)
+        {
+            fseek(pool->audit, 0, SEEK_END);
+            length = ftell(pool->audit);
+            if (length == 0) fprintf(pool->audit,
+                "pool_id,owner,event,block_count,backing_bytes,peak_backing_bytes,allocation_calls,requested_bytes,aligned_bytes,reset_count,failed_allocations\n");
+        }
+    }
+    auditPool(pool, "pool_created");
+    if ((pool->first = AllocHdr(pool)) == NULL)
+    {
+        MSXBudgetAllocation backing = pool->backing;
+        pool->stats.backingBytes = 0;
+        auditPool(pool, "pool_released");
+        if (pool->audit) fclose(pool->audit);
+        free(pool);
+        MSXresidentBudget_releaseAllocation(budget, &backing);
+        return NULL;
+    }
+    pool->current = pool->first;
+    root = pool;
+    return (alloc_handle_t *)pool;
 }
 
 
@@ -110,21 +204,31 @@ alloc_handle_t * AllocInit()
 
 char * Alloc(long size)
 {
-    alloc_hdr_t  *hdr = root->current;
+    alloc_hdr_t  *hdr;
     char         *ptr;
+    long requested = size;
+    if (!root) return NULL;
+    /* Reject invalid/oversize requests before pointer arithmetic. This pool
+       uses fixed-size blocks and cannot safely serve a larger object. */
+    if (size <= 0 || size > ALLOC_BLOCK_SIZE || size > LONG_MAX - 3)
+    {
+        ++root->stats.failedAllocations;
+        auditPool(root, "request_rejected");
+        return NULL;
+    }
+    hdr = root->current;
 
     /*
     **  Align to 4 byte boundary - should be ok for most machines.
     **  Change this if your machine has weird alignment requirements.
     */
-    size = (size + 3) & 0xfffffffc;
+    size = (size + 3) & ~3L;
 
     ptr = hdr->free;
-    hdr->free += size;
 
     /* Check if the current block is exhausted. */
 
-    if (hdr->free >= hdr->end)
+    if ((size_t)size > (size_t)(hdr->end - hdr->free))
     {
         /* Is the next block already allocated? */
 
@@ -137,7 +241,7 @@ char * Alloc(long size)
         else
         {
             /* extend the pool with a new block */
-            if ( (hdr->next = AllocHdr()) == NULL) return(NULL);
+            if ( (hdr->next = AllocHdr(root)) == NULL) return(NULL);
             root->current = hdr->next;
         }
 
@@ -145,6 +249,11 @@ char * Alloc(long size)
         ptr = root->current->free;
         root->current->free += size;
     }
+    else hdr->free += size;
+
+    ++root->stats.allocationCalls;
+    root->stats.requestedBytes += (uint64_t)requested;
+    root->stats.alignedBytes += (uint64_t)size;
 
     /* Return pointer to allocated memory. */
 
@@ -175,8 +284,18 @@ alloc_handle_t * AllocSetPool(alloc_handle_t *newpool)
 
 void  AllocReset()
 {
+    if (!root) return;
     root->current = root->first;
     root->current->free = root->current->block;
+    ++root->stats.resetCount;
+    auditPool(root, "pool_reset_retained");
+}
+
+int AllocGetPoolStats(alloc_handle_t *pool, AllocPoolStats *stats)
+{
+    if (!pool || !stats) return 0;
+    *stats = ((alloc_root_t *)pool)->stats;
+    return 1;
 }
 
 
@@ -189,16 +308,27 @@ void  AllocReset()
 
 void  AllocFreePool()
 {
-    alloc_hdr_t  *tmp,
-                 *hdr = root->first;
+    alloc_hdr_t  *tmp, *hdr;
+    if (!root) return;
+    hdr = root->first;
+    auditPool(root, "pool_release_begin");
 
     while (hdr != NULL)
     {
+        MSXBudgetAllocation backing = hdr->backing;
         tmp = hdr->next;
         free((char *) hdr->block);
         free((char *) hdr);
+        MSXresidentBudget_releaseAllocation(MSXresidentBudget_global(), &backing);
         hdr = tmp;
     }
-    free((char *) root);
+    root->stats.blockCount = root->stats.backingBytes = 0;
+    auditPool(root, "pool_released");
+    if (root->audit) fclose(root->audit);
+    {
+        MSXBudgetAllocation backing = root->backing;
+        free((char *) root);
+        MSXresidentBudget_releaseAllocation(MSXresidentBudget_global(), &backing);
+    }
     root = NULL;
 }

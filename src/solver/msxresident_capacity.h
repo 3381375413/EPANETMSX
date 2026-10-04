@@ -1,6 +1,7 @@
 #ifndef MSXRESIDENT_CAPACITY_H
 #define MSXRESIDENT_CAPACITY_H
 #include "msxresident_core_cuda.h"
+MSXResidentStatus MSXresidentCapacity_memoryConfig(MSXResidentMemoryConfig *);
 typedef struct {
  double volume,qmin,qmax,vmin;
  uint64_t positiveSteps,zeroMs,reversals;

@@ -11,9 +11,13 @@
 #include "msxresident_capacity.h"
 #include "msxresident_runtime.h"
 #include "msxresident_hash.h"
+#include "msxresident_memory_config.h"
 #include "msxsegment_storage.h"
 #include "msxqual_shared.h"
 #include "epanet2.h"
+#include "msxresident_alloc.h"
+#define calloc(n,w) MSXresidentAlloc_calloc(n,w,__FILE__,__LINE__)
+#define free(p) MSXresidentAlloc_free(p)
 extern MSXproject MSX;
 int MSXResidentCapacityAuditEnabled;
 typedef struct { uint64_t id; unsigned char owner,seen; } AuditParcel;
@@ -32,6 +36,7 @@ static struct {
  Usage *usage;
  uint64_t hostAvailable,deviceBudget,hostBudget,initialBytes;
  MSXResidentMemoryEstimate memory;
+ MSXResidentMemoryConfig memoryConfig;
  MSXResidentMemoryEstimate programMemory;
  char hydHash[65],inpHash[65],msxHash[65];
  double scanMs,budgetMs;
@@ -161,10 +166,16 @@ memory:MSX.ErrCode=ERR_MEMORY;goto done;
 bad:MSX.ErrCode=ERR_READ_HYD_FILE;
 done:if(f)fclose(f);free(q);MSXresidentCapacity_close();return MSX.ErrCode;
 }
+MSXResidentStatus MSXresidentCapacity_memoryConfig(MSXResidentMemoryConfig *c)
+{
+ if(!c)return MSX_RESIDENT_ERR_ARGUMENT;
+ if(Plan.memoryConfig.version){*c=Plan.memoryConfig;return MSX_RESIDENT_OK;}
+ return MSXresidentGpu_residentMemoryConfig(c);
+}
 static int fits(uint64_t slots,MSXResidentMemoryEstimate *memory)
 {
  uint64_t host;
- if(slots>UINT32_MAX||MSXresidentGpu_estimateMemory(Plan.links,(uint32_t)slots,Plan.stride,memory)!=MSX_RESIDENT_OK)return 0;
+ if(slots>UINT32_MAX||MSXresidentGpu_estimateConfigured(Plan.links,(uint32_t)slots,Plan.stride,&Plan.memoryConfig,memory)!=MSX_RESIDENT_OK)return 0;
  memory->deviceBytes+=Plan.programMemory.deviceBytes;
  memory->pinnedBytes+=Plan.programMemory.pinnedBytes;
  memory->hostBytes+=Plan.programMemory.hostBytes;
@@ -189,6 +200,7 @@ MSXResidentStatus MSXresidentCapacity_openPlan(const char *caseHash)
  uint64_t freeDevice,slots=0;uint32_t k,lo=0,hi=0;int extras;
  MSXResidentMemoryEstimate memory;MSXResidentStatus status;double start=MSXgpu_wallTimeMs();
  if(!Plan.pipe||!caseHash)return MSX_RESIDENT_ERR_CONFIG;
+ status=MSXresidentGpu_residentMemoryConfig(&Plan.memoryConfig);if(status)return status;
  if(MSXgpu_prepareResidentContext())return MSX_RESIDENT_ERR_GPU;
  {int error=MSXgpu_openResidentPrograms();
   if(error)return error==ERR_MEMORY||error==ERR_GPU_MEMORY_ALLOCATION_FAILED?MSX_RESIDENT_ERR_MEMORY:MSX_RESIDENT_ERR_GPU;}
@@ -196,6 +208,8 @@ MSXResidentStatus MSXresidentCapacity_openPlan(const char *caseHash)
  status=MSXresidentGpu_availableMemory(&freeDevice);if(status)return status;
  start=MSXgpu_wallTimeMs(); /* Context startup is separate from prediction. */
  if(!Plan.retries){Plan.deviceBudget=((freeDevice+Plan.programMemory.deviceBytes)/5)*4;Plan.hostBudget=Plan.hostAvailable/2;}
+ if(!Plan.retries){const char *budget=getenv("MSX_RESIDENT_HOST_BUDGET_BYTES");uint64_t bytes;
+  if(budget){if(!MSXresident_parseBytes(budget,&bytes)||!bytes)return MSX_RESIDENT_ERR_CONFIG;Plan.hostBudget=bytes;}}
  if(!Plan.retries&&MSX.GpuCoreMemoryMB>0){double bytes=MSX.GpuCoreMemoryMB*1048576.0;
   if(bytes<(double)Plan.deviceBudget)Plan.deviceBudget=(uint64_t)bytes;}
  for(k=1;k<=Plan.links;++k){slots+=Plan.pipe[k].requested?Plan.pipe[k].requested:1;hi=MAX(hi,Plan.pipe[k].requested);}
@@ -219,9 +233,9 @@ MSXResidentStatus MSXresidentCapacity_openPlan(const char *caseHash)
  if(status==MSX_RESIDENT_OK){
   FILE *f=fopen("resident_capacity_prediction.csv","wb");char id[EN_MAXID+1];
   if(!f)return MSX_RESIDENT_ERR_PATH;
-  fputs("link_index,link_id,volume,N0,guard,Qmin,Qmax,vmin,K_positive,zero_ms,reversals,U,predicted,requested,admissionLimit,capacity,clipped\n",f);
-  for(k=1;k<=Plan.links;++k){MSXResidentCapacityPipe *p=&Plan.pipe[k];ENgetlinkid((int)k,id);
-   fprintf(f,"%u,%s,%.17g,%u,%u,%.17g,%.17g,%.17g,%llu,%llu,%llu,%u,%u,%u,%u,%u,%s\n",k,id,p->volume,p->initial,p->guard,p->qmin,p->qmax,p->vmin,(unsigned long long)p->positiveSteps,(unsigned long long)p->zeroMs,(unsigned long long)p->reversals,p->upper,p->predicted,p->requested,p->admission,p->admission?p->admission:1,p->admission<p->requested?"budget":"none");
+  fputs("link_index,link_id,volume,N0,guard,Qmin,Qmax,vmin,K_positive,zero_ms,reversals,U,predicted,requested,admissionLimit,capacity,clipped,initial_core_required,initial_core_admitted,initial_shortfall\n",f);
+  for(k=1;k<=Plan.links;++k){MSXResidentCapacityPipe *p=&Plan.pipe[k];uint32_t initial=p->initial>2*p->guard?p->initial-2*p->guard:0;ENgetlinkid((int)k,id);
+   fprintf(f,"%u,%s,%.17g,%u,%u,%.17g,%.17g,%.17g,%llu,%llu,%llu,%u,%u,%u,%u,%u,%s,%u,%u,%u\n",k,id,p->volume,p->initial,p->guard,p->qmin,p->qmax,p->vmin,(unsigned long long)p->positiveSteps,(unsigned long long)p->zeroMs,(unsigned long long)p->reversals,p->upper,p->predicted,p->requested,p->admission,p->admission?p->admission:1,p->admission<p->requested?"budget":"none",initial,MIN(initial,p->admission),initial-MIN(initial,p->admission));
   }if(ferror(f)){fclose(f);return MSX_RESIDENT_ERR_PATH;}fclose(f);
   f=fopen("resident_capacity_summary.json","wb");if(!f)return MSX_RESIDENT_ERR_PATH;
   fprintf(f,"{\n \"prediction_version\":\"hyd_minflow_v1\",\n \"inp_sha256\":\"%s\",\n \"msx_sha256\":\"%s\",\n \"hyd_sha256\":\"%s\",\n \"runtime_hash_reference\":\"runtime_manifest.csv\",\n \"Q_STAGNANT_cfs\":%.17g,\n \"quality_step_ms\":%lld,\n \"duration_ms\":%lld,\n \"device_budget_bytes\":%llu,\n \"host_budget_bytes\":%llu,\n \"device_array_bytes\":%llu,\n \"pinned_array_bytes\":%llu,\n \"host_array_bytes_including_initial_parcels\":%llu,\n \"hyd_statistics_ms\":%.9g,\n \"prediction_budget_ms\":%.9g,\n \"gpu_slots\":%u,\n \"gpu_capacity_growth_count\":0,\n \"startup_retries\":%d,\n \"ownership_policy\":\"contiguous_core_cpu_overflow\"\n}\n",Plan.inpHash,Plan.msxHash,Plan.hydHash,MSX_Q_STAGNANT,(long long)MSX.Qstep,(long long)MSX.Dur,(unsigned long long)Plan.deviceBudget,(unsigned long long)Plan.hostBudget,(unsigned long long)Plan.memory.deviceBytes,(unsigned long long)Plan.memory.pinnedBytes,(unsigned long long)Plan.memory.hostBytes,Plan.scanMs,Plan.budgetMs,Plan.slots,Plan.retries);

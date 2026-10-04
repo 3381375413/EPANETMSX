@@ -8,15 +8,20 @@
 #include "msxgpu.h"
 #include "msxtypes.h"
 #include "msxresident_capacity.h"
+#include "msxresident_alloc.h"
+#define free(p) MSXresidentAlloc_free(p)
 
 extern MSXproject MSX;
 
 typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; MSXResidentGpu *gpu;
+    int auditMemory;
+    uint32_t peakPatchRows, peakImportRows, peakDescriptors;
+    uint32_t peakHandoffRows, peakMaterializeRows, peakSelectedRows;
     uint64_t wouldDescriptors, wouldSlots, stale, fallbacks; MSXResidentStatus lastStatus;
     MSXResidentActiveRow *rows; double *pipeHyd;
     uint32_t activeCap, stride;
     MSXResidentHandoffPlan *plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *out;
-    double *c,*lastc; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
+    MSXResidentHandoffTarget *targets; MSXResidentHandoffTransaction *tx; unsigned char *fallback;
     uint32_t *offset; uint32_t itemCap, itemCount;
     double handoffPlanMs;
     int auditPoisonCpuMirrors, auditAggregateFail, auditHyd, inFlight;
@@ -27,13 +32,35 @@ typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; 
     MSXResidentRuntimeToken flight;
     char status[96], resolvedCapacity[MAXFNAME]; } Runtime;
 static Runtime R;
+static void auditPatchDemand(const MSXResidentPatchBatch *b)
+{
+    uint32_t i,imports=0;
+    if(!R.auditMemory)return;
+    for(i=0;i<b->slotCount;++i)
+        if(b->slot[i].used && b->slot[i].kind==MSX_RESIDENT_PATCH_IMPORT)++imports;
+    if(b->slotCount>R.peakPatchRows)R.peakPatchRows=b->slotCount;
+    if(imports>R.peakImportRows)R.peakImportRows=imports;
+    if(b->descriptorCount>R.peakDescriptors)R.peakDescriptors=b->descriptorCount;
+}
+static void writeMemoryDemand(void)
+{
+    FILE *f;
+    if(!R.auditMemory)return;
+    f=fopen("resident_transaction_demand.csv","a+");if(!f)return;
+    fseek(f,0,SEEK_END);
+    if(ftell(f)==0)fprintf(f,"peak_patch_rows,peak_import_rows,peak_descriptors,peak_handoff_rows,peak_materialize_rows,peak_selected_rows\n");
+    fprintf(f,"%u,%u,%u,%u,%u,%u\n",R.peakPatchRows,R.peakImportRows,R.peakDescriptors,
+        R.peakHandoffRows,R.peakMaterializeRows,R.peakSelectedRows);
+    fclose(f);
+}
 uint64_t MSXresidentRuntime_fixedHostBytes(uint32_t links,uint32_t slots,uint32_t stride)
 {
  uint64_t l=(uint64_t)links+1,s=slots;
- return l*(MSX_RESIDENT_HYD_STRIDE*sizeof(double)+sizeof(MSXResidentHandoffPlan)+
+ return 9*MSXresidentAlloc_headerBytes()+
+   l*(MSX_RESIDENT_HYD_STRIDE*sizeof(double)+sizeof(MSXResidentHandoffPlan)+
    sizeof(MSXResidentHandoffTransaction)+1+sizeof(uint32_t))+
    s*(sizeof(MSXResidentActiveRow)+sizeof(MSXResidentHandoffItem)+
-   sizeof(MSXResidentHandoffResult)+(uint64_t)2*stride*sizeof(double));
+   sizeof(MSXResidentHandoffResult)+sizeof(MSXResidentHandoffTarget));
 }
 
 #define MSX_RESIDENT_RUNTIME_TOKEN_MAGIC UINT64_C(0x52544f4b454e5033)
@@ -138,13 +165,14 @@ static int resolveCapacityPath(char out[MAXFNAME], const char *capacity, const c
 static void runtimeFreeBuffers(void)
 {
     free(R.rows); free(R.pipeHyd); free(R.plan); free(R.item); free(R.out);
-    free(R.c); free(R.lastc); free(R.tx); free(R.fallback); free(R.offset);
-    R.rows=0; R.pipeHyd=0; R.plan=0; R.item=0; R.out=0; R.c=0; R.lastc=0;
+    free(R.targets); free(R.tx); free(R.fallback); free(R.offset);
+    R.rows=0; R.pipeHyd=0; R.plan=0; R.item=0; R.out=0; R.targets=0;
     R.tx=0; R.fallback=0; R.offset=0;
 }
 static uint64_t RuntimeAllocationBytes;
-static void *runtime_calloc(size_t n,size_t size)
-{if(n&&size>SIZE_MAX/n)return NULL;RuntimeAllocationBytes+=(uint64_t)n*size;return calloc(n,size);}
+static void *runtime_calloc_impl(size_t n,size_t size,unsigned site)
+{if(n&&size>SIZE_MAX/n)return NULL;RuntimeAllocationBytes+=(uint64_t)n*size+MSXresidentAlloc_headerBytes();return MSXresidentAlloc_calloc(n,size,__FILE__,site);}
+#define runtime_calloc(n,w) runtime_calloc_impl(n,w,__LINE__)
 static int runtimeAllocateBuffers(const MSXResidentLayout *l)
 {
     size_t hydValues;RuntimeAllocationBytes=0;
@@ -158,12 +186,11 @@ static int runtimeAllocateBuffers(const MSXResidentLayout *l)
     R.plan=(MSXResidentHandoffPlan*)runtime_calloc((size_t)l->nLinks+1,sizeof(*R.plan));
     R.item=(MSXResidentHandoffItem*)runtime_calloc(l->totalSlots,sizeof(*R.item));
     R.out=(MSXResidentHandoffResult*)runtime_calloc(l->totalSlots,sizeof(*R.out));
-    R.c=(double*)runtime_calloc((size_t)l->totalSlots*l->speciesStride,sizeof(*R.c));
-    R.lastc=(double*)runtime_calloc((size_t)l->totalSlots*l->speciesStride,sizeof(*R.lastc));
+    R.targets=(MSXResidentHandoffTarget*)runtime_calloc(l->totalSlots,sizeof(*R.targets));
     R.tx=(MSXResidentHandoffTransaction*)runtime_calloc((size_t)l->nLinks+1,sizeof(*R.tx));
     R.fallback=(unsigned char*)runtime_calloc((size_t)l->nLinks+1,1);
     R.offset=(uint32_t*)runtime_calloc((size_t)l->nLinks+1,sizeof(*R.offset));
-    if(!R.rows||!R.pipeHyd||!R.plan||!R.item||!R.out||!R.c||!R.lastc||!R.tx||!R.fallback||!R.offset)
+    if(!R.rows||!R.pipeHyd||!R.plan||!R.item||!R.out||!R.targets||!R.tx||!R.fallback||!R.offset)
     { runtimeFreeBuffers(); return fail(MSX_RESIDENT_ERR_MEMORY,"runtime_buffers"); }
     if(RuntimeAllocationBytes!=MSXresidentRuntime_fixedHostBytes(l->nLinks,l->totalSlots,l->speciesStride))
     {runtimeFreeBuffers();return fail(MSX_RESIDENT_ERR_OVERFLOW,"runtime_size_ledger");}
@@ -184,9 +211,10 @@ static void makeConfig(MSXResidentConfig *c, const char *hash)
 static int preHybridAttempt(void)
 {
     MSXResidentConfig c; MSXResidentStatus s; MSXResidentLayout l;
-    MSXResidentPatchBatch b; MSXResidentGpuOpen o; char actual[65];
+    MSXResidentPatchBatch b; MSXResidentGpuOpen o; MSXResidentMemoryConfig memoryConfig; char actual[65];
     if (MSX.GpuCoreMode == MSX_RESIDENT_OFF) return 0;
     if (R.opened) return 0;
+    {const char *a=getenv("MSX_RESIDENT_MEMORY_AUDIT");R.auditMemory=a&&!strcmp(a,"1");}
     R.auditPoisonCpuMirrors = auditPoisonRequested();
     R.auditHyd = auditHydRequested();
     R.auditAggregateFail = auditAggregateMode();
@@ -218,7 +246,10 @@ static int preHybridAttempt(void)
      s=MSXresidentGpu_availableMemory(&freeDevice);
      if(s!=MSX_RESIDENT_OK){MSXresidentRuntime_close();return fail(s,"pre_memory_query");}
      MSXresidentCapacity_setDeviceBaseline(freeDevice);}
-    s=MSXresidentGpu_open(&o,&R.gpu);
+    s=MSXresidentCapacity_memoryConfig(&memoryConfig);
+    if(s==MSX_RESIDENT_OK)s=MSXresidentGpu_openConfigured(&o,&memoryConfig,&R.gpu);
+    if(s==MSX_RESIDENT_OK){const char *audit=getenv("MSX_RESIDENT_MEMORY_AUDIT");
+        if(audit&&!strcmp(audit,"1"))s=MSXresidentGpu_writeAllocationManifest(R.gpu,"resident_cuda_allocations.csv");}
     if(s==MSX_RESIDENT_OK && (initialFault("allocation_oom") ||
        (initialFault("allocation_oom_once") && MSXresidentCapacity_startupAttempt()==0)))
         s=MSX_RESIDENT_ERR_MEMORY;
@@ -227,6 +258,7 @@ static int preHybridAttempt(void)
     {
         double t=0.0, elapsed=0.0;
         if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
+        auditPatchDemand(&b);
         s=MSXresidentGpu_initialUpload(R.gpu,&b);
         if (MSXgpu_profileStageEnabled())
         {
@@ -300,6 +332,7 @@ int MSXresidentRuntime_afterHybridInit(void)
     }
     if ((s=MSXresident_getPatches(&b))!=MSX_RESIDENT_OK) return fail(s,"patch_read");
     R.wouldDescriptors+=b.descriptorCount; R.wouldSlots+=b.slotCount;
+    auditPatchDemand(&b);
     if (MSX.GpuCoreMode==MSX_RESIDENT_RESIDENT && (s=MSXresidentGpu_applyPatches(R.gpu,&b))!=MSX_RESIDENT_OK)
         return fail(s,"initial_patch_apply");
     MSXresident_clearPatches(); R.resident=(MSX.GpuCoreMode==MSX_RESIDENT_RESIDENT); R.dispatchReady=R.resident;
@@ -315,6 +348,7 @@ int MSXresidentRuntime_flushPatches(void)
     if ((s=MSXresident_getPatches(&b))!=MSX_RESIDENT_OK) return fail(s,"patch_read");
     R.wouldDescriptors+=b.descriptorCount; R.wouldSlots+=b.slotCount;
     if (!b.descriptorCount && !b.slotCount) return 0;
+    auditPatchDemand(&b);
     if (!R.resident) { MSXresident_clearPatches(); return 0; }
     MSXsegStorage_hybridRebalanceAddPatchCounts(b.descriptorCount,
                                                 b.slotCount);
@@ -445,6 +479,7 @@ MSXResidentStatus MSXresidentRuntime_fetchBatch(
     f.lastcOut = lastc;
     f.stride = stride;
     fetchStart = rebalanceProfile ? MSXgpu_wallTimeMs() : 0.0;
+    if(R.auditMemory&&count>R.peakSelectedRows)R.peakSelectedRows=count;
     s = MSXresidentGpu_fetchHandoffBatch(R.gpu, items, count, &f);
     if (rebalanceProfile)
         MSXsegStorage_hybridRebalanceAddPhase(
@@ -458,8 +493,23 @@ MSXResidentStatus MSXresidentRuntime_fetchBatch(
     return MSX_RESIDENT_OK;
 }
 
+MSXResidentStatus MSXresidentRuntime_fetchTargets(const MSXResidentHandoffItem *items,uint32_t count,
+ MSXResidentHandoffResult *r,const MSXResidentHandoffTarget *t)
+{
+ MSXResidentStatus s;int detail=MSXsegStorage_hybridRebalanceProfileActive();
+ double start=detail?MSXgpu_wallTimeMs():0.0;
+ if(!R.resident||!R.gpu)return MSX_RESIDENT_DISABLED;
+ if(count>R.itemCap)return MSX_RESIDENT_ERR_CAPACITY;
+ if(MSXresidentRuntime_flushPatches())return R.lastStatus;
+ if(detail){MSXsegStorage_hybridRebalanceAddPhase(MSX_REBALANCE_PHASE_PREFLUSH,MSXgpu_wallTimeMs()-start);start=MSXgpu_wallTimeMs();}
+ if(R.auditMemory&&count>R.peakSelectedRows)R.peakSelectedRows=count;
+ s=MSXresidentGpu_fetchHandoffTargets(R.gpu,items,count,r,t);
+ if(detail)MSXsegStorage_hybridRebalanceAddPhase(MSX_REBALANCE_PHASE_FETCH,MSXgpu_wallTimeMs()-start);
+ if(s!=MSX_RESIDENT_OK)fail(s,"selected_fetch_targets");return s;
+}
 void MSXresidentRuntime_close(void)
 {
+    writeMemoryDemand();
     if (R.resident && MSX.GpuCoreOverflow) MSXresidentCapacity_writeUsage();
     int emitDiagnosticSummary = 0;
     if (R.auditPoisonCpuMirrors || R.auditHyd || R.auditAggregateFail)
@@ -568,8 +618,9 @@ static int materializePlan(int k, MSXResidentHandoffPlan *p)
     uint64_t fetchBytesBefore=0, fetchCallsBefore=0;
     int handoffDetail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF);
     memset(&f,0,sizeof(f));
-    f.meta=R.out+o; f.cOut=R.c+(size_t)o*R.stride;
-    f.lastcOut=R.lastc+(size_t)o*R.stride; f.stride=R.stride;
+    f.meta=R.out+o;f.stride=R.stride;
+    z=MSXresident_prepareHandoffLeases(p,f.meta,R.targets+o,&R.tx[k]);
+    if(z!=MSX_RESIDENT_OK)return fail(z,"materialize_leases");
     if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
     if (handoffDetail)
     {
@@ -578,7 +629,8 @@ static int materializePlan(int k, MSXResidentHandoffPlan *p)
         fetchCallsBefore=totals->handoff_d2h_calls;
         fetchStart=MSXgpu_wallTimeMs();
     }
-    z=MSXresidentGpu_fetchHandoffs(R.gpu,p,&f,p->itemCount);
+    if(R.auditMemory&&p->itemCount>R.peakMaterializeRows)R.peakMaterializeRows=p->itemCount;
+    z=MSXresidentGpu_fetchHandoffTargets(R.gpu,p->item,p->itemCount,f.meta,R.targets+o);
     if (handoffDetail)
     {
         const MSXProfileRunTotals *totals=MSXgpu_getProfileRunTotals();
@@ -589,14 +641,14 @@ static int materializePlan(int k, MSXResidentHandoffPlan *p)
     if (handoffDetail)
         MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_HANDOFF_GPU_FETCH,
                                fetchMs);
-    if(z!=MSX_RESIDENT_OK)return fail(z,"fallback_fetch");
+    if(z!=MSX_RESIDENT_OK){MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"fallback_fetch");}
     if (handoffDetail) prepareStart=MSXgpu_wallTimeMs();
-    z=MSXresident_prepareHandoffTransaction(p,f.meta,p->itemCount,&R.tx[k]);
+    z=MSXresident_finishHandoffLeases(&R.tx[k],f.meta);
     if (handoffDetail) prepareMs=MSXgpu_wallTimeMs()-prepareStart;
     if (handoffDetail)
         MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_HANDOFF_CPU_PREPARE,
                                prepareMs);
-    if(z!=MSX_RESIDENT_OK)return fail(z,"fallback_prepare");
+    if(z!=MSX_RESIDENT_OK){MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"fallback_prepare");}
     z=MSXresident_validateHandoffTransactions(&R.tx[k],1);
     if(z!=MSX_RESIDENT_OK){MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"fallback_final_validate");}
     MSXresident_commitHandoffTransaction(&R.tx[k]);
@@ -706,10 +758,13 @@ int MSXresidentRuntime_completeHandoffs(void)
        the CUDA API wrapper; logical handoff counters below stay separate. */
     if (R.itemCount)
     {
-        MSXResidentGpuFetchOutput f;
-        memset(&f,0,sizeof(f)); f.meta=R.out; f.cOut=R.c;
-        f.lastcOut=R.lastc; f.stride=R.stride;
-        z=MSXresidentGpu_fetchHandoffBatch(R.gpu,R.item,R.itemCount,&f);
+        if(MSXsegStorage_hybridEnsureBoundaryPoolFree(R.itemCount))return fail(MSX_RESIDENT_ERR_MEMORY,"handoff_pool");
+        for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];++k)if(R.plan[k].itemCount){uint32_t o=R.offset[k];
+            z=MSXresident_prepareHandoffLeases(&R.plan[k],R.out+o,R.targets+o,&R.tx[k]);
+            if(z){for(uint32_t j=1;j<=(uint32_t)MSX.Nobjects[LINK];++j)MSXresident_abortHandoffTransaction(&R.tx[j]);
+                return fail(z,"handoff_leases");}}
+        if(R.auditMemory&&R.itemCount>R.peakHandoffRows)R.peakHandoffRows=R.itemCount;
+        z=MSXresidentGpu_fetchHandoffTargets(R.gpu,R.item,R.itemCount,R.out,R.targets);
         if(z!=MSX_RESIDENT_OK){
             if (handoffDetail)
                 MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_HANDOFF_GPU_FETCH,
@@ -733,7 +788,7 @@ int MSXresidentRuntime_completeHandoffs(void)
     for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++) if(R.plan[k].itemCount)
     {
         uint32_t o=R.offset[k];
-        z=MSXresident_prepareHandoffTransaction(&R.plan[k],R.out+o,R.plan[k].itemCount,&R.tx[k]);
+        z=MSXresident_finishHandoffLeases(&R.tx[k],R.out+o);
         if(z!=MSX_RESIDENT_OK){
             if (handoffDetail)
                 MSXgpu_profileRunPhase(MSX_PROFILE_RUN_TRANSPORT_HANDOFF_CPU_PREPARE,

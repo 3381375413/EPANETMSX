@@ -233,7 +233,7 @@ int  MSXqual_open()
 
     // --- allocate a memory pool for pipe segments
 
-    MSX.QualPool = AllocInit();
+    MSX.QualPool = AllocInitNamed("QualPool");
     if (MSX.QualPool == NULL) return ERR_MEMORY;
 
 // --- allocate memory used for species concentrations
@@ -1024,6 +1024,7 @@ int MSXqual_close()
     {
         AllocSetPool(MSX.QualPool);
         AllocFreePool();
+        MSX.QualPool = NULL;
     }
     FREE(MSX.MassBalance.initial);
     FREE(MSX.MassBalance.inflow);

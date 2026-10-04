@@ -292,4 +292,5 @@ static void t_retry_identities(void)
  OK(MSXsegStorage_hybridResetUncommitted()==ERR_PIPE_RING_CAPACITY);
  initial->inHybridCore=0;MSXqual_removeSeg(fresh);
 }
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t_cpu_spill();t_cpu_pool_growth();t_predictor();t_hyd_scan();t_host_size_ledger();t_retry_identities();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+#include "resident_lease_tests.h"
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t_cpu_spill();t_cpu_pool_growth();t_predictor();t_hyd_scan();t_host_size_ledger();t_retry_identities();t_handoff_leases();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}

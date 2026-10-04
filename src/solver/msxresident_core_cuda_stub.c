@@ -1,4 +1,18 @@
 #include "msxresident_core_cuda.h"
+#include "msxresident_memory_config.h"
+MSXResidentStatus MSXresidentGpu_writeAllocationManifest(const MSXResidentGpu*g,const char*p)
+{(void)g;(void)p;return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_fetchHandoffTargets(MSXResidentGpu *g,const MSXResidentHandoffItem *i,
+ uint32_t n,MSXResidentHandoffResult *r,const MSXResidentHandoffTarget *t)
+{(void)g;(void)i;(void)n;(void)r;(void)t;return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_residentMemoryConfig(MSXResidentMemoryConfig *c)
+{return MSXresident_resolveMemoryConfig(c);}
+MSXResidentStatus MSXresidentGpu_estimateConfigured(uint32_t n,uint32_t s,uint32_t t,
+ const MSXResidentMemoryConfig *c,MSXResidentMemoryEstimate *m)
+{(void)n;(void)s;(void)t;(void)c;(void)m;return MSX_RESIDENT_ERR_GPU;}
+MSXResidentStatus MSXresidentGpu_openConfigured(const MSXResidentGpuOpen *o,
+ const MSXResidentMemoryConfig *c,MSXResidentGpu **g)
+{(void)o;(void)c;if(g)*g=0;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_estimateMemory(uint32_t n,uint32_t s,uint32_t t,MSXResidentMemoryEstimate *m)
 { (void)n;(void)s;(void)t;(void)m;return MSX_RESIDENT_ERR_GPU; }
 MSXResidentStatus MSXresidentGpu_availableMemory(uint64_t *b)

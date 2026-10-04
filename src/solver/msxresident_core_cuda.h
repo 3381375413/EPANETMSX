@@ -33,6 +33,8 @@ typedef struct {
     uint64_t hydH2DBytes,hydH2DCalls;
     uint64_t hydCandidateComparisons,hydUploads,hydSkips,hydBytes,hydApiCalls;
     int hydAppliedValid,hydPending;
+    uint64_t patchReuseWaits;
+    double patchReuseWaitMs; /* measured only with detail profiling enabled */
 } MSXResidentGpuTransferStats;
 /* Phase 3B deliberately exposes no CUDA headers.  ``globalRow`` is the
    fixed row in the published resident span, never a Pseg or ring index. */
@@ -72,9 +74,18 @@ typedef struct { double activeUploadMs,gatherMs,ros2Ms,equilMs,formulaMs,diagDow
 
 MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen *, MSXResidentGpu **);
 typedef struct { uint64_t deviceBytes,pinnedBytes,hostBytes; } MSXResidentMemoryEstimate;
+/* Versioned internal configuration. The legacy ABI retains ACTIVE_MAJOR and
+   full-sized transfers; production explicitly selects PIPE_MAJOR. */
+typedef struct { uint32_t version,hydLayout,transferBatchRows; } MSXResidentMemoryConfig;
+MSXResidentStatus MSXresidentGpu_residentMemoryConfig(MSXResidentMemoryConfig *);
+MSXResidentStatus MSXresidentGpu_openConfigured(const MSXResidentGpuOpen *,
+    const MSXResidentMemoryConfig *,MSXResidentGpu **);
+MSXResidentStatus MSXresidentGpu_estimateConfigured(uint32_t,uint32_t,uint32_t,
+    const MSXResidentMemoryConfig *,MSXResidentMemoryEstimate *);
 MSXResidentStatus MSXresidentGpu_estimateMemory(uint32_t,uint32_t,uint32_t,MSXResidentMemoryEstimate *);
 MSXResidentStatus MSXresidentGpu_availableMemory(uint64_t *);
 MSXResidentStatus MSXresidentGpu_getFixedMemory(const MSXResidentGpu *,MSXResidentMemoryEstimate *);
+MSXResidentStatus MSXresidentGpu_writeAllocationManifest(const MSXResidentGpu *,const char *);
 MSXResidentStatus MSXresidentGpu_initialUpload(MSXResidentGpu *, const MSXResidentPatchBatch *);
 MSXResidentStatus MSXresidentGpu_applyPatches(MSXResidentGpu *, const MSXResidentPatchBatch *);
 MSXResidentStatus MSXresidentGpu_fetchHandoffs(MSXResidentGpu *, const MSXResidentHandoffPlan *, MSXResidentGpuFetchOutput *, uint32_t);
@@ -82,6 +93,8 @@ MSXResidentStatus MSXresidentGpu_fetchHandoffs(MSXResidentGpu *, const MSXReside
    Items may belong to different links and boundary plans; the caller keeps
    the flat order when preparing per-link CPU transactions. */
 MSXResidentStatus MSXresidentGpu_fetchHandoffBatch(MSXResidentGpu *, const MSXResidentHandoffItem *, uint32_t, MSXResidentGpuFetchOutput *);
+MSXResidentStatus MSXresidentGpu_fetchHandoffTargets(MSXResidentGpu *,
+    const MSXResidentHandoffItem *,uint32_t,MSXResidentHandoffResult *,const MSXResidentHandoffTarget *);
 MSXResidentStatus MSXresidentGpu_getTransferStats(const MSXResidentGpu *, MSXResidentGpuTransferStats *);
 /* massBySpecies has speciesStride entries (including index zero) supplied by caller. */
 MSXResidentStatus MSXresidentGpu_reduce(MSXResidentGpu *, double *massBySpecies, uint32_t massCount, MSXResidentGpuReduction *);

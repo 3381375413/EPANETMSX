@@ -728,7 +728,7 @@ int createHashTables()
 
 // --- initialize the memory pool used to store object ID's
 
-    HashPool = AllocInit();
+    HashPool = AllocInitNamed("HashPool");
     if ( HashPool == NULL ) return ERR_MEMORY;
     return 0;
 }

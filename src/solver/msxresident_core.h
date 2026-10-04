@@ -117,6 +117,11 @@ MSXResidentStatus MSXresident_applyHandoff(const MSXResidentHandoffResult*,uint3
    and does not change topology, dense Core, or Resident metadata. Commit is
    allocation-free; abort is always safe. */
 MSXResidentStatus MSXresident_prepareHandoffTransaction(const MSXResidentHandoffPlan*,const MSXResidentHandoffResult*,uint32_t,MSXResidentHandoffTransaction*);
+typedef struct { double *c,*lastc; } MSXResidentHandoffTarget;
+MSXResidentStatus MSXresident_prepareHandoffLeases(const MSXResidentHandoffPlan*,
+    MSXResidentHandoffResult*,MSXResidentHandoffTarget*,MSXResidentHandoffTransaction*);
+MSXResidentStatus MSXresident_finishHandoffLeases(MSXResidentHandoffTransaction*,
+    const MSXResidentHandoffResult*);
 /* Revalidates an entire prepared batch without allocation or mutation. */
 MSXResidentStatus MSXresident_validateHandoffTransactions(const MSXResidentHandoffTransaction*,uint32_t);
 /* No-fail primitive: callers must final-validate the whole batch first. */

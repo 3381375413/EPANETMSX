@@ -63,6 +63,8 @@ MSXResidentStatus MSXresidentRuntime_fetchSlot(uint32_t linkIndex,
                                                MSXResidentPayload *payload);
 /* Fetch a caller-planned set of selected rows in one GPU gather.  c/lastc
    contain count packed rows and results receives the matching metadata. */
+MSXResidentStatus MSXresidentRuntime_fetchTargets(const MSXResidentHandoffItem*,uint32_t,
+ MSXResidentHandoffResult*,const MSXResidentHandoffTarget*);
 MSXResidentStatus MSXresidentRuntime_fetchBatch(
     const MSXResidentHandoffItem *items, uint32_t count,
     double *c, double *lastc, uint32_t stride,

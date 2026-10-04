@@ -10,28 +10,30 @@
 #include "msxtypes.h"
 #include "msxsegment_storage.h"
 #include "epanet2.h"
+#include "msxresident_alloc.h"
 extern MSXproject MSX;
 extern void MSXqual_removeSeg(Pseg seg);
 #define NONE UINT32_MAX
 static uint64_t ResidentAllocationCount;
 static uint64_t ResidentAllocationBytes;
 static int64_t ResidentAllocationFailAfter = -1;
-static void *resident_malloc(size_t n)
-{ if (ResidentAllocationFailAfter == 0) return NULL; if (ResidentAllocationFailAfter > 0) ResidentAllocationFailAfter--; ResidentAllocationCount++; ResidentAllocationBytes+=n; return malloc(n); }
-static void *resident_calloc(size_t n, size_t z)
-{ if (n&&z>SIZE_MAX/n) return NULL; if (ResidentAllocationFailAfter == 0) return NULL; if (ResidentAllocationFailAfter > 0) ResidentAllocationFailAfter--; ResidentAllocationCount++; ResidentAllocationBytes+=(uint64_t)n*z; return calloc(n,z); }
-#define malloc resident_malloc
-#define calloc resident_calloc
+static void *resident_malloc(size_t n,unsigned site)
+{ if (ResidentAllocationFailAfter == 0) return NULL; if (ResidentAllocationFailAfter > 0) ResidentAllocationFailAfter--; ResidentAllocationCount++; ResidentAllocationBytes+=n+MSXresidentAlloc_headerBytes(); return MSXresidentAlloc_malloc(n,__FILE__,site); }
+static void *resident_calloc(size_t n, size_t z,unsigned site)
+{ if (n&&z>SIZE_MAX/n) return NULL; if (ResidentAllocationFailAfter == 0) return NULL; if (ResidentAllocationFailAfter > 0) ResidentAllocationFailAfter--; ResidentAllocationCount++; ResidentAllocationBytes+=(uint64_t)n*z+MSXresidentAlloc_headerBytes(); return MSXresidentAlloc_calloc(n,z,__FILE__,site); }
+#define malloc(n) resident_malloc(n,__LINE__)
+#define calloc(n,z) resident_calloc(n,z,__LINE__)
+#define free(p) MSXresidentAlloc_free(p)
 typedef struct { MSXResidentPipeDesc d; uint32_t guard,admissionLimit; unsigned char *used; uint32_t *gen,*patch,*obsI2s,*obsKeep; uint64_t *id; double *row; } Pipe;
 /* One reusable transaction arena is owned by each resident link.  Runtime
    prepares at most one transaction per link before the all-link validation. */
-typedef struct { MSXResidentHandoffPlan plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *result; Pseg *boundary; double *c,*lastc; uint32_t count,capacity,patchReserve; int active; MSXHybridResidentMaterialization storage; } Tx;
+typedef struct { MSXResidentHandoffPlan plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *result; Pseg *boundary; uint32_t count,capacity,patchReserve; int active,payloadReady; MSXHybridResidentMaterialization storage; } Tx;
 typedef struct { int open,strict,initialStaging,initialCommitted,poisoned; MSXResidentMode mode; uint32_t nlinks,stride,rowWidth; size_t slots; char hash[65]; Pipe *p; uint32_t *dirty,*capacity,*base,*guard,*admissionLimit; MSXResidentDescriptorPatch *desc,*initialDesc; MSXResidentSlotPatch *slot,*initialSlot; MSXResidentHandoffItem *hand; Tx *tx; uint32_t ndesc,nslot,nh; MSXResidentStats stat; } State;
 static State S={0};
 uint64_t MSXresident_testAllocationBytes(void){return ResidentAllocationBytes;}
 static int mul(size_t a,size_t b,size_t*o){if(a&&b>SIZE_MAX/a)return 0;*o=a*b;return 1;}
 static void txreset(Tx *t);
-static void freestate(void){uint32_t k;if(S.tx){for(k=1;k<=S.nlinks;k++){txreset(&S.tx[k]);free(S.tx[k].item);free(S.tx[k].result);free(S.tx[k].boundary);free(S.tx[k].c);free(S.tx[k].lastc);}free(S.tx);}if(S.p)for(k=1;k<=S.nlinks;k++){free(S.p[k].used);free(S.p[k].gen);free(S.p[k].patch);free(S.p[k].obsI2s);free(S.p[k].obsKeep);free(S.p[k].id);free(S.p[k].row);}free(S.p);free(S.dirty);free(S.capacity);free(S.base);free(S.guard);free(S.admissionLimit);free(S.desc);free(S.initialDesc);free(S.slot);free(S.initialSlot);free(S.hand);memset(&S,0,sizeof(S));}
+static void freestate(void){uint32_t k;if(S.tx){for(k=1;k<=S.nlinks;k++){txreset(&S.tx[k]);free(S.tx[k].item);free(S.tx[k].result);free(S.tx[k].boundary);}free(S.tx);}if(S.p)for(k=1;k<=S.nlinks;k++){free(S.p[k].used);free(S.p[k].gen);free(S.p[k].patch);free(S.p[k].obsI2s);free(S.p[k].obsKeep);free(S.p[k].id);free(S.p[k].row);}free(S.p);free(S.dirty);free(S.capacity);free(S.base);free(S.guard);free(S.admissionLimit);free(S.desc);free(S.initialDesc);free(S.slot);free(S.initialSlot);free(S.hand);memset(&S,0,sizeof(S));}
 static int hashok(const char*s){int i;if(!s)return 0;for(i=0;i<64;i++)if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='A'&&s[i]<='F')||(s[i]>='a'&&s[i]<='f')))return 0;return s[64]==0;}
 static void hashupper(char*s){int i;for(i=0;i<64;i++)if(s[i]>='a'&&s[i]<='f')s[i]=(char)(s[i]-'a'+'A');}
 static int hashcmp(const char*a,const char*b){char x[65],y[65];if(!hashok(a)||!hashok(b))return 1;memcpy(x,a,65);memcpy(y,b,65);hashupper(x);hashupper(y);return strcmp(x,y);}
@@ -68,11 +70,12 @@ static void writePayload(Pipe *p,uint32_t s,const MSXResidentPayload *x)
 uint64_t MSXresident_fixedHostBytes(uint32_t links,uint32_t slots,uint32_t stride)
 {
  uint64_t l=(uint64_t)links+1,s=slots;
- return l*(sizeof(Pipe)+5*sizeof(uint32_t)+sizeof(Tx))+
+ return ((uint64_t)10*links+10)*MSXresidentAlloc_headerBytes()+
+  l*(sizeof(Pipe)+5*sizeof(uint32_t)+sizeof(Tx))+
   (uint64_t)links*sizeof(MSXResidentDescriptorPatch)+
   s*(sizeof(MSXResidentSlotPatch)+2*sizeof(MSXResidentHandoffItem)+
      sizeof(MSXResidentHandoffResult)+sizeof(Pseg)+1+4*sizeof(uint32_t)+sizeof(uint64_t)+
-     ((uint64_t)4*stride+10)*sizeof(double));
+     ((uint64_t)2*stride+10)*sizeof(double));
 }
 MSXResidentStatus MSXresident_openPlan(uint32_t links,const uint32_t *limit,
                                       const uint32_t *guards,const char *hash)
@@ -91,7 +94,7 @@ MSXResidentStatus MSXresident_openPlan(uint32_t links,const uint32_t *limit,
    S.slots+=cap;p=&S.p[k];p->guard=guards[k];p->admissionLimit=limit[k];
    p->d.linkIndex=k;p->d.capacity=cap;p->d.head=p->d.tail=NONE;p->d.orient=1;
  }
-S.stride=(uint32_t)MSX.Nobjects[SPECIES]+1;if(S.stride>UINT32_MAX-5)goto ov;S.rowWidth=5+S.stride;if(!mul((size_t)S.nlinks+1,sizeof(uint32_t),&b))goto ov;S.dirty=(uint32_t*)malloc(b);S.capacity=(uint32_t*)calloc(1,b);S.base=(uint32_t*)calloc(1,b);S.admissionLimit=(uint32_t*)calloc(1,b);if(!S.dirty||!S.capacity||!S.base||!S.admissionLimit)goto mem;for(k=0;k<=S.nlinks;k++)S.dirty[k]=NONE;for(k=1;k<=S.nlinks;k++){S.admissionLimit[k]=S.p[k].admissionLimit;S.capacity[k]=S.p[k].d.capacity;S.base[k]=base;base+=S.capacity[k];}if(!mul(S.nlinks,sizeof(*S.desc),&b))goto ov;S.desc=(MSXResidentDescriptorPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.slot),&b))goto ov;S.slot=(MSXResidentSlotPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.hand),&b))goto ov;S.hand=(MSXResidentHandoffItem*)calloc(1,b);if(!S.desc||!S.slot||!S.hand)goto mem;S.tx=(Tx*)calloc((size_t)S.nlinks+1,sizeof(*S.tx));if(!S.tx)goto mem;for(k=1;k<=S.nlinks;k++){Tx*t=&S.tx[k];p=&S.p[k];t->capacity=p->d.capacity;t->item=(MSXResidentHandoffItem*)calloc(t->capacity,sizeof(*t->item));t->result=(MSXResidentHandoffResult*)calloc(t->capacity,sizeof(*t->result));t->boundary=(Pseg*)calloc(t->capacity,sizeof(*t->boundary));t->c=(double*)calloc((size_t)t->capacity*S.stride,sizeof(*t->c));t->lastc=(double*)calloc((size_t)t->capacity*S.stride,sizeof(*t->lastc));if(!t->item||!t->result||!t->boundary||!t->c||!t->lastc)goto mem;if(!mul(p->d.capacity,2*(size_t)S.rowWidth,&n)||!mul(n,sizeof(double),&b))goto ov;p->row=(double*)calloc(1,b);p->used=(unsigned char*)calloc(p->d.capacity,1);p->gen=(uint32_t*)calloc(p->d.capacity,sizeof(uint32_t));p->id=(uint64_t*)calloc(p->d.capacity,sizeof(uint64_t));p->patch=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsI2s=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsKeep=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));if(!p->row||!p->used||!p->gen||!p->id||!p->patch||!p->obsI2s||!p->obsKeep)goto mem;for(n=0;n<p->d.capacity;n++)p->patch[n]=NONE;}
+S.stride=(uint32_t)MSX.Nobjects[SPECIES]+1;if(S.stride>UINT32_MAX-5)goto ov;S.rowWidth=5+S.stride;if(!mul((size_t)S.nlinks+1,sizeof(uint32_t),&b))goto ov;S.dirty=(uint32_t*)malloc(b);S.capacity=(uint32_t*)calloc(1,b);S.base=(uint32_t*)calloc(1,b);S.admissionLimit=(uint32_t*)calloc(1,b);if(!S.dirty||!S.capacity||!S.base||!S.admissionLimit)goto mem;for(k=0;k<=S.nlinks;k++)S.dirty[k]=NONE;for(k=1;k<=S.nlinks;k++){S.admissionLimit[k]=S.p[k].admissionLimit;S.capacity[k]=S.p[k].d.capacity;S.base[k]=base;base+=S.capacity[k];}if(!mul(S.nlinks,sizeof(*S.desc),&b))goto ov;S.desc=(MSXResidentDescriptorPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.slot),&b))goto ov;S.slot=(MSXResidentSlotPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.hand),&b))goto ov;S.hand=(MSXResidentHandoffItem*)calloc(1,b);if(!S.desc||!S.slot||!S.hand)goto mem;S.tx=(Tx*)calloc((size_t)S.nlinks+1,sizeof(*S.tx));if(!S.tx)goto mem;for(k=1;k<=S.nlinks;k++){Tx*t=&S.tx[k];p=&S.p[k];t->capacity=p->d.capacity;t->item=(MSXResidentHandoffItem*)calloc(t->capacity,sizeof(*t->item));t->result=(MSXResidentHandoffResult*)calloc(t->capacity,sizeof(*t->result));t->boundary=(Pseg*)calloc(t->capacity,sizeof(*t->boundary));if(!t->item||!t->result||!t->boundary)goto mem;if(!mul(p->d.capacity,2*(size_t)S.rowWidth,&n)||!mul(n,sizeof(double),&b))goto ov;p->row=(double*)calloc(1,b);p->used=(unsigned char*)calloc(p->d.capacity,1);p->gen=(uint32_t*)calloc(p->d.capacity,sizeof(uint32_t));p->id=(uint64_t*)calloc(p->d.capacity,sizeof(uint64_t));p->patch=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsI2s=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsKeep=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));if(!p->row||!p->used||!p->gen||!p->id||!p->patch||!p->obsI2s||!p->obsKeep)goto mem;for(n=0;n<p->d.capacity;n++)p->patch[n]=NONE;}
  S.open=1;S.mode=MSX_RESIDENT_OFF;return MSX_RESIDENT_OK;
 bad:freestate();return MSX_RESIDENT_ERR_ARGUMENT;
 ov:freestate();return MSX_RESIDENT_ERR_OVERFLOW;
@@ -481,7 +484,7 @@ void MSXresident_testFailAllocationAfter(int64_t allocationIndex){ResidentAlloca
 MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*b){if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;b->descriptor=S.desc;b->descriptorCount=S.ndesc;b->slot=S.slot;b->slotCount=S.nslot;return MSX_RESIDENT_OK;}
 void MSXresident_clearPatches(void)
 { uint32_t i,k,s; if(!S.open)return; for(i=0;i<S.ndesc;i++){k=S.desc[i].linkIndex;if(k&&k<=S.nlinks)S.dirty[k]=NONE;} for(i=0;i<S.nslot;i++){k=S.slot[i].linkIndex;s=S.slot[i].slot;if(k&&k<=S.nlinks&&s<S.p[k].d.capacity)S.p[k].patch[s]=NONE;} S.ndesc=S.nslot=0; }
-MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *o){uint32_t k;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(!S.open||!S.capacity||!S.base)return MSX_RESIDENT_DISABLED;if(!S.guard){S.guard=(uint32_t*)resident_calloc((size_t)S.nlinks+1,sizeof(*S.guard));if(!S.guard)return MSX_RESIDENT_ERR_MEMORY;for(k=1;k<=S.nlinks;k++)S.guard[k]=S.p[k].guard;}o->nLinks=S.nlinks;o->totalSlots=(uint32_t)S.slots;o->speciesStride=S.stride;o->capacity=S.capacity;o->base=S.base;o->guard=S.guard;o->admissionLimit=S.admissionLimit;return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *o){uint32_t k;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(!S.open||!S.capacity||!S.base)return MSX_RESIDENT_DISABLED;if(!S.guard){S.guard=(uint32_t*)calloc((size_t)S.nlinks+1,sizeof(*S.guard));if(!S.guard)return MSX_RESIDENT_ERR_MEMORY;for(k=1;k<=S.nlinks;k++)S.guard[k]=S.p[k].guard;}o->nLinks=S.nlinks;o->totalSlots=(uint32_t)S.slots;o->speciesStride=S.stride;o->capacity=S.capacity;o->base=S.base;o->guard=S.guard;o->admissionLimit=S.admissionLimit;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,uint32_t cap,uint32_t *count)
 { uint32_t k,s,n=0,total=0,base=0; if(!count||(!rows&&cap))return MSX_RESIDENT_ERR_ARGUMENT;*count=0;if(!S.open)return MSX_RESIDENT_DISABLED;
   for(k=1;k<=S.nlinks;k++){Pipe*p=&S.p[k];uint32_t seen=0;if(p->d.count>p->d.capacity||(p->d.count&&p->d.head>=p->d.capacity))return MSX_RESIDENT_ERR_CAPACITY;s=p->d.head;while(seen<p->d.count){if(s>=p->d.capacity||!p->used[s])return MSX_RESIDENT_ERR_GENERATION;if(n>=cap)return MSX_RESIDENT_ERR_CAPACITY;rows[n].linkIndex=k;rows[n].slot=s;rows[n].globalRow=base+s;rows[n].generation=p->gen[s];rows[n].descriptorHead=p->d.head;rows[n].descriptorCount=p->d.count;rows[n].descriptorOrient=p->d.orient;rows[n].descriptorEpoch=p->d.epoch;rows[n].parcelId=p->id[s];rows[n].volume=crow(p,s)[0];n++;seen++;s=(uint32_t)(((int64_t)s+p->d.orient+(int64_t)p->d.capacity)%(int64_t)p->d.capacity);}if(base>UINT32_MAX-p->d.capacity)return MSX_RESIDENT_ERR_OVERFLOW;base+=p->d.capacity;total+=seen;}
@@ -518,12 +521,12 @@ static void txreset(Tx *t)
         if (t->boundary[i]) MSXqual_removeSeg(t->boundary[i]);
     if (t->boundary) memset(t->boundary, 0, (size_t)t->capacity * sizeof(*t->boundary));
     t->count = t->patchReserve = 0;
-    t->active = 0;
+    t->active = t->payloadReady = 0;
     memset(&t->plan, 0, sizeof(t->plan));
 }
 
 static MSXResidentStatus txvalidate(const MSXResidentHandoffPlan *plan,
-    const MSXResidentHandoffResult *r, uint32_t n)
+    const MSXResidentHandoffResult *r, uint32_t n,int requirePayload)
 {
     uint32_t i, j;
     Pipe *p;
@@ -536,7 +539,7 @@ static MSXResidentStatus txvalidate(const MSXResidentHandoffPlan *plan,
             q->pipeEpoch != plan->pipeEpoch || r[i].linkIndex != q->linkIndex ||
             r[i].slot != q->slot || r[i].generation != q->generation ||
             r[i].boundarySide != q->boundarySide || r[i].pipeEpoch != q->pipeEpoch ||
-            !r[i].payload.c || !r[i].payload.lastc) return MSX_RESIDENT_ERR_ARGUMENT;
+            (requirePayload&&(!r[i].payload.c || !r[i].payload.lastc))) return MSX_RESIDENT_ERR_ARGUMENT;
         if (pipeok(q->linkIndex, &p) != MSX_RESIDENT_OK || p->d.epoch != q->pipeEpoch ||
             q->slot >= p->d.capacity || !p->used[q->slot] || p->gen[q->slot] != q->generation)
             return MSX_RESIDENT_ERR_GENERATION;
@@ -551,7 +554,7 @@ MSXResidentStatus MSXresident_prepareHandoffTransaction(const MSXResidentHandoff
 {
     Tx *t; MSXResidentStatus z; uint32_t i, m, reserve = 0;
     if (!out || out->opaque) return MSX_RESIDENT_ERR_ARGUMENT;
-    z = txvalidate(plan, r, n); if (z) return z;
+    z = txvalidate(plan, r, n,1); if (z) return z;
     t = &S.tx[plan->linkIndex];
     if (t->active || n > t->capacity) return MSX_RESIDENT_ERR_CAPACITY;
     if (MSXsegStorage_hybridEnsureBoundaryPoolFree(n)) return MSX_RESIDENT_ERR_MEMORY;
@@ -561,15 +564,6 @@ MSXResidentStatus MSXresident_prepareHandoffTransaction(const MSXResidentHandoff
     memcpy(t->item, plan->item, (size_t)n * sizeof(*t->item));
     memcpy(t->result, r, (size_t)n * sizeof(*r));
     t->count = n;
-    /* Deep-copy D2H rows now: their runtime buffers may be reused before commit. */
-    for (i = 0; i < n; ++i) {
-        t->result[i].payload.c = t->c + (size_t)i * S.stride;
-        t->result[i].payload.lastc = t->lastc + (size_t)i * S.stride;
-        for (m = 0; m < S.stride; ++m) {
-            t->c[(size_t)i * S.stride + m] = r[i].payload.c[m];
-            t->lastc[(size_t)i * S.stride + m] = r[i].payload.lastc[m];
-        }
-    }
     /* Every invalidation has a bounded preallocated patch slot.  Reserve the
        exact number that is not already published; no State field changes here. */
     for (i = 0; i < n; ++i) if (S.p[plan->linkIndex].patch[t->result[i].slot] == NONE) ++reserve;
@@ -591,9 +585,56 @@ MSXResidentStatus MSXresident_prepareHandoffTransaction(const MSXResidentHandoff
             t->boundary[i]->lastc[m] = r[i].payload.lastc[m];
         }
     }
+    /* The transaction leases these final CPU objects until commit/abort.
+       Caller D2H storage can be reused; no concentration scratch is needed. */
+    for(i=0;i<n;++i){t->result[i].payload.c=t->boundary[i]->c;
+        t->result[i].payload.lastc=t->boundary[i]->lastc;}
     if (MSXsegStorage_hybridPrepareResidentMaterialization(&t->plan,
         t->result, t->boundary, t->count, &t->storage)) { txreset(t); return MSX_RESIDENT_ERR_GENERATION; }
-    out->opaque = t; return MSX_RESIDENT_OK;
+    t->payloadReady=1;out->opaque = t; return MSX_RESIDENT_OK;
+}
+
+MSXResidentStatus MSXresident_prepareHandoffLeases(const MSXResidentHandoffPlan *plan,
+ MSXResidentHandoffResult *r,MSXResidentHandoffTarget *target,MSXResidentHandoffTransaction *out)
+{
+ uint32_t i,n,reserve=0;Tx*t;MSXResidentStatus z;
+ if(!plan||!out||out->opaque||!r||!target||!plan->itemCount||!plan->item||
+    !plan->linkIndex||plan->linkIndex>S.nlinks)return MSX_RESIDENT_ERR_ARGUMENT;
+ n=plan->itemCount;
+ if(!S.open)return MSX_RESIDENT_DISABLED;
+ if(S.poisoned)return MSX_RESIDENT_ERR_POISONED;
+ t=&S.tx[plan->linkIndex];
+ if(t->active||n>t->capacity)return MSX_RESIDENT_ERR_CAPACITY;
+ for(i=0;i<n;++i){const MSXResidentHandoffItem*q=&plan->item[i];
+    memset(&r[i],0,sizeof(r[i]));r[i].linkIndex=q->linkIndex;r[i].slot=q->slot;
+    r[i].generation=q->generation;r[i].boundarySide=q->boundarySide;r[i].pipeEpoch=q->pipeEpoch;
+    /* Metadata preflight does not consume concentrations. */
+}
+ z=txvalidate(plan,r,n,0);if(z)return z;
+ if(MSXsegStorage_hybridEnsureBoundaryPoolFree(n))return MSX_RESIDENT_ERR_MEMORY;
+ for(i=0;i<n;++i)if(S.p[plan->linkIndex].patch[r[i].slot]==NONE)++reserve;
+ if(reserve>S.slots-S.nslot)return MSX_RESIDENT_ERR_CAPACITY;
+ t->active=1;t->payloadReady=0;t->count=n;t->patchReserve=reserve;
+ t->plan=*plan;t->plan.item=t->item;memcpy(t->item,plan->item,n*sizeof(*t->item));
+ for(i=0;i<n;++i){if(MSXsegStorage_hybridMaterializeResident(r[i].linkIndex,r[i].slot,
+    r[i].generation,&t->boundary[i])){txreset(t);return MSX_RESIDENT_ERR_MEMORY;}
+    target[i].c=t->boundary[i]->c;target[i].lastc=t->boundary[i]->lastc;}
+ out->opaque=t;return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_finishHandoffLeases(MSXResidentHandoffTransaction *x,
+ const MSXResidentHandoffResult *r)
+{
+ Tx*t;uint32_t i;MSXResidentStatus z;
+ if(!x||!(t=(Tx*)x->opaque)||!t->active||t->payloadReady)return MSX_RESIDENT_ERR_ARGUMENT;
+ z=txvalidate(&t->plan,r,t->count,1);if(z)return z;
+ for(i=0;i<t->count;++i){Pseg b=t->boundary[i];
+    if(r[i].payload.c!=b->c||r[i].payload.lastc!=b->lastc)return MSX_RESIDENT_ERR_ARGUMENT;
+    b->v=r[i].payload.volume;b->hstep=r[i].payload.hstep;b->hresponse=r[i].payload.hresponse;
+    b->uresponse=r[i].payload.uresponse;b->dresponse=r[i].payload.dresponse;}
+ memcpy(t->result,r,t->count*sizeof(*r));
+ if(MSXsegStorage_hybridPrepareResidentMaterialization(&t->plan,t->result,t->boundary,
+    t->count,&t->storage))return MSX_RESIDENT_ERR_GENERATION;
+ t->payloadReady=1;return MSX_RESIDENT_OK;
 }
 
 MSXResidentStatus MSXresident_validateHandoffTransactions(const MSXResidentHandoffTransaction *x,
@@ -603,7 +644,7 @@ MSXResidentStatus MSXresident_validateHandoffTransactions(const MSXResidentHando
     if (!x && n) return MSX_RESIDENT_ERR_ARGUMENT;
     for (j = 0; j < n; ++j) if (x[j].opaque) {
         Tx *t = (Tx *)x[j].opaque;
-        if (!t->active || txvalidate(&t->plan, t->result, t->count) != MSX_RESIDENT_OK ||
+        if (!t->active || !t->payloadReady || txvalidate(&t->plan, t->result, t->count,1) != MSX_RESIDENT_OK ||
             t->patchReserve > S.slots - S.nslot ||
             !MSXsegStorage_hybridValidatePreparedResidentMaterialization(&t->storage))
             return MSX_RESIDENT_ERR_GENERATION;

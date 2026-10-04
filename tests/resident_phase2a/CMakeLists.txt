@@ -4,6 +4,8 @@ project(resident_phase2a C)
 add_executable(resident_phase2a_harness resident_phase2a_harness.c
   ../../src/solver/msxresident_core.c
   ../../src/solver/msxresident_hash.c
+  ../../src/solver/msxresident_alloc.c
+  ../../src/solver/msxresident_budget.c
   ../../src/solver/msxresident_capacity.c
   ../../src/solver/msxresident_core_cuda_stub.c
   ../../src/solver/msxsegment_storage.c)

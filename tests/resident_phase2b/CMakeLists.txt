@@ -19,9 +19,13 @@ add_custom_command(OUTPUT ${RESIDENT_CUDA_OBJ}
     ${RESIDENT_CUDA_INCLUDE_ARGS} -D_CRT_SECURE_NO_WARNINGS -Xcompiler=/MD
   DEPENDS ../../src/solver/msxresident_core_cuda.cu
           ../../src/solver/msxresident_core_cuda.h
+          ../../src/solver/msxresident_memory_config.h
+          ../../src/solver/msxresident_alloc.h
+          ../../src/solver/msxresident_budget.h
           ../../src/solver/msxresident_core.h
   VERBATIM)
-add_executable(resident_phase2b_harness resident_phase2b_harness.c ${RESIDENT_CUDA_OBJ})
+add_executable(resident_phase2b_harness resident_phase2b_harness.c ${RESIDENT_CUDA_OBJ}
+  ../../src/solver/msxresident_alloc.c ../../src/solver/msxresident_budget.c)
 target_include_directories(resident_phase2b_harness PRIVATE
   ../../src/solver ../../src ../../EPANET2.2/SRC_engines/include)
 target_compile_definitions(resident_phase2b_harness PRIVATE _CRT_SECURE_NO_WARNINGS)
