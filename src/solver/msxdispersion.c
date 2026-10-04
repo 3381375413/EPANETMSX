@@ -16,6 +16,7 @@
 #include "dispersion.h"
 #include "msxsegment_storage.h"
 #include "smatrix.h"
+#include "msxresident_alloc_redirect.h"
 
 #define ERRCODE(x) (errcode = ((errcode>100) ? (errcode) : (x)))
 //  External variables

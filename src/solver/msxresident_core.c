@@ -11,6 +11,7 @@
 #include "msxsegment_storage.h"
 #include "epanet2.h"
 #include "msxresident_alloc.h"
+#include "msxresident_upload.h"
 extern MSXproject MSX;
 extern void MSXqual_removeSeg(Pseg seg);
 #define NONE UINT32_MAX
@@ -24,16 +25,38 @@ static void *resident_calloc(size_t n, size_t z,unsigned site)
 #define malloc(n) resident_malloc(n,__LINE__)
 #define calloc(n,z) resident_calloc(n,z,__LINE__)
 #define free(p) MSXresidentAlloc_free(p)
-typedef struct { MSXResidentPipeDesc d; uint32_t guard,admissionLimit; unsigned char *used; uint32_t *gen,*patch,*obsI2s,*obsKeep; uint64_t *id; double *row; } Pipe;
+typedef struct { MSXResidentPipeDesc d; uint32_t guard,admissionLimit; unsigned char *used; uint32_t *gen,*patch,*obsI2s,*obsKeep; uint64_t *id,*revision; double *row; const double *sourceC,*sourceL; } Pipe;
 /* One reusable transaction arena is owned by each resident link.  Runtime
    prepares at most one transaction per link before the all-link validation. */
 typedef struct { MSXResidentHandoffPlan plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *result; Pseg *boundary; uint32_t count,capacity,patchReserve; int active,payloadReady; MSXHybridResidentMaterialization storage; } Tx;
-typedef struct { int open,strict,initialStaging,initialCommitted,poisoned; MSXResidentMode mode; uint32_t nlinks,stride,rowWidth; size_t slots; char hash[65]; Pipe *p; uint32_t *dirty,*capacity,*base,*guard,*admissionLimit; MSXResidentDescriptorPatch *desc,*initialDesc; MSXResidentSlotPatch *slot,*initialSlot; MSXResidentHandoffItem *hand; Tx *tx; uint32_t ndesc,nslot,nh; MSXResidentStats stat; } State;
+typedef struct { int open,strict,initialStaging,initialCommitted,poisoned,compact; MSXResidentMode mode; uint32_t nlinks,stride,rowWidth; size_t slots; char hash[65]; Pipe *p; uint32_t *dirty,*capacity,*base,*guard,*admissionLimit; MSXResidentDescriptorPatch *desc,*initialDesc; MSXResidentSlotPatch *slot,*initialSlot; MSXResidentHandoffItem *hand; Tx *tx; uint32_t ndesc,nslot,nh; MSXResidentStats stat; } State;
 static State S={0};
+#ifdef MSX_RESIDENT_TEST_API
+/* Read-only physical storage inspection; concentration storage is embedded
+   in row only for the compatibility representation. */
+void MSXresident_testStorageOwnership(uint64_t *v)
+{
+ uint32_t k;v[0]=(uint64_t)S.compact;v[1]=(uint64_t)S.slots;v[2]=0;
+ if(S.p&&!S.compact)for(k=1;k<=S.nlinks;k++)if(S.p[k].row)v[2]+=(uint64_t)2*S.p[k].d.capacity;
+}
+MSXResidentStatus MSXresident_testInitialDescriptor(uint32_t k,MSXResidentPipeDesc *out)
+{
+ if(!out||!S.open||S.poisoned||!k||k>S.nlinks)return MSX_RESIDENT_ERR_ARGUMENT;
+ *out=S.p[k].d;return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_testInitialSlot(uint32_t k,uint32_t slot,
+ uint32_t *used,uint32_t *generation,uint64_t *id)
+{
+ Pipe *p;
+ if(!used||!generation||!id||!S.open||S.poisoned||!k||k>S.nlinks)return MSX_RESIDENT_ERR_ARGUMENT;
+ p=&S.p[k];if(slot>=p->d.capacity)return MSX_RESIDENT_ERR_ARGUMENT;
+ *used=p->used[slot];*generation=p->gen[slot];*id=p->id[slot];return MSX_RESIDENT_OK;
+}
+#endif
 uint64_t MSXresident_testAllocationBytes(void){return ResidentAllocationBytes;}
 static int mul(size_t a,size_t b,size_t*o){if(a&&b>SIZE_MAX/a)return 0;*o=a*b;return 1;}
 static void txreset(Tx *t);
-static void freestate(void){uint32_t k;if(S.tx){for(k=1;k<=S.nlinks;k++){txreset(&S.tx[k]);free(S.tx[k].item);free(S.tx[k].result);free(S.tx[k].boundary);}free(S.tx);}if(S.p)for(k=1;k<=S.nlinks;k++){free(S.p[k].used);free(S.p[k].gen);free(S.p[k].patch);free(S.p[k].obsI2s);free(S.p[k].obsKeep);free(S.p[k].id);free(S.p[k].row);}free(S.p);free(S.dirty);free(S.capacity);free(S.base);free(S.guard);free(S.admissionLimit);free(S.desc);free(S.initialDesc);free(S.slot);free(S.initialSlot);free(S.hand);memset(&S,0,sizeof(S));}
+static void freestate(void){uint32_t k;if(S.tx){for(k=1;k<=S.nlinks;k++){txreset(&S.tx[k]);free(S.tx[k].item);free(S.tx[k].result);free(S.tx[k].boundary);}free(S.tx);}if(S.p)for(k=1;k<=S.nlinks;k++){free(S.p[k].used);free(S.p[k].gen);free(S.p[k].patch);free(S.p[k].obsI2s);free(S.p[k].obsKeep);free(S.p[k].id);free(S.p[k].revision);free(S.p[k].row);}free(S.p);free(S.dirty);free(S.capacity);free(S.base);free(S.guard);free(S.admissionLimit);free(S.desc);free(S.initialDesc);free(S.slot);free(S.initialSlot);free(S.hand);memset(&S,0,sizeof(S));}
 static int hashok(const char*s){int i;if(!s)return 0;for(i=0;i<64;i++)if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='A'&&s[i]<='F')||(s[i]>='a'&&s[i]<='f')))return 0;return s[64]==0;}
 static void hashupper(char*s){int i;for(i=0;i<64;i++)if(s[i]>='a'&&s[i]<='f')s[i]=(char)(s[i]-'a'+'A');}
 static int hashcmp(const char*a,const char*b){char x[65],y[65];if(!hashok(a)||!hashok(b))return 1;memcpy(x,a,65);memcpy(y,b,65);hashupper(x);hashupper(y);return strcmp(x,y);}
@@ -47,9 +70,9 @@ static MSXResidentStatus validatecsv(const char *path,int guard,const char *hash
   if(ferror(f)||row!=n){fclose(f);return MSX_RESIDENT_ERR_CSV;}fclose(f);return MSX_RESIDENT_OK; }
 static MSXResidentStatus pipeok(uint32_t k,Pipe**p){if(!S.open)return MSX_RESIDENT_DISABLED;if(S.poisoned)return MSX_RESIDENT_ERR_POISONED;if(!k||k>S.nlinks)return MSX_RESIDENT_ERR_ARGUMENT;*p=&S.p[k];return MSX_RESIDENT_OK;}
 /* slot layout is [5 scalar + stride c][5 scalar + stride lastc]. */
-static double*crow(Pipe*p,uint32_t s){return p->row+(size_t)s*2*S.rowWidth;}
+static double*crow(Pipe*p,uint32_t s){return p->row+(size_t)s*(S.compact?1:2)*S.rowWidth;}
 static double*lrow(Pipe*p,uint32_t s){return crow(p,s)+S.rowWidth;}
-static void getpayload(Pipe*p,uint32_t s,MSXResidentPayload*x){double*r=crow(p,s);x->volume=r[0];x->hstep=r[1];x->hresponse=r[2];x->uresponse=r[3];x->dresponse=r[4];x->parcelId=p->id[s];x->generation=p->gen[s];x->c=r+5;x->lastc=lrow(p,s)+5;}
+static void getpayload(Pipe*p,uint32_t s,MSXResidentPayload*x){double*r=crow(p,s);x->volume=r[0];x->hstep=r[1];x->hresponse=r[2];x->uresponse=r[3];x->dresponse=r[4];x->parcelId=p->id[s];x->generation=p->gen[s];x->c=S.compact?NULL:r+5;x->lastc=S.compact?NULL:lrow(p,s)+5;}
 static int find(Pipe*p,uint64_t id){uint32_t s;for(s=0;s<p->d.capacity;s++)if(p->used[s]&&p->id[s]==id)return(int)s;return-1;}
 static uint32_t nextslot(const Pipe *p,uint32_t slot,int dir)
 { int64_t q=(int64_t)slot+(dir<0?-1:1); if(q<0)q+=p->d.capacity; if(q>=(int64_t)p->d.capacity)q-=p->d.capacity; return(uint32_t)q; }
@@ -58,24 +81,42 @@ static uint32_t prevslot(const Pipe *p,uint32_t slot,int dir)
 static MSXResidentPatchKind defaultKind(uint32_t used)
 { return used?MSX_RESIDENT_PATCH_IMPORT:MSX_RESIDENT_PATCH_INVALIDATE; }
 static void markdesc(uint32_t k){uint32_t n=S.dirty[k];if(n==NONE){n=S.ndesc++;S.dirty[k]=n;S.desc[n].linkIndex=k;}S.desc[n].descriptor=S.p[k].d;S.stat.descriptorPatches++;}
-static void markslot(uint32_t k,uint32_t s,uint32_t used,MSXResidentPatchKind kind){Pipe*p=&S.p[k];uint32_t n=p->patch[s];int hadPatch=n!=NONE;MSXResidentSlotPatch*q;MSXResidentPatchKind finalKind=kind?kind:defaultKind(used);if(!hadPatch){n=S.nslot++;p->patch[s]=n;}q=&S.slot[n];if(hadPatch&&q->kind==MSX_RESIDENT_PATCH_IMPORT&&finalKind==MSX_RESIDENT_PATCH_META)finalKind=MSX_RESIDENT_PATCH_IMPORT;q->linkIndex=k;q->slot=s;q->generation=p->gen[s];q->used=used;q->kind=finalKind;if(used)getpayload(p,s,&q->payload);else{memset(&q->payload,0,sizeof(q->payload));q->payload.generation=p->gen[s];}if(used)S.stat.slotUploads++;else S.stat.slotInvalidates++;}
+static void markslot(uint32_t k,uint32_t s,uint32_t used,MSXResidentPatchKind kind)
+{
+    Pipe *p=&S.p[k];uint32_t n=p->patch[s];int hadPatch=n!=NONE;
+    MSXResidentSlotPatch *q;MSXResidentPatchKind requested=kind?kind:defaultKind(used),finalKind=requested;
+    if(!hadPatch){n=S.nslot++;p->patch[s]=n;memset(&S.slot[n],0,sizeof(S.slot[n]));}
+    q=&S.slot[n];
+    if(hadPatch&&q->kind==MSX_RESIDENT_PATCH_IMPORT&&finalKind==MSX_RESIDENT_PATCH_META)finalKind=MSX_RESIDENT_PATCH_IMPORT;
+    if(finalKind!=MSX_RESIDENT_PATCH_IMPORT)q->uploadRevision=0;
+    q->linkIndex=k;q->slot=s;q->generation=p->gen[s];q->used=used;q->kind=finalKind;
+    if(used)getpayload(p,s,&q->payload);
+    else{memset(&q->payload,0,sizeof(q->payload));q->payload.generation=p->gen[s];}
+    if(used&&requested==MSX_RESIDENT_PATCH_IMPORT&&MSXupload_enabled()){
+        if(S.compact){q->payload.c=p->sourceC;q->payload.lastc=p->sourceL;}
+        if(MSXupload_capture(q,&q->uploadRevision)!=MSX_RESIDENT_OK)S.poisoned=1;
+        else p->revision[s]=q->uploadRevision;
+        if(S.compact){q->payload.c=q->payload.lastc=NULL;p->sourceC=p->sourceL=NULL;}
+    }
+    if(used)S.stat.slotUploads++;else S.stat.slotInvalidates++;
+}
 static int payloadMetaEqual(const Pipe *p,uint32_t s,const MSXResidentPayload *x)
 { const double *r=crow((Pipe *)p,s); return r[0]==x->volume&&r[1]==x->hstep&&r[2]==x->hresponse&&r[3]==x->uresponse&&r[4]==x->dresponse&&p->id[s]==x->parcelId; }
 static int payloadConcentrationEqual(const Pipe *p,uint32_t s,const MSXResidentPayload *x)
-{ const double *r=crow((Pipe *)p,s);uint32_t m;for(m=0;m<S.stride;m++)if(r[5+m]!=x->c[m]||lrow((Pipe *)p,s)[5+m]!=x->lastc[m])return 0;return 1; }
+{ const double *r=crow((Pipe *)p,s);uint32_t m;if(S.compact)return 0;for(m=0;m<S.stride;m++)if(r[5+m]!=x->c[m]||lrow((Pipe *)p,s)[5+m]!=x->lastc[m])return 0;return 1; }
 static void writePayload(Pipe *p,uint32_t s,const MSXResidentPayload *x)
-{ double*r=crow(p,s);uint32_t m;r[0]=x->volume;r[1]=x->hstep;r[2]=x->hresponse;r[3]=x->uresponse;r[4]=x->dresponse;p->id[s]=x->parcelId;for(m=0;m<S.stride;m++){r[5+m]=x->c[m];lrow(p,s)[5+m]=x->lastc[m];} }
+{ double*r=crow(p,s);uint32_t m;r[0]=x->volume;r[1]=x->hstep;r[2]=x->hresponse;r[3]=x->uresponse;r[4]=x->dresponse;p->id[s]=x->parcelId;p->sourceC=x->c;p->sourceL=x->lastc;if(S.compact)return;for(m=0;m<S.stride;m++){r[5+m]=x->c[m];lrow(p,s)[5+m]=x->lastc[m];} }
 
 /* FILE and automatic plans share the same validated fixed layout allocator. */
 uint64_t MSXresident_fixedHostBytes(uint32_t links,uint32_t slots,uint32_t stride)
 {
  uint64_t l=(uint64_t)links+1,s=slots;
- return ((uint64_t)10*links+10)*MSXresidentAlloc_headerBytes()+
+ return ((uint64_t)11*links+10)*MSXresidentAlloc_headerBytes()+
   l*(sizeof(Pipe)+5*sizeof(uint32_t)+sizeof(Tx))+
   (uint64_t)links*sizeof(MSXResidentDescriptorPatch)+
   s*(sizeof(MSXResidentSlotPatch)+2*sizeof(MSXResidentHandoffItem)+
-     sizeof(MSXResidentHandoffResult)+sizeof(Pseg)+1+4*sizeof(uint32_t)+sizeof(uint64_t)+
-     ((uint64_t)2*stride+10)*sizeof(double));
+     sizeof(MSXResidentHandoffResult)+sizeof(Pseg)+1+4*sizeof(uint32_t)+2*sizeof(uint64_t)+
+     (MSX.GpuCoreMode==2?5:(uint64_t)2*stride+10)*sizeof(double));
 }
 MSXResidentStatus MSXresident_openPlan(uint32_t links,const uint32_t *limit,
                                       const uint32_t *guards,const char *hash)
@@ -83,7 +124,7 @@ MSXResidentStatus MSXresident_openPlan(uint32_t links,const uint32_t *limit,
  uint32_t k,base=0;size_t b,n;Pipe *p;
  if(!links||links!=(uint32_t)MSX.Nobjects[LINK]||!limit||!guards||!hashok(hash))
    return MSX_RESIDENT_ERR_ARGUMENT;
- freestate();S.nlinks=links;strcpy(S.hash,hash);hashupper(S.hash);
+ freestate();S.compact=MSX.GpuCoreMode==2;S.nlinks=links;strcpy(S.hash,hash);hashupper(S.hash);
  if(!mul((size_t)links+1,sizeof(Pipe),&b))goto ov;
  S.p=(Pipe*)calloc(1,b);if(!S.p)goto mem;
  for(k=1;k<=links;++k){
@@ -94,7 +135,7 @@ MSXResidentStatus MSXresident_openPlan(uint32_t links,const uint32_t *limit,
    S.slots+=cap;p=&S.p[k];p->guard=guards[k];p->admissionLimit=limit[k];
    p->d.linkIndex=k;p->d.capacity=cap;p->d.head=p->d.tail=NONE;p->d.orient=1;
  }
-S.stride=(uint32_t)MSX.Nobjects[SPECIES]+1;if(S.stride>UINT32_MAX-5)goto ov;S.rowWidth=5+S.stride;if(!mul((size_t)S.nlinks+1,sizeof(uint32_t),&b))goto ov;S.dirty=(uint32_t*)malloc(b);S.capacity=(uint32_t*)calloc(1,b);S.base=(uint32_t*)calloc(1,b);S.admissionLimit=(uint32_t*)calloc(1,b);if(!S.dirty||!S.capacity||!S.base||!S.admissionLimit)goto mem;for(k=0;k<=S.nlinks;k++)S.dirty[k]=NONE;for(k=1;k<=S.nlinks;k++){S.admissionLimit[k]=S.p[k].admissionLimit;S.capacity[k]=S.p[k].d.capacity;S.base[k]=base;base+=S.capacity[k];}if(!mul(S.nlinks,sizeof(*S.desc),&b))goto ov;S.desc=(MSXResidentDescriptorPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.slot),&b))goto ov;S.slot=(MSXResidentSlotPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.hand),&b))goto ov;S.hand=(MSXResidentHandoffItem*)calloc(1,b);if(!S.desc||!S.slot||!S.hand)goto mem;S.tx=(Tx*)calloc((size_t)S.nlinks+1,sizeof(*S.tx));if(!S.tx)goto mem;for(k=1;k<=S.nlinks;k++){Tx*t=&S.tx[k];p=&S.p[k];t->capacity=p->d.capacity;t->item=(MSXResidentHandoffItem*)calloc(t->capacity,sizeof(*t->item));t->result=(MSXResidentHandoffResult*)calloc(t->capacity,sizeof(*t->result));t->boundary=(Pseg*)calloc(t->capacity,sizeof(*t->boundary));if(!t->item||!t->result||!t->boundary)goto mem;if(!mul(p->d.capacity,2*(size_t)S.rowWidth,&n)||!mul(n,sizeof(double),&b))goto ov;p->row=(double*)calloc(1,b);p->used=(unsigned char*)calloc(p->d.capacity,1);p->gen=(uint32_t*)calloc(p->d.capacity,sizeof(uint32_t));p->id=(uint64_t*)calloc(p->d.capacity,sizeof(uint64_t));p->patch=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsI2s=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsKeep=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));if(!p->row||!p->used||!p->gen||!p->id||!p->patch||!p->obsI2s||!p->obsKeep)goto mem;for(n=0;n<p->d.capacity;n++)p->patch[n]=NONE;}
+S.stride=(uint32_t)MSX.Nobjects[SPECIES]+1;if(S.stride>UINT32_MAX-5)goto ov;S.rowWidth=S.compact?5:5+S.stride;if(!mul((size_t)S.nlinks+1,sizeof(uint32_t),&b))goto ov;S.dirty=(uint32_t*)malloc(b);S.capacity=(uint32_t*)calloc(1,b);S.base=(uint32_t*)calloc(1,b);S.admissionLimit=(uint32_t*)calloc(1,b);if(!S.dirty||!S.capacity||!S.base||!S.admissionLimit)goto mem;for(k=0;k<=S.nlinks;k++)S.dirty[k]=NONE;for(k=1;k<=S.nlinks;k++){S.admissionLimit[k]=S.p[k].admissionLimit;S.capacity[k]=S.p[k].d.capacity;S.base[k]=base;base+=S.capacity[k];}if(!mul(S.nlinks,sizeof(*S.desc),&b))goto ov;S.desc=(MSXResidentDescriptorPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.slot),&b))goto ov;S.slot=(MSXResidentSlotPatch*)calloc(1,b);if(!mul(S.slots,sizeof(*S.hand),&b))goto ov;S.hand=(MSXResidentHandoffItem*)calloc(1,b);if(!S.desc||!S.slot||!S.hand)goto mem;S.tx=(Tx*)calloc((size_t)S.nlinks+1,sizeof(*S.tx));if(!S.tx)goto mem;for(k=1;k<=S.nlinks;k++){Tx*t=&S.tx[k];p=&S.p[k];t->capacity=p->d.capacity;t->item=(MSXResidentHandoffItem*)calloc(t->capacity,sizeof(*t->item));t->result=(MSXResidentHandoffResult*)calloc(t->capacity,sizeof(*t->result));t->boundary=(Pseg*)calloc(t->capacity,sizeof(*t->boundary));if(!t->item||!t->result||!t->boundary)goto mem;if(!mul(p->d.capacity,(S.compact?1:2)*(size_t)S.rowWidth,&n)||!mul(n,sizeof(double),&b))goto ov;p->row=(double*)calloc(1,b);p->used=(unsigned char*)calloc(p->d.capacity,1);p->gen=(uint32_t*)calloc(p->d.capacity,sizeof(uint32_t));p->id=(uint64_t*)calloc(p->d.capacity,sizeof(uint64_t));p->revision=(uint64_t*)calloc(p->d.capacity,sizeof(uint64_t));p->patch=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsI2s=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));p->obsKeep=(uint32_t*)malloc((size_t)p->d.capacity*sizeof(uint32_t));if(!p->row||!p->used||!p->gen||!p->id||!p->revision||!p->patch||!p->obsI2s||!p->obsKeep)goto mem;for(n=0;n<p->d.capacity;n++)p->patch[n]=NONE;}
  S.open=1;S.mode=MSX_RESIDENT_OFF;return MSX_RESIDENT_OK;
 bad:freestate();return MSX_RESIDENT_ERR_ARGUMENT;
 ov:freestate();return MSX_RESIDENT_ERR_OVERFLOW;
@@ -151,6 +192,7 @@ MSXResidentStatus MSXresident_observePipe(uint32_t k,const uint64_t*id,const MSX
     int topologyChanged = 0;
     if (S.mode == MSX_RESIDENT_OFF) return MSX_RESIDENT_OK;
     z = pipeok(k, &p); if (z) return z;
+    if(S.compact&&S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT;
     if ((count && (!id || !in)) || count > p->admissionLimit ||
         (orient != 1 && orient != -1)) return MSX_RESIDENT_ERR_ARGUMENT;
     i2s = p->obsI2s; keep = p->obsKeep;
@@ -217,7 +259,7 @@ MSXResidentStatus MSXresident_observePipe(uint32_t k,const uint64_t*id,const MSX
     for (s = 0; s < p->d.capacity; ++s) if (p->used[s] && !keep[s])
     {
         p->used[s] = 0; p->id[s] = 0;
-        memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+        memset(crow(p, s), 0, (S.compact?1:2) * (size_t)S.rowWidth * sizeof(double));
         markslot(k, s, 0, MSX_RESIDENT_PATCH_INVALIDATE);
     }
     for (i = 0; i < count; ++i)
@@ -285,7 +327,7 @@ MSXResidentStatus MSXresident_stageRemove(uint32_t k,uint32_t s,uint32_t generat
     else return MSX_RESIDENT_ERR_ARGUMENT;
     if (p->d.epoch == UINT64_MAX) return MSX_RESIDENT_ERR_OVERFLOW;
     p->used[s] = 0; p->id[s] = 0;
-    memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+    memset(crow(p, s), 0, (S.compact?1:2) * (size_t)S.rowWidth * sizeof(double));
     if (p->d.count == 1) p->d.head = p->d.tail = NONE;
     else if (!side) p->d.head = nextslot(p, p->d.head, p->d.orient);
     else p->d.tail = prevslot(p, p->d.tail, p->d.orient);
@@ -351,7 +393,7 @@ MSXResidentStatus MSXresident_stageRemoveBatch(
         else if (s == tail) side = 1;
         else return MSX_RESIDENT_ERR_ARGUMENT;
         p->used[s] = 0; p->id[s] = 0;
-        memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+        memset(crow(p, s), 0, (S.compact?1:2) * (size_t)S.rowWidth * sizeof(double));
         if (remaining == 1) head = tail = NONE;
         else if (!side) head = nextslot(p, head, p->d.orient);
         else tail = prevslot(p, tail, p->d.orient);
@@ -368,6 +410,7 @@ MSXResidentStatus MSXresident_auditPoisonCpuMirrors(void)
 {
     uint32_t k, s, m;
     if (!S.open) return MSX_RESIDENT_DISABLED;
+    if(S.compact)return MSX_RESIDENT_OK; /* No Core concentration mirror exists. */
     /* This is intentionally an explicit audit-only walk.  Production runs
        never call it unless the runtime audit environment switch is enabled. */
     for (k = 1; k <= S.nlinks; ++k)
@@ -403,7 +446,7 @@ MSXResidentStatus MSXresident_stageClear(uint32_t k)
         if (p->used[s])
         {
             p->used[s] = 0; p->id[s] = 0;
-            memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+            memset(crow(p, s), 0, (S.compact?1:2) * (size_t)S.rowWidth * sizeof(double));
             markslot(k, s, 0, MSX_RESIDENT_PATCH_INVALIDATE);
         }
     p->d.count = 0; p->d.head = p->d.tail = NONE;
@@ -476,12 +519,14 @@ MSXResidentStatus MSXresident_getSlotIdentity(uint32_t k,uint32_t s,
     if (epochOut) *epochOut = p->d.epoch;
     return MSX_RESIDENT_OK;
 }
-MSXResidentStatus MSXresident_getSlotPayload(uint32_t k,uint32_t s,uint32_t g,MSXResidentPayload*x){Pipe*p;MSXResidentStatus z;if(!x)return MSX_RESIDENT_ERR_ARGUMENT;z=pipeok(k,&p);if(z)return z;if(s>=p->d.capacity||!p->used[s]||p->gen[s]!=g){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}getpayload(p,s,x);return MSX_RESIDENT_OK;}
-MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow*r,const MSXResidentPayload*x,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if((!r||!x)&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].globalRow!=S.base[r[i].linkIndex]+r[i].slot||r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].descriptorEpoch||p->id[r[i].slot]!=r[i].parcelId||!x[i].c||!x[i].lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=x[i].volume;q[1]=x[i].hstep;q[2]=x[i].hresponse;q[3]=x[i].uresponse;q[4]=x[i].dresponse;for(m=0;m<S.stride;m++){q[5+m]=x[i].c[m];lrow(p,r[i].slot)[5+m]=x[i].lastc[m];}}}return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_getSlotMetadata(uint32_t k,uint32_t s,uint32_t g,MSXResidentPayload*x){Pipe*p;MSXResidentStatus z;if(!x)return MSX_RESIDENT_ERR_ARGUMENT;z=pipeok(k,&p);if(z)return z;if(s>=p->d.capacity||!p->used[s]||p->gen[s]!=g){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}getpayload(p,s,x);x->c=x->lastc=NULL;return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_getSlotPayload(uint32_t k,uint32_t s,uint32_t g,MSXResidentPayload*x)
+{MSXResidentStatus status=MSXresident_getSlotMetadata(k,s,g,x);if(status)return status;if(S.compact)return MSX_RESIDENT_ERR_ARGUMENT;getpayload(&S.p[k],s,x);return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow*r,const MSXResidentPayload*x,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if(S.compact)return MSX_RESIDENT_ERR_ARGUMENT;if((!r||!x)&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].globalRow!=S.base[r[i].linkIndex]+r[i].slot||r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].descriptorEpoch||p->id[r[i].slot]!=r[i].parcelId||!x[i].c||!x[i].lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=x[i].volume;q[1]=x[i].hstep;q[2]=x[i].hresponse;q[3]=x[i].uresponse;q[4]=x[i].dresponse;for(m=0;m<S.stride;m++){q[5+m]=x[i].c[m];lrow(p,r[i].slot)[5+m]=x[i].lastc[m];}}}return MSX_RESIDENT_OK;}
 uint64_t MSXresident_testAllocationCount(void){return ResidentAllocationCount;}
 void MSXresident_testResetAllocationCount(void){ResidentAllocationCount=0;}
 void MSXresident_testFailAllocationAfter(int64_t allocationIndex){ResidentAllocationFailAfter=allocationIndex;}
-MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*b){if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;b->descriptor=S.desc;b->descriptorCount=S.ndesc;b->slot=S.slot;b->slotCount=S.nslot;return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*b){if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;if(S.poisoned)return MSX_RESIDENT_ERR_POISONED;b->descriptor=S.desc;b->descriptorCount=S.ndesc;b->slot=S.slot;b->slotCount=S.nslot;return MSX_RESIDENT_OK;}
 void MSXresident_clearPatches(void)
 { uint32_t i,k,s; if(!S.open)return; for(i=0;i<S.ndesc;i++){k=S.desc[i].linkIndex;if(k&&k<=S.nlinks)S.dirty[k]=NONE;} for(i=0;i<S.nslot;i++){k=S.slot[i].linkIndex;s=S.slot[i].slot;if(k&&k<=S.nlinks&&s<S.p[k].d.capacity)S.p[k].patch[s]=NONE;} S.ndesc=S.nslot=0; }
 MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *o){uint32_t k;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(!S.open||!S.capacity||!S.base)return MSX_RESIDENT_DISABLED;if(!S.guard){S.guard=(uint32_t*)calloc((size_t)S.nlinks+1,sizeof(*S.guard));if(!S.guard)return MSX_RESIDENT_ERR_MEMORY;for(k=1;k<=S.nlinks;k++)S.guard[k]=S.p[k].guard;}o->nLinks=S.nlinks;o->totalSlots=(uint32_t)S.slots;o->speciesStride=S.stride;o->capacity=S.capacity;o->base=S.base;o->guard=S.guard;o->admissionLimit=S.admissionLimit;return MSX_RESIDENT_OK;}
@@ -491,7 +536,7 @@ MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,uint32_
   if(total!=n||n>S.slots)return MSX_RESIDENT_ERR_OVERFLOW;*count=n;return MSX_RESIDENT_OK; }
 MSXResidentStatus MSXresident_getInitialBatch(MSXResidentPatchBatch *b){uint32_t k,s,n=0;if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;if(!S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT;/* Initial image construction reuses the patch arenas; discard the staging
    indices before filling the dense all-slot image so later incremental
-   markslot() calls cannot address overwritten records. */MSXresident_clearPatches();for(k=1;k<=S.nlinks;k++){S.desc[k-1].linkIndex=k;S.desc[k-1].descriptor=S.p[k].d;for(s=0;s<S.p[k].d.capacity;s++){MSXResidentSlotPatch*q=&S.slot[n++];q->linkIndex=k;q->slot=s;q->generation=S.p[k].gen[s];q->used=S.p[k].used[s];q->kind=q->used?MSX_RESIDENT_PATCH_IMPORT:MSX_RESIDENT_PATCH_INVALIDATE;getpayload(&S.p[k],s,&q->payload);}}b->descriptor=S.desc;b->descriptorCount=S.nlinks;b->slot=S.slot;b->slotCount=n;return MSX_RESIDENT_OK;}
+   markslot() calls cannot address overwritten records. */MSXresident_clearPatches();for(k=1;k<=S.nlinks;k++){S.desc[k-1].linkIndex=k;S.desc[k-1].descriptor=S.p[k].d;for(s=0;s<S.p[k].d.capacity;s++){MSXResidentSlotPatch*q=&S.slot[n++];q->linkIndex=k;q->slot=s;q->generation=S.p[k].gen[s];q->used=S.p[k].used[s];q->kind=q->used?MSX_RESIDENT_PATCH_IMPORT:MSX_RESIDENT_PATCH_INVALIDATE;getpayload(&S.p[k],s,&q->payload);q->uploadRevision=q->used?S.p[k].revision[s]:0;}}b->descriptor=S.desc;b->descriptorCount=S.nlinks;b->slot=S.slot;b->slotCount=n;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_beginInitialImage(void)
 { if(!S.open||S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT; S.initialStaging=1; return MSX_RESIDENT_OK; }
 MSXResidentStatus MSXresident_stageInitialPipe(uint32_t k,const uint64_t *id,
@@ -505,7 +550,7 @@ static uint32_t nth(Pipe*p,uint32_t base,int dir,uint32_t n){int64_t q=(int64_t)
 MSXResidentStatus MSXresident_planHandoff(uint32_t k,double flow,double dt,uint32_t side,double bv,int strict,MSXResidentHandoffPlan*o){Pipe*p;MSXResidentStatus z;double need;if(!o||dt<0||side>1)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(S.mode==MSX_RESIDENT_OFF)return MSX_RESIDENT_OK;z=pipeok(k,&p);if(z)return z;need=fabs(flow)*dt;o->linkIndex=k;o->boundarySide=side;o->pipeEpoch=p->d.epoch;o->flowVolume=need;if(need<=bv)return MSX_RESIDENT_OK;need-=bv;S.nh=0;while(need>0&&S.nh<p->d.count){uint32_t s=nth(p,side?p->d.tail:p->d.head,side?-p->d.orient:p->d.orient,S.nh);if(!p->used[s])return MSX_RESIDENT_ERR_GENERATION;S.hand[S.nh].linkIndex=k;S.hand[S.nh].slot=s;S.hand[S.nh].generation=p->gen[s];S.hand[S.nh].boundarySide=side;S.hand[S.nh].pipeEpoch=p->d.epoch;S.hand[S.nh].requestedVolume=crow(p,s)[0];need-=crow(p,s)[0];S.nh++;}S.stat.handoffRequests++;if(need>0){S.stat.fallbacks++;return strict||S.strict?MSX_RESIDENT_ERR_CAPACITY:MSX_RESIDENT_FALLBACK_WHOLE_LINK;}o->itemCount=S.nh;o->item=S.hand;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_planHandoffInto(uint32_t k,double flow,double dt,uint32_t side,double bv,int strict,MSXResidentHandoffItem *item,uint32_t cap,MSXResidentHandoffPlan *o){MSXResidentStatus z;MSXResidentHandoffPlan q;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;z=MSXresident_planHandoff(k,flow,dt,side,bv,strict,&q);if(z!=MSX_RESIDENT_OK)return z;if(q.itemCount>cap||(!item&&q.itemCount))return MSX_RESIDENT_ERR_CAPACITY;*o=q;o->item=item;if(q.itemCount)memcpy(item,q.item,(size_t)q.itemCount*sizeof(*item));return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_planAllHandoffInto(uint32_t k,uint32_t side,MSXResidentHandoffItem *item,uint32_t cap,MSXResidentHandoffPlan *o){Pipe*p;MSXResidentStatus z;uint32_t i;if(!o||side>1)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));z=pipeok(k,&p);if(z)return z;if(p->d.count>cap||(!item&&p->d.count))return MSX_RESIDENT_ERR_CAPACITY;o->linkIndex=k;o->boundarySide=side;o->pipeEpoch=p->d.epoch;o->itemCount=p->d.count;o->item=item;for(i=0;i<p->d.count;i++){uint32_t s=nth(p,side?p->d.tail:p->d.head,side?-p->d.orient:p->d.orient,i);if(!p->used[s])return MSX_RESIDENT_ERR_GENERATION;item[i].linkIndex=k;item[i].slot=s;item[i].generation=p->gen[s];item[i].boundarySide=side;item[i].pipeEpoch=p->d.epoch;item[i].requestedVolume=crow(p,s)[0];}return MSX_RESIDENT_OK;}
-MSXResidentStatus MSXresident_applyHandoff(const MSXResidentHandoffResult*r,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if(!r&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].pipeEpoch||r[i].boundarySide>1||!r[i].payload.c||!r[i].payload.lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=r[i].payload.volume;q[1]=r[i].payload.hstep;q[2]=r[i].payload.hresponse;q[3]=r[i].payload.uresponse;q[4]=r[i].payload.dresponse;for(m=0;m<S.stride;m++){q[5+m]=r[i].payload.c[m];lrow(p,r[i].slot)[5+m]=r[i].payload.lastc[m];}}}return MSX_RESIDENT_OK;}const MSXResidentStats*MSXresident_stats(void){return&S.stat;}
+MSXResidentStatus MSXresident_applyHandoff(const MSXResidentHandoffResult*r,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if(S.compact)return MSX_RESIDENT_ERR_ARGUMENT;if(!r&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].pipeEpoch||r[i].boundarySide>1||!r[i].payload.c||!r[i].payload.lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=r[i].payload.volume;q[1]=r[i].payload.hstep;q[2]=r[i].payload.hresponse;q[3]=r[i].payload.uresponse;q[4]=r[i].payload.dresponse;for(m=0;m<S.stride;m++){q[5+m]=r[i].payload.c[m];lrow(p,r[i].slot)[5+m]=r[i].payload.lastc[m];}}}return MSX_RESIDENT_OK;}const MSXResidentStats*MSXresident_stats(void){return&S.stat;}
 
 static void txreset(Tx *t)
 {
@@ -664,7 +709,7 @@ void MSXresident_commitHandoffTransaction(MSXResidentHandoffTransaction *x)
     {
         uint32_t s = t->result[i].slot;
         p->used[s] = 0; p->id[s] = 0;
-        memset(crow(p, s), 0, 2 * (size_t)S.rowWidth * sizeof(double));
+        memset(crow(p, s), 0, (S.compact?1:2) * (size_t)S.rowWidth * sizeof(double));
         markslot(t->plan.linkIndex, s, 0, MSX_RESIDENT_PATCH_INVALIDATE);
     }
     p->d.count -= t->count;

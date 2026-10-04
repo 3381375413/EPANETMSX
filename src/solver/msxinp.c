@@ -19,6 +19,7 @@
 #include "msxutils.h"
 #include "msxdict.h"
 #include "epanet2.h"
+#include "msxresident_alloc_redirect.h"
 
 //  Constants
 //-----------
@@ -107,6 +108,23 @@ static int    checkCyclicTerms(void);
 static int    traceTermPath(int i, int istar, int n);                          
 
 //=============================================================================
+
+int MSXinp_readMemoryOptions(void)
+{
+    char line[MAXLINE+1];int section=-1,option,error;long number=0;
+    rewind(MSX.MsxFile.file);
+    while(fgets(line,MAXLINE,MSX.MsxFile.file)){
+        ++number;Ntokens=getTokens(line);if(!Ntokens)continue;
+        if(getNewSection(Tok[0],MsxSectWords,&section))continue;
+        if(section!=s_OPTION)continue;
+        option=MSXutils_findmatch(Tok[0],OptionTypeWords);
+        if(option!=GPU_CORE_MODE_OPTION && option<GPU_CORE_HOST_MEMORY_MB_OPTION)continue;
+        error=parseOption();
+        if(error){writeInpErrMsg(error,MsxSectWords[section],line,number);
+            rewind(MSX.MsxFile.file);return ERR_MSX_INPUT;}
+    }
+    rewind(MSX.MsxFile.file);return 0;
+}
 
 int MSXinp_countMsxObjects()
 /*
@@ -810,6 +828,32 @@ int parseOption()
           if ( strlen(Tok[1]) >= MAXFNAME ) return ERR_ITEMS;
           strcpy(MSX.GpuCoreCapacityFile, Tok[1]);
           break;
+
+      case GPU_CORE_HOST_MEMORY_MB_OPTION:
+      case GPU_CORE_CPU_POOL_BUDGET_MB_OPTION:
+      case GPU_CORE_UPLOAD_BUDGET_MB_OPTION:
+      case GPU_CORE_TRANSFER_BATCH_ROWS_OPTION:
+      {
+          uint64_t value,*target=NULL;unsigned mask;
+          if (option == GPU_CORE_TRANSFER_BATCH_ROWS_OPTION)
+          {
+              if (!MSXmemory_parseInteger(Tok[1],&value) || !value || value>UINT32_MAX) return ERR_NUMBER;
+              if ((MSX.ResidentMemoryOptions.explicitMask&MSX_MEMORY_OPTION_BATCH) &&
+                  MSX.ResidentMemoryOptions.batchRows!=(uint32_t)value) return ERR_NUMBER;
+              MSX.ResidentMemoryOptions.batchRows=(uint32_t)value;mask=MSX_MEMORY_OPTION_BATCH;
+          }
+          else
+          {
+              if (!MSXmemory_parseMB(Tok[1],&value)) return ERR_NUMBER;
+              if(option==GPU_CORE_HOST_MEMORY_MB_OPTION){target=&MSX.ResidentMemoryOptions.hostBytes;mask=MSX_MEMORY_OPTION_HOST;}
+              else if(option==GPU_CORE_CPU_POOL_BUDGET_MB_OPTION){target=&MSX.ResidentMemoryOptions.cpuPoolBytes;mask=MSX_MEMORY_OPTION_CPU;}
+              else {target=&MSX.ResidentMemoryOptions.uploadBytes;mask=MSX_MEMORY_OPTION_UPLOAD;}
+              if ((MSX.ResidentMemoryOptions.explicitMask&mask) && *target!=value) return ERR_NUMBER;
+              *target=value;
+          }
+          MSX.ResidentMemoryOptions.explicitMask|=mask;
+          break;
+      }
 
     }
     return 0;

@@ -24,6 +24,7 @@
 #include "msxsegment_profile.h"
 #include "msxresident_runtime.h"
 #include "msxresident_capacity.h"
+#include "msxresident_alloc_redirect.h"
 
 //  External variables
 //--------------------

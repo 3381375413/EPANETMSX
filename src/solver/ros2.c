@@ -17,6 +17,7 @@
 #include <math.h>
 #include "msxutils.h"
 #include "ros2.h"
+#include "msxresident_alloc_redirect.h"
 
 #define fmin(x,y) (((x)<=(y)) ? (x) : (y))     /* minimum of x and y    */
 #define fmax(x,y) (((x)>=(y)) ? (x) : (y))     /* maximum of x and y    */

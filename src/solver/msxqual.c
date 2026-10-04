@@ -24,6 +24,8 @@
 #include "msxresident_runtime.h"
 #include "msxresident_capacity.h"
 #include "msxqual_shared.h"
+#include "msxresident_initial_golden.h"
+#include "msxresident_alloc_redirect.h"
 
 // Macros to identify upstream & downstream nodes of a link
 // under the current flow and to compute link volume
@@ -572,6 +574,19 @@ int MSXqual_step(double *t, double *tleft)
                                                     qualityApiExclusive);
                             return MSX.ErrCode;
                         }
+#ifdef MSX_RESIDENT_TEST_API
+                        /* Stop after initial GPU/topology publication and
+                           initial mass, before the first reaction (even dt=0).
+                           Ordinary builds contain no golden-state branch. */
+                        if (MSXinitialGolden_checkpoint())
+                        {
+                            *t = 0.0;
+                            *tleft = MSX.Dur / 1000.0;
+                            finishQualityApiProfile(profileStage, qualityApiStart,
+                                                    qualityApiExclusive);
+                            return 0;
+                        }
+#endif
                     }
                     else 
                     {
@@ -1289,6 +1304,156 @@ int  transport(int64_t tstep)
 
 //=============================================================================
 
+static void abortInitialTankDrafts(MSXResidentInitialTankDraft *draft,int tanks)
+{
+    int j;
+    if(!draft)return;
+    for(j=1;j<=tanks;++j){
+        Pseg seg=draft[j].first;
+        while(seg){Pseg next=seg->prev;seg->prev=seg->next=NULL;MSXqual_removeSeg(seg);seg=next;}
+        memset(&draft[j],0,sizeof(draft[j]));
+    }
+}
+
+static int appendInitialTankDraft(MSXResidentInitialTankDraft *draft,double volume,double *c)
+{
+    Pseg seg=MSXqual_getFreeSeg(volume,c);
+    if(!seg)return ERR_MEMORY;
+    seg->prev=NULL;seg->next=draft->last;
+    if(draft->last)draft->last->prev=seg;else draft->first=seg;
+    draft->last=seg;++draft->count;return 0;
+}
+
+static void auditDirectInitialAttempt(int error,MSXResidentInitialTankDraft *draft,int tanks,uint64_t equilCalls)
+{
+    const char *fault=getenv("MSX_RESIDENT_INIT_FAIL"),*audit=getenv("MSX_RESIDENT_MEMORY_AUDIT");
+    uint64_t pipes,cpu,core,tankRows=0;int j;FILE *f;
+    if(!fault&&(!audit||strcmp(audit,"1")))return;
+    MSXsegStorage_hybridDirectInitialCounts(&pipes,&cpu,&core);
+    for(j=1;j<=tanks;++j)tankRows+=draft[j].count;
+    f=fopen("resident_initial_attempts.csv","a+");if(!f)return;
+    fseek(f,0,SEEK_END);
+    if(!ftell(f))fprintf(f,"attempt,error,nonempty_pipes,cpu_parcels,core_parcels,tank_parcels,equil_calls\n");
+    {fprintf(f,"%u,%d,%llu,%llu,%llu,%llu,%llu\n",MSXresidentCapacity_startupAttempt(),error,
+       (unsigned long long)pipes,(unsigned long long)cpu,(unsigned long long)core,
+       (unsigned long long)tankRows,(unsigned long long)equilCalls);}
+    fclose(f);
+}
+
+/* Resident initialization creates CPU storage only for boundary/spill parcels.
+   Equilibrium is evaluated once in the historical link-then-tank order; the
+   immutable cache survives the one permitted smaller AUTO layout retry. */
+static int initDirectResidentSegs(void)
+{
+    uint32_t links=(uint32_t)MSX.Nobjects[LINK],tanks=(uint32_t)MSX.Nobjects[TANK];
+    uint32_t stride=(uint32_t)MSX.Nobjects[SPECIES]+1;
+    uint64_t rows=(uint64_t)links+tanks+1,equilCalls=0;
+    MSXResidentInitialTankDraft *draft=NULL;double *cache=NULL;
+    int j,k,m,error=0;double v;
+    MSXResidentBudget *scratch=MSXresidentBudget_domain(MSX_BUDGET_SCRATCH);
+    if(!stride||rows>SIZE_MAX/stride/sizeof(double)||
+       (uint64_t)tanks+1>SIZE_MAX/sizeof(*draft))return ERR_MEMORY;
+    cache=(double *)MSXresidentAlloc_callocBudget(scratch,(size_t)rows*stride,sizeof(double),__FILE__,__LINE__);
+    draft=(MSXResidentInitialTankDraft *)MSXresidentAlloc_callocBudget(scratch,(size_t)tanks+1,sizeof(*draft),__FILE__,__LINE__);
+    if(!cache||!draft){error=ERR_MEMORY;goto done;}
+    for(k=1;k<=(int)links;++k){
+        if(fabs(MSX.Q[k])<Q_STAGNANT)MSX.FlowDir[k]=ZERO_FLOW;
+        else MSX.FlowDir[k]=MSX.Q[k]>0.0?POSITIVE:NEGATIVE;
+        j=MSX.Link[k].n2;
+        for(m=1;m<(int)stride;++m){
+            if(MSX.Link[k].c0[m]!=MISSING)MSX.C1[m]=MSX.Link[k].c0[m];
+            else if(MSX.Species[m].type==BULK)MSX.C1[m]=MSX.Node[j].c0[m];
+            else MSX.C1[m]=0.0;
+        }
+        MSXchem_equil(LINK,k,MSX.C1);
+        ++equilCalls;
+        memcpy(cache+(size_t)k*stride+1,MSX.C1+1,(size_t)(stride-1)*sizeof(double));
+    }
+    for(j=1;j<=(int)tanks;++j){
+        if(MSX.Tank[j].a==0.0)continue;
+        k=MSX.Tank[j].node;
+        for(m=1;m<(int)stride;++m)MSX.C1[m]=MSX.Node[k].c0[m];
+        MSXchem_equil(NODE,j,MSX.C1);
+        ++equilCalls;
+        memcpy(cache+((size_t)links+j)*stride+1,MSX.C1+1,(size_t)(stride-1)*sizeof(double));
+    }
+    for(;;){
+        error=MSXresidentRuntime_prepareDirectInitial();
+        for(k=1;!error&&k<=(int)links;++k){
+            int total;v=LINKVOL(k);total=v>0.0?MIN(100,MSX.MaxSegments):0;
+            error=MSXsegStorage_hybridStageDirectInitialPipe(k,(uint32_t)total,
+                total?v/(double)total:0.0,cache+(size_t)k*stride);
+            if(!error&&total>0){
+                const char *fault=getenv("MSX_RESIDENT_INIT_FAIL");
+                if(fault&&(!_stricmp(fault,"direct_cpu_oom")||
+                   !_stricmp(fault,"direct_draft_oom")||
+                   ((!_stricmp(fault,"direct_cpu_oom_once")||!_stricmp(fault,"direct_draft_oom_once"))&&
+                    !MSXresidentCapacity_startupAttempt())))error=ERR_MEMORY;
+            }
+        }
+        for(j=1;!error&&j<=(int)tanks;++j){
+            double *c=cache+((size_t)links+j)*stride;
+            if(MSX.Tank[j].a==0.0)continue;
+            if(MSX.Tank[j].mixModel==MIX2){
+                v=MAX(0,MSX.Tank[j].v-MSX.Tank[j].vMix);
+                error=appendInitialTankDraft(&draft[j],v,c);
+                if(!error)error=appendInitialTankDraft(&draft[j],MSX.Tank[j].v-v,c);
+            }else error=appendInitialTankDraft(&draft[j],MSX.Tank[j].v,c);
+            if(!error){
+                const char *fault=getenv("MSX_RESIDENT_INIT_FAIL");
+                if(fault&&(!_stricmp(fault,"direct_tank_oom")||
+                   (!_stricmp(fault,"direct_tank_oom_once")&&!MSXresidentCapacity_startupAttempt())))error=ERR_MEMORY;
+            }
+        }
+        if(!error)error=MSXsegStorage_hybridValidateDirectInitial();
+        for(j=1;!error&&j<=(int)tanks;++j){
+            Pseg seg,previous=NULL;uint32_t n=0;
+            if(MSX.Tank[j].a==0.0)continue;
+            for(seg=draft[j].first;seg;seg=seg->prev){
+                if(n>=draft[j].count||seg->next!=previous||!seg->c||!seg->lastc){error=ERR_MEMORY;break;}
+                previous=seg;++n;
+            }
+            if(n!=draft[j].count||previous!=draft[j].last||
+               n!=(MSX.Tank[j].mixModel==MIX2?2U:1U))error=ERR_MEMORY;
+        }
+        auditDirectInitialAttempt(error,draft,(int)tanks,equilCalls);
+        if(!error)error=MSXresidentRuntime_finishDirectInitial();
+        if(!error)error=MSXresidentRuntime_afterHybridInit();
+        if(!error){
+            /* All drafts were validated before any visible list publication;
+               these remaining tank pointer stores cannot allocate or fail. */
+            for(j=1;j<=(int)tanks;++j){
+                k=(int)links+j;
+                MSX.FirstSeg[k]=draft[j].first;MSX.LastSeg[k]=draft[j].last;MSX.NewSeg[k]=NULL;
+                memset(&draft[j],0,sizeof(draft[j]));
+            }
+            error=MSXresidentRuntime_completeDirectInitial();
+            break;
+        }
+        MSXresidentRuntime_close();
+        abortInitialTankDrafts(draft,(int)tanks);
+        if(!MSX.GpuCoreCapacityMode||
+           (error!=ERR_MEMORY&&error!=ERR_GPU_MEMORY_ALLOCATION_FAILED)||
+           !MSXresidentCapacity_retryBudget())break;
+        {const char *reason=getenv("MSX_RESIDENT_INIT_FAIL");
+         MSXresidentCapacity_noteStartupRetry(reason?reason:"initial_memory_allocation");}
+        /* No published list survives this reset. Retained QualPool blocks
+           remain charged; cache and tank ledger belong to independent heap. */
+        error=MSXsegStorage_hybridResetUncommitted();
+        if(error)break;
+        for(k=1;k<=(int)(links+tanks);++k){
+            MSX.FirstSeg[k]=MSX.LastSeg[k]=MSX.NewSeg[k]=NULL;
+            if(k<=(int)links)MSX.Link[k].nsegs=0;
+        }
+        MSX.FreeSeg=NULL;AllocSetPool(MSX.QualPool);AllocReset();
+        MSX.ErrCode=0;MSX.OutOfMemory=0;memset(&MSX.GpuError,0,sizeof(MSX.GpuError));
+    }
+done:
+    if(error){MSXresidentRuntime_close();abortInitialTankDrafts(draft,(int)tanks);}
+    free(cache);free(draft);
+    return error;
+}
+
 void  initSegs()
 /*
 **   Purpose:
@@ -1300,6 +1465,12 @@ void  initSegs()
 {
     int     j, k, m;
     double  v;
+
+    if(MSX.GpuCoreMode==MSX_RESIDENT_RESIDENT&&MSXsegStorage_isHybridEnabled()){
+        MSX.ErrCode=initDirectResidentSegs();
+        if(!MSX.ErrCode)MSX.ErrCode=findstoredmass(MSX.MassBalance.initial);
+        return;
+    }
 
 // --- examine each link
 
@@ -3011,7 +3182,12 @@ Pseg MSXqual_getFreeSeg(double v, double c[])
     }
 
     if (MSXsegStorage_preparePrivate(seg))
+    {
+        /* A partially prepared object retains charged pool backing and can
+           finish its private buffers on a later growth attempt. */
+        seg->prev=MSX.FreeSeg;MSX.FreeSeg=seg;
         return NULL;
+    }
 
     seg->hybridId = 0;
 

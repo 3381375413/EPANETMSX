@@ -17,6 +17,7 @@
 
 #include "mathexpr.h"
 #include "mempool.h"
+#include "msxresident_options.h"
 
 //-----------------------------------------------------------------------------
 //  Definition of 4-byte integers & reals
@@ -231,7 +232,11 @@ typedef  float REAL4;
                   GPU_CORE_CAPACITY_FILE_OPTION,
                   GPU_CORE_OVERFLOW_OPTION,
                   GPU_CORE_CAPACITY_MODE_OPTION,
-                  GPU_CORE_MEMORY_MB_OPTION};
+                  GPU_CORE_MEMORY_MB_OPTION,
+                  GPU_CORE_HOST_MEMORY_MB_OPTION,
+                  GPU_CORE_TRANSFER_BATCH_ROWS_OPTION,
+                  GPU_CORE_CPU_POOL_BUDGET_MB_OPTION,
+                  GPU_CORE_UPLOAD_BUDGET_MB_OPTION};
 
  enum SegmentStorageType              // Pipe segment concentration storage
                  {SEG_STORAGE_PSEG,
@@ -842,6 +847,7 @@ typedef struct                         // MSX PROJECT VARIABLES
           GpuCoreOverflow,             // ERROR (0) or CPU (1) admission policy
           GpuCoreCapacityMode;         // FILE (0) or HYD_MINFLOW (1)
    double GpuCoreMemoryMB;
+   MSXResidentMemoryOptions ResidentMemoryOptions;
    char   InpFileName[MAXFNAME],       // actual EPANET input path, not reconstructed
           GpuCoreCapacityFile[MAXFNAME]; // resident capacity CSV path
    int    MaxSegments;                 // Maximum number of segments in a link  

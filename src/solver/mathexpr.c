@@ -51,6 +51,7 @@
 #include <math.h>
 
 #include "mathexpr.h"
+#include "msxresident_alloc_redirect.h"
 
 #define MAX_STACK_SIZE  1024
 

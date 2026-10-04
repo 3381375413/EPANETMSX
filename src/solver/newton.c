@@ -16,6 +16,7 @@
 #include <math.h>
 #include "msxutils.h"
 #include "newton.h"
+#include "msxresident_alloc_redirect.h"
 
 // Local declarations
 //-------------------

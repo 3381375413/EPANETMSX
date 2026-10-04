@@ -40,6 +40,7 @@ Linsolve() solves the linearized system of hydraulic equations.
 #include "msxtypes.h"
 #include "smatrix.h"
 #include "dispersion.h"
+#include "msxresident_alloc_redirect.h"
 #define  EXTERN  extern
 
 
@@ -122,7 +123,7 @@ int  msx_createsparse()
    ERRCODE(buildlists(FALSE));   //FALSE buildadjlists in 2.2
 
    /* Free allocated memory */
-   free(MSX.Dispersion.Degree);
+   FREE(MSX.Dispersion.Degree);
    return(errcode);
 }                        /* End of msx_createsparse */
 
@@ -181,8 +182,10 @@ void  msx_freesparse()
    FREE(MSX.Dispersion.link);
    FREE(MSX.Dispersion.first);
    FREE(MSX.Dispersion.temp);
+   FREE(MSX.Dispersion.Degree);
 
    FREE(MSX.Dispersion.md);
+   FREE(MSX.Dispersion.ld);
  
    FREE(MSX.Dispersion.pipeDispersionCoeff);
    dispersion_close();

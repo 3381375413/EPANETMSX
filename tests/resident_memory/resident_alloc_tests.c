@@ -36,6 +36,33 @@ int main(void)
     if(p)for(i=0;i<51;++i)CHECK(p[i]==0);
     MSXresidentBudget_snapshot(b,&s);CHECK(s.allocated[0]==header+51);
     MSXresidentAlloc_free(p);
+    /* Realloc reserves the complete replacement while the old block lives. */
+    a=(unsigned char*)MSXresidentAlloc_malloc(17,__FILE__,__LINE__);
+    memset(a,0x37,17);
+    CHECK(!MSXresidentBudget_configure(b,2*header+17+33-1,UINT64_MAX));
+    CHECK(MSXresidentAlloc_realloc(a,33,__FILE__,__LINE__)==NULL);
+    CHECK(a[0]==0x37 && a[16]==0x37);
+    CHECK(!MSXresidentBudget_configure(b,2*header+17+33,UINT64_MAX));
+    p=(unsigned char*)MSXresidentAlloc_realloc(a,33,__FILE__,__LINE__);CHECK(p!=NULL);
+    CHECK(p[0]==0x37 && p[16]==0x37 && MSXresidentAlloc_payloadBytes(p)==33);
+    CHECK(MSXresidentAlloc_chargedBytes(p)==header+33);
+    CHECK(MSXresidentAlloc_realloc(p,0,__FILE__,__LINE__)==NULL);
+    CHECK(!MSXresidentBudget_configure(b,UINT64_MAX,UINT64_MAX));
+    {
+        MSXExternalAllocation *r=MSXresidentExternal_reserve(100,MSX_MEMORY_DEVICE,__FILE__,__LINE__);
+        CHECK(r!=NULL);MSXresidentBudget_snapshot(b,&s);
+        CHECK(s.reserved[2]==100 && s.allocated[0]==MSXresidentExternal_recordBytes());
+        MSXresidentExternal_cancel(r);MSXresidentBudget_snapshot(b,&s);
+        CHECK(!s.reserved[2] && !s.allocated[0]);
+        r=MSXresidentExternal_reserve(100,MSX_MEMORY_PINNED,__FILE__,__LINE__);
+        MSXresidentExternal_commit(r,12345);MSXresidentBudget_snapshot(b,&s);
+        CHECK(s.allocated[1]==100 && !s.reserved[1]);
+        MSXresidentExternal_release(12345,MSX_MEMORY_PINNED);
+        CHECK(!MSXresidentBudget_configure(b,UINT64_MAX,99));
+        CHECK(MSXresidentExternal_reserve(100,MSX_MEMORY_DEVICE,__FILE__,__LINE__)==NULL);
+        MSXresidentBudget_snapshot(b,&s);CHECK(!s.allocated[0]&&!s.reserved[2]);
+        CHECK(!MSXresidentBudget_configure(b,UINT64_MAX,UINT64_MAX));
+    }
     /* A second allocation failure must not cancel the first allocation. */
     a=(unsigned char*)MSXresidentAlloc_malloc(17,__FILE__,__LINE__);failNext=1;
     CHECK(MSXresidentAlloc_malloc(17,__FILE__,__LINE__)==NULL);

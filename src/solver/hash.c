@@ -18,6 +18,7 @@
 #include <stdlib.h>
 
 #include "hash.h"
+#include "msxresident_alloc_redirect.h"
 
 /* Use Fletcher's checksum to compute 2-byte hash of string */
 unsigned int hash(char *str)

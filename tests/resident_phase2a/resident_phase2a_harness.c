@@ -14,14 +14,41 @@ int MSXgpu_prepareResidentContext(void){return 0;}
 int MSXgpu_openResidentPrograms(void){return 0;}
 int MSXgpu_getResidentProgramMemory(MSXResidentMemoryEstimate *m){memset(m,0,sizeof(*m));return 0;}
 int MSXresidentRuntime_isResident(void){return 0;}
+int MSXresidentRuntime_directInitialPlanning(void){return 0;}
+uint64_t MSXresidentRuntime_initialScratchBytes(uint32_t n,uint32_t t,uint32_t s){(void)n;(void)t;(void)s;return 0;}
 uint64_t MSXresidentRuntime_fixedHostBytes(uint32_t n,uint32_t s,uint32_t t){(void)n;(void)s;(void)t;return 0;}
 MSXproject MSX; static int pass,fail; static int segmentAllocFail; static uint64_t segmentAllocCalls;
 #define OK(x) do{if(x)pass++;else{fail++;fprintf(stderr,"FAIL:%s:%d: %s\n",__FILE__,__LINE__,#x);}}while(0)
 int ENgetlinkid(int i,char*id){sprintf(id,"L%d",i);return 0;} int ENwriteline(char*s){(void)s;return 0;}
 char *Alloc(long n){return(char*)calloc(1,(size_t)n);} double MSXgpu_wallTimeMs(void){return 0.0;}
+/* This fixture has no block allocator. Model zero extra block backing for
+   ownership tests; production budget gates use the real mempool/DLL. */
+int AllocBindReservation(alloc_handle_t *p,MSXBudgetTicket *ticket){(void)p;(void)ticket;return 1;}
+int AllocForecastBegin(alloc_handle_t *p,AllocForecast *forecast)
+{(void)p;if(!forecast)return 0;memset(forecast,0,sizeof(*forecast));return 1;}
+int AllocForecastAppend(AllocForecast *forecast,const uint64_t *sizes,unsigned count,uint64_t repeats)
+{
+    uint64_t total=0;unsigned i;
+    if(!forecast||!sizes||!count||count>16)return 0;
+    for(i=0;i<count;++i){
+        uint64_t aligned;
+        if(!sizes[i]||sizes[i]>64000)return 0;
+        aligned=(sizes[i]+3)&~UINT64_C(3);
+        if(total>UINT64_MAX-aligned)return 0;
+        total+=aligned;
+    }
+    /* Track simulated logical bytes only: this fixture's calloc objects
+       have no retained blocks or additional block backing to charge. */
+    if(repeats&&total>(UINT64_MAX-forecast->remaining)/repeats)return 0;
+    forecast->remaining+=total*repeats;
+    return 1;
+}
+int AllocAdditionalBacking(alloc_handle_t *p,const uint64_t *sizes,unsigned count,uint64_t repeats,uint64_t *bytes)
+{AllocForecast forecast;if(!bytes||!AllocForecastBegin(p,&forecast)||!AllocForecastAppend(&forecast,sizes,count,repeats))return 0;*bytes=forecast.bytes;return 1;}
 /* The standalone CPU harness does not link msxgpu.c.  Keep the stage gate
    disabled here; production builds resolve it from the GPU timing module. */
 int MSXgpu_profileStageEnabled(void){return 0;}
+int MSXgpu_profileDetailEnabled(void){return 0;}
 int MSXgpu_profileDetailGroupEnabled(MSXProfileDetailGroup group){(void)group;return 0;}
 void MSXgpu_profileRecordDemote(uint64_t rows,double ms){(void)rows;(void)ms;}
 void MSXgpu_profileRecordPromote(uint64_t rows,double ms){(void)rows;(void)ms;}
@@ -75,7 +102,7 @@ static void t19(void){char b[512];double c[2]={0,1},l[2]={0,2};uint64_t id=10,ne
 static void t20(void){char b[512];double c[2]={0,1},l[2]={0,2};uint64_t ids[4]={10,20,30,40},parcel,epoch0,epoch1;uint32_t g0,g1,g2,g3;MSXResidentPayload p[4],q;MSXResidentHandoffItem bad[2],good[2];MSXResidentPatchBatch x;setup(1,1);onecsv(b,sizeof(b),UP,4);open1(b);p[0]=payload(c,l,2,10);p[1]=payload(c,l,3,20);p[2]=payload(c,l,4,30);p[3]=payload(c,l,5,40);OK(MSXresident_observePipe(1,ids,p,4,1)==0);OK(MSXresident_getSlotIdentity(1,0,&g0,&parcel,&epoch0)==0&&parcel==10);OK(MSXresident_getSlotIdentity(1,1,&g1,&parcel,&epoch1)==0&&parcel==20&&epoch1==epoch0);OK(MSXresident_getSlotIdentity(1,2,&g2,&parcel,&epoch1)==0&&parcel==30&&epoch1==epoch0);OK(MSXresident_getSlotIdentity(1,3,&g3,&parcel,&epoch1)==0&&parcel==40&&epoch1==epoch0);bad[0]=(MSXResidentHandoffItem){1,0,g0,0,epoch0+1,0};bad[1]=(MSXResidentHandoffItem){1,2,g2,0,epoch0+1,0};OK(MSXresident_validateRemoveBatch(1,bad,2)==MSX_RESIDENT_ERR_GENERATION);OK(MSXresident_getSlotIdentity(1,0,&g0,&parcel,&epoch1)==0&&parcel==10&&epoch1==epoch0);bad[0].pipeEpoch=epoch0;bad[1].pipeEpoch=epoch0;OK(MSXresident_validateRemoveBatch(1,bad,2)==MSX_RESIDENT_ERR_ARGUMENT);OK(MSXresident_getSlotIdentity(1,0,&g0,&parcel,&epoch1)==0&&parcel==10&&epoch1==epoch0);OK(MSXresident_getPatches(&x)==0&&x.descriptorCount==1&&x.slotCount==4);MSXresident_clearPatches();good[0]=(MSXResidentHandoffItem){1,0,g0,0,epoch0,0};good[1]=(MSXResidentHandoffItem){1,3,g3,1,epoch0,0};OK(MSXresident_validateRemoveBatch(1,good,2)==0&&MSXresident_stageRemoveBatch(1,good,2)==0);OK(MSXresident_getSlotIdentity(1,0,&g0,&parcel,&epoch1)==MSX_RESIDENT_ERR_GENERATION&&MSXresident_getSlotIdentity(1,3,&g3,&parcel,&epoch1)==MSX_RESIDENT_ERR_GENERATION);OK(MSXresident_getSlotPayload(1,1,1,&q)==0&&q.parcelId==20);OK(MSXresident_getPatches(&x)==0&&x.descriptorCount==1&&x.slotCount==2&&x.descriptor[0].descriptor.count==2&&x.descriptor[0].descriptor.epoch==epoch0+2);}
 /* 21: an unexpected demote commit failure poisons the Resident runtime.  No
    later consumer may observe a plausible zero/CPU-mirror value. */
-static void t21(void){char b[512];double c[2]={0,1},l[2]={0,2};uint64_t id=77,parcel,epoch;uint32_t generation;MSXResidentPayload p=payload(c,l,2,id),q;MSXResidentPatchBatch x;setup(1,1);onecsv(b,sizeof(b),UP,2);open1(b);OK(MSXresident_observePipe(1,&id,&p,1,1)==0);MSXresident_clearPatches();MSXresident_poison();OK(MSXresident_getSlotIdentity(1,0,&generation,&parcel,&epoch)==MSX_RESIDENT_ERR_POISONED);OK(MSXresident_getSlotPayload(1,0,1,&q)==MSX_RESIDENT_ERR_POISONED);OK(MSXresident_stageRemove(1,0,generation)==MSX_RESIDENT_ERR_POISONED);OK(MSXresident_getPatches(&x)==MSX_RESIDENT_OK&&x.descriptorCount==0&&x.slotCount==0);}
+static void t21(void){char b[512];double c[2]={0,1},l[2]={0,2};uint64_t id=77,parcel,epoch;uint32_t generation;MSXResidentPayload p=payload(c,l,2,id),q;MSXResidentPatchBatch x;setup(1,1);onecsv(b,sizeof(b),UP,2);open1(b);OK(MSXresident_observePipe(1,&id,&p,1,1)==0);MSXresident_clearPatches();MSXresident_poison();OK(MSXresident_getSlotIdentity(1,0,&generation,&parcel,&epoch)==MSX_RESIDENT_ERR_POISONED);OK(MSXresident_getSlotPayload(1,0,1,&q)==MSX_RESIDENT_ERR_POISONED);OK(MSXresident_stageRemove(1,0,generation)==MSX_RESIDENT_ERR_POISONED);OK(MSXresident_getPatches(&x)==MSX_RESIDENT_ERR_POISONED&&x.descriptorCount==0&&x.slotCount==0);}
 /* 22: callers validate every link before staging any link.  A later-link
    stale request therefore cannot leave an earlier link partially removed. */
 static void t22(void){char b[768];double c[2]={0,1},l[2]={0,2};uint64_t a=101,z=202,parcel,epoch;uint32_t ga,gz;MSXResidentPayload pa=payload(c,l,2,a),pz=payload(c,l,3,z),q;MSXResidentHandoffItem good,bad;MSXResidentPatchBatch x;setup(1,2);snprintf(b,sizeof(b),"link_index,link_id,capacity,max_core_count,combined_burst_p99,guard,case_hash\n1,L1,2,2,1,2,%s\n2,L2,2,2,1,2,%s\n",UP,UP);csv("resident_phase2a.csv",b);OK(MSXresident_open("resident_phase2a.csv")==0);MSXresident_setMode(MSX_RESIDENT_SHADOW,0);OK(MSXresident_observePipe(1,&a,&pa,1,1)==0&&MSXresident_observePipe(2,&z,&pz,1,1)==0);OK(MSXresident_getSlotIdentity(1,0,&ga,&parcel,&epoch)==0&&parcel==a);OK(MSXresident_getSlotIdentity(2,0,&gz,&parcel,&epoch)==0&&parcel==z);MSXresident_clearPatches();good=(MSXResidentHandoffItem){1,0,ga,0,epoch,0};bad=(MSXResidentHandoffItem){2,0,gz,0,epoch+1,0};OK(MSXresident_validateRemoveBatch(1,&good,1)==0&&MSXresident_validateRemoveBatch(2,&bad,1)==MSX_RESIDENT_ERR_GENERATION);OK(MSXresident_getSlotIdentity(1,0,&ga,&parcel,&epoch)==0&&parcel==a);OK(MSXresident_getPatches(&x)==0&&x.descriptorCount==0&&x.slotCount==0);OK(MSXresident_stageRemoveBatch(1,&good,1)==0&&MSXresident_getSlotPayload(1,0,1,&q)==MSX_RESIDENT_ERR_GENERATION);}
@@ -263,14 +290,19 @@ static void t_hyd_scan(void)
 static void t_host_size_ledger(void)
 {
  uint32_t limit[3]={0,2,3},guard[3]={0,2,4};MSXResidentLayout layout;
- uint64_t coreBefore,hybridBefore;int stride;
+ uint64_t coreBefore,hybridBefore,existing;int stride;
  for(stride=2;stride<=18;stride+=4){
   setup(stride-1,2);MSX.SegmentStorage=SEG_STORAGE_HYBRID;
   coreBefore=MSXresident_testAllocationBytes();
   OK(MSXresident_openPlan(2,limit,guard,UP)==0&&MSXresident_getLayout(&layout)==0);
   OK(MSXresident_testAllocationBytes()-coreBefore==MSXresident_fixedHostBytes(2,5,(uint32_t)stride));
   hybridBefore=MSXsegStorage_testAllocationBytes();
-  OK(MSXsegStorage_open()==0&&MSXsegStorage_hybridReserve(&layout)==0);
+  OK(MSXsegStorage_hybridExistingHostBytes()==0);
+  OK(MSXsegStorage_open()==0);
+  existing=MSXsegStorage_hybridExistingHostBytes();
+  OK(existing>0&&existing==MSXsegStorage_testAllocationBytes()-hybridBefore);
+  OK(MSXsegStorage_hybridReserve(&layout)==0);
+  OK(MSXsegStorage_hybridExistingHostBytes()==existing);
   /* Fake CPU allocator's five pool objects are external to storage.c. */
   OK(MSXsegStorage_testAllocationBytes()-hybridBefore+
      5*(sizeof(struct Sseg)+(uint64_t)2*stride*sizeof(double))==
@@ -293,4 +325,5 @@ static void t_retry_identities(void)
  initial->inHybridCore=0;MSXqual_removeSeg(fresh);
 }
 #include "resident_lease_tests.h"
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t_cpu_spill();t_cpu_pool_growth();t_predictor();t_hyd_scan();t_host_size_ledger();t_retry_identities();t_handoff_leases();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+#include "resident_compact_core_tests.h"
+int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t_cpu_spill();t_cpu_pool_growth();t_predictor();t_hyd_scan();t_host_size_ledger();t_retry_identities();t_handoff_leases();t_compact_core();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}

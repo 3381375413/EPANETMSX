@@ -17,6 +17,7 @@
 #include <float.h>
 
 #include "msxutils.h"
+#include "msxresident_alloc_redirect.h"
 // --- define WINDOWS
 
 #undef WINDOWS

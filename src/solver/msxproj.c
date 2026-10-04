@@ -22,6 +22,7 @@
 #include "smatrix.h"
 #include "epanet2.h"
 #include "dispersion.h"
+#include "msxresident_alloc_redirect.h"
 //  Exported variables
 //--------------------
 MSXproject  MSX;                            // MSX project data
@@ -80,6 +81,7 @@ static char * GpuErrmsg[] =
 //  Imported functions
 //--------------------
 int    MSXinp_countMsxObjects(void);
+int    MSXinp_readMemoryOptions(void);
 int    MSXinp_countNetObjects(void);
 int    MSXinp_readNetData(void);
 int    MSXinp_readMsxData(void);
@@ -134,6 +136,21 @@ int  MSXproj_open(char *fname)
     strcpy(MSX.MsxFile.name, fname);
     if ((MSX.MsxFile.file = fopen(fname,"rt")) == NULL) return ERR_OPEN_MSX_FILE;
 
+    /* Resolve explicit limits before the first MSX-managed heap request. */
+    CALL(errcode,MSXinp_readMemoryOptions());
+    if(!errcode){unsigned domain;MSXResidentResolvedOptions resolved;
+        MSXResidentBudget snapshot;
+        MSXresidentBudget_snapshot(MSXresidentBudget_global(),&snapshot);
+        if(snapshot.allocated[0]||snapshot.allocated[1]||snapshot.allocated[2]||
+           snapshot.reserved[0]||snapshot.reserved[1]||snapshot.reserved[2])errcode=ERR_MEMORY;
+        if(!errcode && MSXresidentBudget_beginSession())errcode=ERR_MEMORY;
+        for(domain=0;!errcode&&domain<MSX_BUDGET_DOMAIN_COUNT;++domain)
+            if(MSXresidentBudget_configure(MSXresidentBudget_domain((MSXBudgetDomain)domain),UINT64_MAX,UINT64_MAX))errcode=ERR_MEMORY;
+        if(!errcode && !MSXmemory_resolve(&MSX.ResidentMemoryOptions,0,&resolved))errcode=ERR_MSX_INPUT;
+        if(!errcode && MSXresidentBudget_configure(MSXresidentBudget_global(),
+                MSX.GpuCoreMode==2 && resolved.values.hostBytes?resolved.values.hostBytes:UINT64_MAX,UINT64_MAX))errcode=ERR_MEMORY;
+    }
+
 // --- create hash tables to look up object ID names
 
     CALL(errcode, createHashTables());
@@ -164,7 +181,7 @@ int  MSXproj_open(char *fname)
         ENgetoption(13, &relvis);
         MSX.Dispersion.viscosity = relvis * 1.1E-5;
 
-        msx_createsparse();   //symmetric matrix
+        CALL(errcode, msx_createsparse());   //symmetric matrix
     }
 
     // Build nodal adjacency lists 
@@ -215,6 +232,10 @@ void MSXproj_close()
     MSX.TmpOutFile.file = NULL;
     deleteObjects();
     deleteHashTables();
+    /* MSXclose stops Quality/GPU first; these are the final project heaps.
+       Observe actual remaining charges without clearing failed CUDA frees. */
+    if(!MSXresidentBudget_endSession("resident_budget_summary.json"))
+        fprintf(stderr,"RESIDENT_BUDGET_SUMMARY_WRITE_FAILED\n");
     MSX.ProjectOpened = FALSE;
     MSX.InpFileName[0] = '\0';
 }
@@ -376,6 +397,7 @@ void setDefaults()
     MSX.GpuCoreOverflow = 0;
     MSX.GpuCoreCapacityMode = 0;
     MSX.GpuCoreMemoryMB = 0.0;
+    memset(&MSX.ResidentMemoryOptions,0,sizeof(MSX.ResidentMemoryOptions));
     MSX.InpFileName[0] = '\0';
     MSX.GpuCoreCapacityFile[0] = '\0';
     memset(&MSX.GpuTimingRecord, 0, sizeof(MSX.GpuTimingRecord));
@@ -508,32 +530,48 @@ int createObjects()
 // --- create nodes, links, & tanks
 
     MSX.Node = (Snode *) calloc(MSX.Nobjects[NODE]+1, sizeof(Snode));
+    if(!MSX.Node)return ERR_MEMORY;
     MSX.Link = (Slink *) calloc(MSX.Nobjects[LINK]+1, sizeof(Slink));
+    if(!MSX.Link)return ERR_MEMORY;
     MSX.Tank = (Stank *) calloc(MSX.Nobjects[TANK]+1, sizeof(Stank));
+    if(!MSX.Tank)return ERR_MEMORY;
 
 // --- create species, terms, parameters, constants & time patterns
 
     MSX.Species = (Sspecies *) calloc(MSX.Nobjects[SPECIES]+1, sizeof(Sspecies));
+    if(!MSX.Species)return ERR_MEMORY;
     MSX.Term    = (Sterm *)    calloc(MSX.Nobjects[TERM]+1,  sizeof(Sterm));
+    if(!MSX.Term)return ERR_MEMORY;
     MSX.Param   = (Sparam *)   calloc(MSX.Nobjects[PARAMETER]+1, sizeof(Sparam));
+    if(!MSX.Param)return ERR_MEMORY;
     MSX.Const   = (Sconst *)   calloc(MSX.Nobjects[CONSTANT]+1, sizeof(Sconst));
+    if(!MSX.Const)return ERR_MEMORY;
     MSX.Pattern = (Spattern *) calloc(MSX.Nobjects[PATTERN]+1, sizeof(Spattern));
+    if(!MSX.Pattern)return ERR_MEMORY;
     MSX.K       = (double *)   calloc(MSX.Nobjects[CONSTANT]+1, sizeof(double));  
+    if(!MSX.K)return ERR_MEMORY;
 
 // --- create arrays for demands, heads, & flows
 
     MSX.D = (float *) calloc(MSX.Nobjects[NODE]+1, sizeof(float));
+    if(!MSX.D)return ERR_MEMORY;
     MSX.H = (float *) calloc(MSX.Nobjects[NODE]+1, sizeof(float));
+    if(!MSX.H)return ERR_MEMORY;
     MSX.Q = (float *) calloc(MSX.Nobjects[LINK]+1, sizeof(float));
+    if(!MSX.Q)return ERR_MEMORY;
     MSX.S = (float *) calloc(MSX.Nobjects[LINK] + 1, sizeof(float));
+    if(!MSX.S)return ERR_MEMORY;
 
 // --- create arrays for current & initial concen. of each species for each node
 
     MSX.C0 = (double *) calloc(MSX.Nobjects[SPECIES]+1, sizeof(double));
+    if(!MSX.C0)return ERR_MEMORY;
     for (i=1; i<=MSX.Nobjects[NODE]; i++)
     {
         MSX.Node[i].c = (double *) calloc(MSX.Nobjects[SPECIES]+1, sizeof(double));
+        if(!MSX.Node[i].c)return ERR_MEMORY;
         MSX.Node[i].c0 = (double *) calloc(MSX.Nobjects[SPECIES]+1, sizeof(double));
+        if(!MSX.Node[i].c0)return ERR_MEMORY;
         MSX.Node[i].rpt = 0;
     }
 
@@ -543,10 +581,13 @@ int createObjects()
     {
         MSX.Link[i].c0 = (double *)
             calloc(MSX.Nobjects[SPECIES]+1, sizeof(double));
+        if(!MSX.Link[i].c0)return ERR_MEMORY;
         MSX.Link[i].reacted = (double *)
             calloc(MSX.Nobjects[SPECIES] + 1, sizeof(double));
+        if(!MSX.Link[i].reacted)return ERR_MEMORY;
         MSX.Link[i].param = (double *)
             calloc(MSX.Nobjects[PARAMETER]+1, sizeof(double));
+        if(!MSX.Link[i].param)return ERR_MEMORY;
         MSX.Link[i].rpt = 0;
     }
 
@@ -556,10 +597,13 @@ int createObjects()
     {
         MSX.Tank[i].param = (double *)
             calloc(MSX.Nobjects[PARAMETER]+1, sizeof(double));
+        if(!MSX.Tank[i].param)return ERR_MEMORY;
         MSX.Tank[i].c = (double *)
             calloc(MSX.Nobjects[SPECIES]+1, sizeof(double));
+        if(!MSX.Tank[i].c)return ERR_MEMORY;
         MSX.Tank[i].reacted = (double*)
             calloc(MSX.Nobjects[SPECIES] + 1, sizeof(double));
+        if(!MSX.Tank[i].reacted)return ERR_MEMORY;
     }
 
 // --- initialize contents of each time pattern object
@@ -592,8 +636,10 @@ int createObjects()
     MSX.Dispersion.DIFFUS = 1.29E-8;
     MSX.Dispersion.md = (double*)
         calloc(MSX.Nobjects[SPECIES] + 1, sizeof(double));
+    if(!MSX.Dispersion.md)return ERR_MEMORY;
     MSX.Dispersion.ld = (double*)
         calloc(MSX.Nobjects[SPECIES] + 1, sizeof(double));
+    if (!MSX.Dispersion.md || !MSX.Dispersion.ld) return ERR_MEMORY;
 
     for (int m = 1; m <= MSX.Nobjects[SPECIES]; m++)
     {
@@ -616,6 +662,10 @@ void deleteObjects()
 {
     int i;
     SnumList *listItem;
+
+    /* Also covers partial sparse initialization and the species arrays
+       created when dispersion is disabled. */
+    msx_freesparse();
 
 // --- free memory used by nodes, links, and tanks
 

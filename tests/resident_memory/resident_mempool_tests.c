@@ -51,7 +51,41 @@ int main(void)
     CHECK(Alloc(32000)==first); CHECK(Alloc(32000)==second);
     CHECK(AllocGetPoolStats(a,&after)); CHECK(after.blockCount==1);
     CHECK(Alloc(64001)==NULL); CHECK(Alloc(0)==NULL); CHECK(Alloc(-1)==NULL);
+    /* Compare the accelerated dry-run with actual allocations and reset
+       reuse, including cycles whose requests cross a block boundary. */
+    {
+        const uint64_t patterns[3][3]={{128,136,136},{128,24,24},{31996,32004,4}};
+        unsigned patternIndex,repeatIndex;
+        for(patternIndex=0;patternIndex<3;++patternIndex)
+        for(repeatIndex=0;repeatIndex<4;++repeatIndex){
+            uint64_t extra,startBytes;unsigned repeat=repeatIndex==3?5000:repeatIndex*101,k;
+            AllocReset();CHECK(Alloc(17)!=NULL);CHECK(AllocGetPoolStats(a,&before));startBytes=before.backingBytes;
+            CHECK(AllocAdditionalBacking(a,patterns[patternIndex],3,repeat,&extra));
+            for(k=0;k<repeat;++k)for(unsigned j=0;j<3;++j)CHECK(Alloc((long)patterns[patternIndex][j])!=NULL);
+            CHECK(AllocGetPoolStats(a,&after));CHECK(after.backingBytes-startBytes==extra);
+        }
+        /* Subsequent malloc-failure tests require an exhausted final block. */
+        CHECK(Alloc(64000)!=NULL);
+    }
     /* Failed growth leaves current pointer usable and frees partial mallocs. */
+    {
+        uint64_t repair[2]={136,136},complete[3]={128,136,136};
+        AllocForecast forecast;
+        for(unsigned missing=1;missing<=2;++missing){
+            AllocReset();CHECK(Alloc(63864)!=NULL);
+            CHECK(AllocGetPoolStats(a,&before));
+            CHECK(AllocForecastBegin(a,&forecast));
+            CHECK(AllocForecastAppend(&forecast,repair,missing,1));
+            CHECK(AllocForecastAppend(&forecast,complete,3,5000));
+            for(unsigned j=0;j<missing;++j)CHECK(Alloc((long)repair[j])!=NULL);
+            for(unsigned n=0;n<5000;++n)for(unsigned j=0;j<3;++j)CHECK(Alloc((long)complete[j])!=NULL);
+            CHECK(AllocGetPoolStats(a,&after));
+            CHECK(after.backingBytes-before.backingBytes==forecast.bytes);
+            CHECK((uint64_t)(root->current->end-root->current->free)==forecast.remaining);
+        }
+        while(root->current->next)CHECK(Alloc(64000)!=NULL);
+        CHECK(Alloc(64000)!=NULL);
+    }
     for(k=1;k<=2;++k)
     {
         char *saved=root->current->free;

@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(resident_capacity_m7_tests C)
+add_executable(resident_capacity_m7_tests resident_capacity_m7_tests.c)
+target_include_directories(resident_capacity_m7_tests PRIVATE ../../src/solver)
+enable_testing()
+add_test(NAME resident_capacity_m7_search COMMAND resident_capacity_m7_tests)

@@ -9,11 +9,13 @@
 #include "msxtypes.h"
 #include "msxresident_capacity.h"
 #include "msxresident_alloc.h"
+#include "msxresident_upload.h"
 #define free(p) MSXresidentAlloc_free(p)
 
 extern MSXproject MSX;
 
 typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; MSXResidentGpu *gpu;
+    int directInitial;
     int auditMemory;
     uint32_t peakPatchRows, peakImportRows, peakDescriptors;
     uint32_t peakHandoffRows, peakMaterializeRows, peakSelectedRows;
@@ -25,13 +27,25 @@ typedef struct { int opened, resident, dispatchReady, handoffReady, patchClass; 
     uint32_t *offset; uint32_t itemCap, itemCount;
     double handoffPlanMs;
     int auditPoisonCpuMirrors, auditAggregateFail, auditHyd, inFlight;
-    uint64_t sequence, topologyVersion, stateVersion;
+    uint64_t topologyVersion;
+    MSXResidentTransaction transaction;
     uint64_t activeIteratorPasses, activeRowsAppended, activeFullRowCopies,
              activeBuilderAborts;
     MSXResidentGpuActiveWriter activeWriter;
     MSXResidentRuntimeToken flight;
     char status[96], resolvedCapacity[MAXFNAME]; } Runtime;
 static Runtime R;
+static int DirectInitialPlanning;
+int MSXresidentRuntime_directInitialPlanning(void){return DirectInitialPlanning;}
+uint64_t MSXresidentRuntime_initialScratchBytes(uint32_t links,uint32_t tanks,uint32_t stride)
+{
+    uint64_t rows=(uint64_t)links+tanks+1,bytes;
+    if(!stride||rows>UINT64_MAX/stride/sizeof(double))return UINT64_MAX;
+    bytes=rows*stride*sizeof(double);
+    if(bytes>UINT64_MAX-2*MSXresidentAlloc_headerBytes()||
+       (uint64_t)tanks+1>(UINT64_MAX-bytes-2*MSXresidentAlloc_headerBytes())/sizeof(MSXResidentInitialTankDraft))return UINT64_MAX;
+    return bytes+((uint64_t)tanks+1)*sizeof(MSXResidentInitialTankDraft)+2*MSXresidentAlloc_headerBytes();
+}
 static void auditPatchDemand(const MSXResidentPatchBatch *b)
 {
     uint32_t i,imports=0;
@@ -87,6 +101,8 @@ static int fail(MSXResidentStatus s, const char *where)
             where ? where : "unknown", (int)s, e);
     fflush(stderr);
     R.lastStatus = s;
+    MSXtransaction_fail(&R.transaction,s==MSX_RESIDENT_ERR_GPU||s==MSX_RESIDENT_ERR_TRANSFER||s==MSX_RESIDENT_ERR_POISONED);
+    R.dispatchReady=0;
     MSX.GpuError.code = e;
     MSX.GpuError.value = (double)s;
     MSX.ErrCode = e;
@@ -208,7 +224,10 @@ static void makeConfig(MSXResidentConfig *c, const char *hash)
 /* All fallible Resident/Shadow setup happens before HYBRID changes Pseg
    topology.  The initial GPU image deliberately contains every owned slot
    with used=0; afterHybridInit only publishes real Core patches. */
-static int preHybridAttempt(void)
+static MSXResidentStatus stageUploads(void *owner,const MSXResidentSlotPatch *patch,uint32_t count)
+{return MSXresidentGpu_stageImports((MSXResidentGpu *)owner,patch,count);}
+static int finishInitialImage(void);
+static int preHybridAttempt(int direct)
 {
     MSXResidentConfig c; MSXResidentStatus s; MSXResidentLayout l;
     MSXResidentPatchBatch b; MSXResidentGpuOpen o; MSXResidentMemoryConfig memoryConfig; char actual[65];
@@ -225,21 +244,22 @@ static int preHybridAttempt(void)
         return fail(MSX_RESIDENT_ERR_CASE_HASH,"case_hash");
     makeConfig(&c,actual);
     s=MSXresident_validateConfig(&c); if(s!=MSX_RESIDENT_OK)return fail(s,"pre_validate");
+    if(!MSXtransaction_begin(&R.transaction))return fail(MSX_RESIDENT_ERR_POISONED,"initial_reentry");
     s=MSX.GpuCoreCapacityMode ? MSXresidentCapacity_openPlan(actual) : MSXresident_open(c.capacityFile);
     if(s!=MSX_RESIDENT_OK)return fail(s,"pre_open");
-    R.opened=1; MSXresident_setMode(c.mode,c.strict);
+    R.opened=1;R.directInitial=direct; MSXresident_setMode(c.mode,c.strict);
     if((s=MSXresident_verifyCaseHash(actual))!=MSX_RESIDENT_OK) { MSXresidentRuntime_close(); return fail(s,"pre_verify"); }
     if((s=MSXresident_getLayout(&l))!=MSX_RESIDENT_OK) { MSXresidentRuntime_close(); return fail(s,"pre_layout"); }
+    if(c.mode==MSX_RESIDENT_RESIDENT&&!MSX.GpuCoreCapacityMode){
+        s=MSXresidentCapacity_fileBudget(&l);
+        if(s!=MSX_RESIDENT_OK){MSXresidentRuntime_close();return fail(s,"file_budget");}
+    }
     { int reserveError=MSXsegStorage_hybridReserve(&l);
       if(reserveError) { MSXresidentRuntime_close(); return fail(reserveError==ERR_MEMORY?MSX_RESIDENT_ERR_MEMORY:MSX_RESIDENT_ERR_CAPACITY,"pre_reserve"); } }
     if(runtimeAllocateBuffers(&l)) { MSXresidentRuntime_close(); return MSX.ErrCode; }
+    if(!MSXtransaction_advance(&R.transaction,MSX_TX_PREPARED)||
+       !MSXtransaction_advance(&R.transaction,MSX_TX_STAGING))return fail(MSX_RESIDENT_ERR_POISONED,"initial_state");
     if(c.mode==MSX_RESIDENT_SHADOW) { R.lastStatus=MSX_RESIDENT_OK; strcpy(R.status,"shadow-preopened"); return 0; }
-    if((s=MSXresident_beginInitialImage())!=MSX_RESIDENT_OK) { MSXresidentRuntime_close(); return fail(s,"pre_initial_begin"); }
-    if(MSXsegStorage_hybridPrepareInitialImage()) { MSXresidentRuntime_close(); return fail(MSX_RESIDENT_ERR_CAPACITY,"pre_initial_prepare"); }
-    if(MSXsegStorage_hybridStageInitialImage()) { MSXresidentRuntime_close(); return fail(MSX_RESIDENT_ERR_CAPACITY,"pre_initial_stage"); }
-    if((s=MSXresident_getInitialBatch(&b))!=MSX_RESIDENT_OK) { MSXresidentRuntime_close(); return fail(s,"pre_snapshot"); }
-    if(!l.capacity || !l.base || b.descriptorCount!=l.nLinks || b.slotCount!=l.totalSlots)
-    { MSXresidentRuntime_close(); return fail(MSX_RESIDENT_ERR_ARGUMENT,"pre_layout"); }
     o.nLinks=l.nLinks;o.totalSlots=l.totalSlots;o.speciesStride=l.speciesStride;o.capacity=l.capacity;o.base=l.base;
     if(MSXgpu_prepareResidentContext()){MSXresidentRuntime_close();return fail(MSX_RESIDENT_ERR_GPU,"pre_context");}
     {uint64_t freeDevice;
@@ -254,6 +274,23 @@ static int preHybridAttempt(void)
        (initialFault("allocation_oom_once") && MSXresidentCapacity_startupAttempt()==0)))
         s=MSX_RESIDENT_ERR_MEMORY;
     if(s==MSX_RESIDENT_OK && initialFault("initial_upload")) s=MSX_RESIDENT_ERR_TRANSFER;
+    if(s==MSX_RESIDENT_OK)s=MSXupload_open(memoryConfig.transferBatchRows<l.totalSlots?
+        memoryConfig.transferBatchRows:l.totalSlots,l.speciesStride,stageUploads,R.gpu);
+    if(s==MSX_RESIDENT_OK)s=MSXresident_beginInitialImage();
+    if(s==MSX_RESIDENT_OK&&direct){R.lastStatus=MSX_RESIDENT_OK;strcpy(R.status,"resident-direct-prepared");return 0;}
+    if(s==MSX_RESIDENT_OK&&MSXsegStorage_hybridPrepareInitialImage())s=MSX_RESIDENT_ERR_CAPACITY;
+    if(s==MSX_RESIDENT_OK&&MSXsegStorage_hybridStageInitialImage())s=MSX_RESIDENT_ERR_CAPACITY;
+    if(s!=MSX_RESIDENT_OK){MSXresidentRuntime_close();return fail(s,"pre_initial_stage");}
+    return finishInitialImage();
+}
+
+static int finishInitialImage(void)
+{
+    MSXResidentStatus s;MSXResidentLayout l;MSXResidentPatchBatch b;
+    s=MSXresident_getLayout(&l);
+    if(s==MSX_RESIDENT_OK)s=MSXresident_getInitialBatch(&b);
+    if(s==MSX_RESIDENT_OK&&(!l.capacity||!l.base||b.descriptorCount!=l.nLinks||b.slotCount!=l.totalSlots))s=MSX_RESIDENT_ERR_ARGUMENT;
+    if(s==MSX_RESIDENT_OK)s=MSXupload_flush();
     if(s==MSX_RESIDENT_OK)
     {
         double t=0.0, elapsed=0.0;
@@ -273,17 +310,22 @@ static int preHybridAttempt(void)
     if(initialFault("initial_apply")){MSXresidentRuntime_close();return fail(MSX_RESIDENT_ERR_TRANSFER,"pre_initial_apply");}
     if(initialFault("program")){MSXresidentRuntime_close();return fail(MSX_RESIDENT_ERR_GPU,"pre_program_open");}
     if(MSXgpu_openResidentPrograms()){MSXresidentRuntime_close();return fail(MSX_RESIDENT_ERR_GPU,"pre_program_open");}
+    if(R.directInitial&&(s=MSXresidentGpu_invalidateHyd(R.gpu))!=MSX_RESIDENT_OK){
+        MSXresidentRuntime_close();return fail(s,"direct_initial_hyd_invalidate");
+    }
     R.lastStatus=MSX_RESIDENT_OK; strcpy(R.status,"resident-preopened-image-staged");
     return 0;
 }
 
 int MSXresidentRuntime_preHybridInit(void)
 {
-    int error=preHybridAttempt();
+    int error=preHybridAttempt(0);
     if(error && MSX.GpuCoreCapacityMode &&
        (error==ERR_MEMORY || error==ERR_GPU_MEMORY_ALLOCATION_FAILED) &&
        MSXresidentCapacity_retryBudget())
     {
+        const char *reason=getenv("MSX_RESIDENT_INIT_FAIL");
+        MSXresidentCapacity_noteStartupRetry(reason?reason:"initial_memory_allocation");
         /* No topology has been committed. Destroy all staging arenas before
            the one permitted smaller fixed-layout attempt. */
         MSXresidentRuntime_close();
@@ -291,9 +333,18 @@ int MSXresidentRuntime_preHybridInit(void)
         if(error)return fail(error==ERR_MEMORY?MSX_RESIDENT_ERR_MEMORY:MSX_RESIDENT_ERR_POISONED,"retry_staging_reset");
         MSX.ErrCode=0; MSX.OutOfMemory=0;
         memset(&MSX.GpuError,0,sizeof(MSX.GpuError));
-        error=preHybridAttempt();
+        error=preHybridAttempt(0);
     }
     return error;
+}
+int MSXresidentRuntime_prepareDirectInitial(void)
+{
+    int error;DirectInitialPlanning=1;error=preHybridAttempt(1);DirectInitialPlanning=0;return error;
+}
+int MSXresidentRuntime_finishDirectInitial(void)
+{
+    if(!R.opened||!R.directInitial)return fail(MSX_RESIDENT_ERR_POISONED,"direct_not_prepared");
+    return finishInitialImage();
 }
 
 int MSXresidentRuntime_afterHybridInit(void)
@@ -301,6 +352,8 @@ int MSXresidentRuntime_afterHybridInit(void)
     MSXResidentStatus s; MSXResidentPatchBatch b;
     if (MSX.GpuCoreMode == MSX_RESIDENT_OFF) return 0; /* absolutely no I/O */
     if (!R.opened) return fail(MSX_RESIDENT_ERR_POISONED,"after_not_preopened");
+    if(!MSXtransaction_advance(&R.transaction,MSX_TX_APPLYING))return fail(MSX_RESIDENT_ERR_POISONED,"initial_publish_state");
+    R.transaction.cpuChanged=1;
     if (MSX.GpuCoreMode == MSX_RESIDENT_RESIDENT)
     {
         /* All GPU operations that can fail completed in preHybridInit.  The
@@ -310,13 +363,18 @@ int MSXresidentRuntime_afterHybridInit(void)
             return fail(MSX_RESIDENT_ERR_CAPACITY,"initial_cpu_commit");
         if ((s=MSXresident_commitInitialImage())!=MSX_RESIDENT_OK)
             return fail(s,"initial_metadata_commit");
+        /* Direct initialization publishes tank lists in the same APPLYING
+           interval. Its visible version is completed only after those stores. */
+        if(R.directInitial)return 0;
         /* MSXinit is a real model/reaction lifecycle boundary.  The device
            Hyd table is not valid until the first post-init reaction submits
            and finishes a complete pipe-major candidate. */
-        if ((s=MSXresidentGpu_invalidateHyd(R.gpu))!=MSX_RESIDENT_OK)
+        if (!R.directInitial&&(s=MSXresidentGpu_invalidateHyd(R.gpu))!=MSX_RESIDENT_OK)
             return fail(s,"initial_hyd_invalidate");
         if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_initial"))
             return MSX.ErrCode;
+        if(!MSXtransaction_complete(&R.transaction)||!MSXtransaction_commit(&R.transaction))
+            return fail(MSX_RESIDENT_ERR_POISONED,"initial_publish");
         R.resident=1; R.dispatchReady=1; R.lastStatus=MSX_RESIDENT_OK;
         strcpy(R.status,"resident-react-ready-handoff-pending");
         return 0;
@@ -336,20 +394,41 @@ int MSXresidentRuntime_afterHybridInit(void)
     if (MSX.GpuCoreMode==MSX_RESIDENT_RESIDENT && (s=MSXresidentGpu_applyPatches(R.gpu,&b))!=MSX_RESIDENT_OK)
         return fail(s,"initial_patch_apply");
     MSXresident_clearPatches(); R.resident=(MSX.GpuCoreMode==MSX_RESIDENT_RESIDENT); R.dispatchReady=R.resident;
+    if(!MSXtransaction_complete(&R.transaction)||!MSXtransaction_commit(&R.transaction))
+        return fail(MSX_RESIDENT_ERR_POISONED,"shadow_publish");
     R.lastStatus=MSX_RESIDENT_OK; strcpy(R.status,R.resident?"resident-react-ready-handoff-pending":"shadow");
     return 0;
 }
+int MSXresidentRuntime_completeDirectInitial(void)
+{
+    if(!R.opened||!R.directInitial||R.transaction.state!=MSX_TX_APPLYING)
+        return fail(MSX_RESIDENT_ERR_POISONED,"direct_completion_state");
+    if(R.auditPoisonCpuMirrors&&auditPoisonMirrors("audit_poison_initial"))return MSX.ErrCode;
+    if(!MSXtransaction_complete(&R.transaction)||!MSXtransaction_commit(&R.transaction))
+        return fail(MSX_RESIDENT_ERR_POISONED,"direct_initial_publish");
+    R.resident=1;R.dispatchReady=1;R.lastStatus=MSX_RESIDENT_OK;
+    strcpy(R.status,"resident-react-ready-handoff-pending");
+    return 0;
+}
 
-int MSXresidentRuntime_flushPatches(void)
+static int runtimeFlushPatches(int continuing)
 {
     MSXResidentPatchBatch b; MSXResidentStatus s;
     if (!R.opened) return 0;
-    if (R.inFlight) return fail(MSX_RESIDENT_ERR_POISONED,"patch_inflight");
+    if (R.inFlight || (!continuing&&!MSXtransaction_readable(&R.transaction)))
+        return fail(MSX_RESIDENT_ERR_POISONED,"patch_inflight");
+    if((s=MSXupload_flush())!=MSX_RESIDENT_OK)return fail(s,"upload_stage");
     if ((s=MSXresident_getPatches(&b))!=MSX_RESIDENT_OK) return fail(s,"patch_read");
     R.wouldDescriptors+=b.descriptorCount; R.wouldSlots+=b.slotCount;
     if (!b.descriptorCount && !b.slotCount) return 0;
     auditPatchDemand(&b);
     if (!R.resident) { MSXresident_clearPatches(); return 0; }
+    if(!continuing){
+        if(!MSXtransaction_begin(&R.transaction)||!MSXtransaction_advance(&R.transaction,MSX_TX_PREPARED)||
+           !MSXtransaction_advance(&R.transaction,MSX_TX_STAGING)||!MSXtransaction_advance(&R.transaction,MSX_TX_APPLYING))
+            return fail(MSX_RESIDENT_ERR_POISONED,"patch_state");
+    }else if(R.transaction.state!=MSX_TX_APPLYING)return fail(MSX_RESIDENT_ERR_POISONED,"handoff_publish_state");
+    R.transaction.cpuChanged=1;
     MSXsegStorage_hybridRebalanceAddPatchCounts(b.descriptorCount,
                                                 b.slotCount);
     { double t=0.0; if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
@@ -362,8 +441,13 @@ int MSXresidentRuntime_flushPatches(void)
        double count the real transfer. */
     MSXgpu_profileRecordPatch(b.descriptorCount, b.slotCount, 0, 0,
                               R.patchClass);
-    MSXresident_clearPatches(); R.topologyVersion++; R.stateVersion++; return 0;
+    if(R.topologyVersion==UINT64_MAX)return fail(MSX_RESIDENT_ERR_OVERFLOW,"topology_version");
+    MSXresident_clearPatches(); R.topologyVersion++;
+    if(!MSXtransaction_complete(&R.transaction)||!MSXtransaction_commit(&R.transaction))
+        return fail(MSX_RESIDENT_ERR_POISONED,"patch_publish");
+    return 0;
 }
+int MSXresidentRuntime_flushPatches(void){return runtimeFlushPatches(0);}
 
 MSXResidentStatus MSXresidentRuntime_reduce(double *massBySpecies,
                                             uint32_t massCount,
@@ -559,6 +643,7 @@ void MSXresidentRuntime_close(void)
     /* Same CUDA context: destroy dependent program objects before its mirror. */
     MSXgpu_closeResidentPrograms();
     if (R.gpu) { MSXresidentGpu_close(R.gpu); R.gpu=0; }
+    MSXupload_close();
     MSXsegStorage_hybridAbortInitialImage();
     MSXresident_abortInitialImage();
     if (R.opened || MSXresident_isOpen()) MSXresident_close();
@@ -574,8 +659,10 @@ uint64_t MSXresidentRuntime_stateVersion(void)
     if (!R.resident) return 0;
     /* Every committed topology patch advances stateVersion together with the
        topology epoch; the monotonic runtime sequence is the stable key. */
-    return R.stateVersion;
+    return R.transaction.published;
 }
+void MSXresidentRuntime_transactionSnapshot(MSXResidentTransaction *out)
+{if(out)*out=R.transaction;}
 int MSXresidentRuntime_linkFallback(int k) { return R.resident && k>0 && R.fallback && R.fallback[k]; }
 void MSXresidentRuntime_markRebalance(void) { R.patchClass = 1; }
 /* Keep Resident transport displacement identical to CPU Advect: one quality
@@ -743,6 +830,7 @@ int MSXresidentRuntime_completeHandoffs(void)
     double fetchMs = 0.0, prepareMs = 0.0, validateMs = 0.0, commitMs = 0.0;
     int handoffDetail;
     if(!R.resident)return 0;
+    if(R.itemCount && !MSXtransaction_begin(&R.transaction))return fail(MSX_RESIDENT_ERR_POISONED,"handoff_reentry");
     handoffDetail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_HANDOFF);
     if (MSXgpu_profileStageEnabled()) t=MSXgpu_wallTimeMs();
     if (handoffDetail)
@@ -764,6 +852,8 @@ int MSXresidentRuntime_completeHandoffs(void)
             if(z){for(uint32_t j=1;j<=(uint32_t)MSX.Nobjects[LINK];++j)MSXresident_abortHandoffTransaction(&R.tx[j]);
                 return fail(z,"handoff_leases");}}
         if(R.auditMemory&&R.itemCount>R.peakHandoffRows)R.peakHandoffRows=R.itemCount;
+        if(!MSXtransaction_advance(&R.transaction,MSX_TX_PREPARED)||!MSXtransaction_advance(&R.transaction,MSX_TX_STAGING))
+            return fail(MSX_RESIDENT_ERR_POISONED,"handoff_stage_state");
         z=MSXresidentGpu_fetchHandoffTargets(R.gpu,R.item,R.itemCount,R.out,R.targets);
         if(z!=MSX_RESIDENT_OK){
             if (handoffDetail)
@@ -806,12 +896,20 @@ int MSXresidentRuntime_completeHandoffs(void)
     if(z!=MSX_RESIDENT_OK){for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)MSXresident_abortHandoffTransaction(&R.tx[k]);return fail(z,"handoff_final_validate");}
     if (handoffDetail) validateMs = MSXgpu_wallTimeMs() - validateTimer;
     if (handoffDetail) commitTimer = MSXgpu_wallTimeMs();
+    if(R.itemCount){
+        if(!MSXtransaction_advance(&R.transaction,MSX_TX_APPLYING))return fail(MSX_RESIDENT_ERR_POISONED,"handoff_apply_state");
+        R.transaction.cpuChanged=1;
+    }
     for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++)if(R.tx[k].opaque)MSXresident_commitHandoffTransaction(&R.tx[k]);
     if (handoffDetail) commitMs = MSXgpu_wallTimeMs() - commitTimer;
     /* CPU transactions are committed atomically as a batch. A GPU flush
        failure is fail-stop; it never claims CPU topology was rolled back. */
     R.patchClass = 0;
-    if(MSXresidentRuntime_flushPatches()){R.dispatchReady=0;return MSX.ErrCode;}
+    if(runtimeFlushPatches(R.itemCount!=0)){R.dispatchReady=0;return MSX.ErrCode;}
+    if(R.itemCount && R.transaction.state!=MSX_TX_COMMITTED){
+        if(!MSXtransaction_complete(&R.transaction)||!MSXtransaction_commit(&R.transaction))
+            return fail(MSX_RESIDENT_ERR_POISONED,"handoff_empty_publish");
+    }
     R.handoffReady=1;
     if (MSXgpu_profileStageEnabled()) MSX.GpuTimingRecord.resident_handoff_ms+=MSXgpu_wallTimeMs()-t;
     if (handoffDetail && fetchPerformed)
@@ -916,6 +1014,7 @@ int MSXresidentRuntime_submitCore(double dt, MSXResidentRuntimeToken *token)
     if(stage)MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_FLUSH,
                                     MSXgpu_wallTimeMs()-flushStart);
     if(err)return MSX.ErrCode;
+    if(!MSXtransaction_begin(&R.transaction))return fail(MSX_RESIDENT_ERR_POISONED,"react_reentry");
     s=runtimeBuildActive(&R.activeWriter,&active);
     if(s!=MSX_RESIDENT_OK){R.dispatchReady=0;return fail(s,"active_identity_filter");}
     memset(token,0,sizeof(*token));
@@ -930,15 +1029,16 @@ int MSXresidentRuntime_submitCore(double dt, MSXResidentRuntimeToken *token)
     { R.dispatchReady=0; R.activeBuilderAborts++;
       (void)MSXresidentGpu_abortActive(R.gpu);
       return fail(MSX_RESIDENT_ERR_ARGUMENT,"audit_hyd"); }
+    if(!MSXtransaction_advance(&R.transaction,MSX_TX_PREPARED)||!MSXtransaction_advance(&R.transaction,MSX_TX_STAGING)||
+       !MSXtransaction_advance(&R.transaction,MSX_TX_APPLYING))return fail(MSX_RESIDENT_ERR_POISONED,"react_stage_state");
     err=MSXgpu_submitResidentCoreHydPrepared(R.gpu,&R.activeWriter,&hyd,dt,&token->gpu);
     if(err){R.dispatchReady=0; R.activeBuilderAborts++;
         (void)MSXresidentGpu_abortActive(R.gpu);
         (void)fail(MSX_RESIDENT_ERR_GPU,"submit_gpu");return err;}
-    R.sequence++; if(!R.sequence)R.sequence++;
-    R.inFlight=1; R.stateVersion++;
-    token->magic=MSX_RESIDENT_RUNTIME_TOKEN_MAGIC; token->stepId=R.sequence;
-    token->topologyVersion=R.topologyVersion; token->stateVersion=R.stateVersion;
-    token->gpu.batchId=R.sequence;
+    R.transaction.gpuAccepted=1;R.inFlight=1;
+    token->magic=MSX_RESIDENT_RUNTIME_TOKEN_MAGIC; token->stepId=R.transaction.sequence;
+    token->topologyVersion=R.topologyVersion; token->stateVersion=R.transaction.working;
+    token->gpu.batchId=R.transaction.sequence;
     token->batchCount=active; token->inFlight=1; R.flight=*token;
     return 0;
 }
@@ -950,7 +1050,8 @@ int MSXresidentRuntime_finishCore(MSXResidentRuntimeToken *token)
     if(!token || token->magic!=MSX_RESIDENT_RUNTIME_TOKEN_MAGIC || !token->inFlight ||
        !R.inFlight || token->stepId!=R.flight.stepId ||
        token->gpu.batchId!=R.flight.gpu.batchId ||
-       token->topologyVersion!=R.topologyVersion || token->stateVersion!=R.flight.stateVersion)
+       token->topologyVersion!=R.topologyVersion || token->stateVersion!=R.flight.stateVersion ||
+       token->stateVersion!=R.transaction.working || R.transaction.state!=MSX_TX_APPLYING)
     {
         runtimeDrainFlight();
         if(token)memset(token,0,sizeof(*token));
@@ -965,7 +1066,6 @@ int MSXresidentRuntime_finishCore(MSXResidentRuntimeToken *token)
         return fail(MSX_RESIDENT_ERR_GPU,"finish_gpu");
     }
     R.inFlight=0; token->inFlight=0; token->magic=0; R.flight.inFlight=0;
-    R.stateVersion++;
     if(!out.reacted || out.reactedStride<(uint32_t)MSX.Nobjects[SPECIES]+1 ||
        out.reactedLinkCount<(uint32_t)MSX.Nobjects[LINK]+1)
     { R.dispatchReady=0; return fail(MSX_RESIDENT_ERR_TRANSFER,"finish_reacted"); }
@@ -978,6 +1078,8 @@ int MSXresidentRuntime_finishCore(MSXResidentRuntimeToken *token)
     MSXresidentCapacity_recordDeviceMemory();
     if (R.auditPoisonCpuMirrors && auditPoisonMirrors("audit_poison_after_react"))
         return MSX.ErrCode;
+    if(!MSXtransaction_complete(&R.transaction)||!MSXtransaction_commit(&R.transaction))
+        return fail(MSX_RESIDENT_ERR_POISONED,"react_publish");
     return 0;
 }
 
@@ -993,6 +1095,7 @@ int MSXresidentRuntime_abortCore(MSXResidentRuntimeToken *token)
     R.inFlight=0; R.dispatchReady=0; token->inFlight=0; token->magic=0; R.flight.inFlight=0;
     if(err) return fail(MSX_RESIDENT_ERR_GPU,"abort_gpu");
     R.lastStatus=MSX_RESIDENT_ERR_POISONED; strcpy(R.status,"resident-aborted");
+    MSXtransaction_fail(&R.transaction,1);
     return 0;
 }
 
@@ -1007,3 +1110,36 @@ MSXResidentStatus MSXresidentRuntime_lastStatus(void) { return R.lastStatus; }
 const char *MSXresidentRuntime_resolvedCapacityPath(void) { return R.resolvedCapacity; }
 void MSXresidentRuntime_getMetrics(MSXResidentRuntimeMetrics *m)
 { if(!m)return; m->wouldDescriptorPatches=R.wouldDescriptors; m->wouldSlotPatches=R.wouldSlots; m->stalePatches=R.stale; m->fallbacks=R.fallbacks; m->activeIteratorPasses=R.activeIteratorPasses; m->activeRowsAppended=R.activeRowsAppended; m->activeFullRowCopies=R.activeFullRowCopies; m->activeBuilderAborts=R.activeBuilderAborts; m->opened=R.opened; m->resident=R.resident; }
+
+#ifdef MSX_RESIDENT_TEST_API
+/* Exported only in an isolated validation build. Production ABI is unchanged. */
+static MSXResidentRuntimeToken TestFlight;
+__declspec(dllexport) int MSXTESTresidentSubmit(double dt,int reenter)
+{
+    MSXResidentRuntimeToken second={0};
+    if(reenter)return MSXresidentRuntime_submitCore(dt,&second);
+    memset(&TestFlight,0,sizeof(TestFlight));return MSXresidentRuntime_submitCore(dt,&TestFlight);
+}
+__declspec(dllexport) int MSXTESTresidentFinish(void)
+{return MSXresidentRuntime_finishCore(&TestFlight);}
+__declspec(dllexport) int MSXTESTresidentRead(void)
+{
+    double mass[65];MSXResidentGpuReduction result;
+    return (int)MSXresidentRuntime_reduce(mass,65,&result);
+}
+__declspec(dllexport) int MSXTESTresidentState(uint64_t *values)
+{
+    if(!values)return 1;
+    values[0]=R.transaction.sequence;values[1]=R.transaction.working;
+    values[2]=R.transaction.published;values[3]=R.transaction.completed;
+    values[4]=R.transaction.state;return 0;
+}
+__declspec(dllexport) int MSXTESTresidentBudget(uint64_t *values)
+{
+    MSXResidentBudget snapshot;if(!values)return 1;
+    MSXresidentBudget_snapshot(MSXresidentBudget_global(),&snapshot);
+    values[0]=snapshot.allocated[0]+snapshot.allocated[1]+snapshot.reserved[0]+snapshot.reserved[1];
+    values[1]=snapshot.allocated[2]+snapshot.reserved[2];values[2]=snapshot.hostLimit;
+    values[3]=snapshot.deviceLimit;return 0;
+}
+#endif

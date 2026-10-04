@@ -19,6 +19,8 @@
 
 #include "msxreact_transfer_cuda.h"
 #include "msxsegment_storage.h"
+#include "msxresident_cuda_alloc.h"
+#include "msxresident_alloc_redirect.h"
 
 extern "C" MSXproject MSX;
 
@@ -171,13 +173,13 @@ static int growPinned(void **ptr, size_t oldBytes, size_t newBytes)
     void *next = NULL;
     cudaError_t err;
     if (newBytes == 0) return 0;
-    err = cudaMallocHost(&next, newBytes);
+    err = managedCudaMallocHost(&next, newBytes);
     if (err != cudaSuccess) return 1;
     if (*ptr)
     {
         size_t copyBytes = oldBytes < newBytes ? oldBytes : newBytes;
         if (copyBytes > 0) memcpy(next, *ptr, copyBytes);
-        cudaFreeHost(*ptr);
+        managedCudaFreeHost(*ptr);
     }
     *ptr = next;
     return 0;
@@ -289,87 +291,87 @@ static int ensureDevice(MSXReactTransferView *view, size_t errSize)
     if (segValues > Ws.deviceNSegCap)
     {
         int newCap = nextCapacity(Ws.deviceNSegCap, segValues);
-        if (Ws.d_segRow) cudaFree(Ws.d_segRow);
-        if (Ws.d_segPipe) cudaFree(Ws.d_segPipe);
-        if (Ws.d_segVol) cudaFree(Ws.d_segVol);
-        if (Ws.d_hstep) cudaFree(Ws.d_hstep);
-        if (Ws.d_rk5Nfcn) cudaFree(Ws.d_rk5Nfcn);
-        if (Ws.d_rk5Naccpt) cudaFree(Ws.d_rk5Naccpt);
-        if (Ws.d_rk5Nrejct) cudaFree(Ws.d_rk5Nrejct);
-        if (Ws.d_rk5Err) cudaFree(Ws.d_rk5Err);
-        if (Ws.d_rk5LastHstep) cudaFree(Ws.d_rk5LastHstep);
-        if (Ws.d_ros2Nfcn) cudaFree(Ws.d_ros2Nfcn);
-        if (Ws.d_ros2Njac) cudaFree(Ws.d_ros2Njac);
-        if (Ws.d_ros2Naccept) cudaFree(Ws.d_ros2Naccept);
-        if (Ws.d_ros2Nreject) cudaFree(Ws.d_ros2Nreject);
-        if (Ws.d_ros2Err) cudaFree(Ws.d_ros2Err);
-        if (Ws.d_ros2LastHstep) cudaFree(Ws.d_ros2LastHstep);
+        if (Ws.d_segRow) managedCudaFree(Ws.d_segRow);
+        if (Ws.d_segPipe) managedCudaFree(Ws.d_segPipe);
+        if (Ws.d_segVol) managedCudaFree(Ws.d_segVol);
+        if (Ws.d_hstep) managedCudaFree(Ws.d_hstep);
+        if (Ws.d_rk5Nfcn) managedCudaFree(Ws.d_rk5Nfcn);
+        if (Ws.d_rk5Naccpt) managedCudaFree(Ws.d_rk5Naccpt);
+        if (Ws.d_rk5Nrejct) managedCudaFree(Ws.d_rk5Nrejct);
+        if (Ws.d_rk5Err) managedCudaFree(Ws.d_rk5Err);
+        if (Ws.d_rk5LastHstep) managedCudaFree(Ws.d_rk5LastHstep);
+        if (Ws.d_ros2Nfcn) managedCudaFree(Ws.d_ros2Nfcn);
+        if (Ws.d_ros2Njac) managedCudaFree(Ws.d_ros2Njac);
+        if (Ws.d_ros2Naccept) managedCudaFree(Ws.d_ros2Naccept);
+        if (Ws.d_ros2Nreject) managedCudaFree(Ws.d_ros2Nreject);
+        if (Ws.d_ros2Err) managedCudaFree(Ws.d_ros2Err);
+        if (Ws.d_ros2LastHstep) managedCudaFree(Ws.d_ros2LastHstep);
         Ws.d_segRow = NULL; Ws.d_segPipe = NULL; Ws.d_segVol = NULL; Ws.d_hstep = NULL;
         Ws.d_rk5Nfcn = NULL; Ws.d_rk5Naccpt = NULL; Ws.d_rk5Nrejct = NULL;
         Ws.d_rk5Err = NULL; Ws.d_rk5LastHstep = NULL;
         Ws.d_ros2Nfcn = NULL; Ws.d_ros2Njac = NULL; Ws.d_ros2Naccept = NULL;
         Ws.d_ros2Nreject = NULL; Ws.d_ros2Err = NULL; Ws.d_ros2LastHstep = NULL;
-        if (cudaMalloc((void **)&Ws.d_segRow, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_segPipe, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_segVol, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_hstep, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_rk5Nfcn, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_rk5Naccpt, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_rk5Nrejct, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_rk5Err, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_rk5LastHstep, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_ros2Nfcn, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_ros2Njac, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_ros2Naccept, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_ros2Nreject, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_ros2Err, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_ros2LastHstep, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_segRow, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_segPipe, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_segVol, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_hstep, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_rk5Nfcn, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_rk5Naccpt, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_rk5Nrejct, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_rk5Err, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_rk5LastHstep, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_ros2Nfcn, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_ros2Njac, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_ros2Naccept, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_ros2Nreject, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_ros2Err, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_ros2LastHstep, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
         Ws.deviceNSegCap = newCap;
     }
     if (view->nActiveLinks > Ws.deviceActiveCap)
     {
         int newCap = nextCapacity(Ws.deviceActiveCap, view->nActiveLinks);
-        if (Ws.d_activeLink) cudaFree(Ws.d_activeLink);
-        if (Ws.d_pipeSegOffset) cudaFree(Ws.d_pipeSegOffset);
-        if (Ws.d_pipeSegCount) cudaFree(Ws.d_pipeSegCount);
+        if (Ws.d_activeLink) managedCudaFree(Ws.d_activeLink);
+        if (Ws.d_pipeSegOffset) managedCudaFree(Ws.d_pipeSegOffset);
+        if (Ws.d_pipeSegCount) managedCudaFree(Ws.d_pipeSegCount);
         Ws.d_activeLink = NULL;
         Ws.d_pipeSegOffset = NULL;
         Ws.d_pipeSegCount = NULL;
-        if (cudaMalloc((void **)&Ws.d_activeLink, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_pipeSegOffset, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_pipeSegCount, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_activeLink, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_pipeSegOffset, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_pipeSegCount, (size_t)newCap * sizeof(int)) != cudaSuccess) return 1;
         Ws.deviceActiveCap = newCap;
     }
     if (cValues > Ws.deviceCValueCap)
     {
         int newCap = nextCapacity(Ws.deviceCValueCap, cValues);
-        if (Ws.d_c) cudaFree(Ws.d_c);
-        if (Ws.d_cOde) cudaFree(Ws.d_cOde);
+        if (Ws.d_c) managedCudaFree(Ws.d_c);
+        if (Ws.d_cOde) managedCudaFree(Ws.d_cOde);
         Ws.d_c = NULL; Ws.d_cOde = NULL;
-        if (cudaMalloc((void **)&Ws.d_c, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
-        if (cudaMalloc((void **)&Ws.d_cOde, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_c, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_cOde, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
         Ws.deviceCValueCap = newCap;
     }
     if (hydValues > Ws.deviceHydValueCap)
     {
         int newCap = nextCapacity(Ws.deviceHydValueCap, hydValues);
-        if (Ws.d_hyd) cudaFree(Ws.d_hyd);
+        if (Ws.d_hyd) managedCudaFree(Ws.d_hyd);
         Ws.d_hyd = NULL;
-        if (cudaMalloc((void **)&Ws.d_hyd, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_hyd, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
         Ws.deviceHydValueCap = newCap;
     }
     if (reactedValues > Ws.deviceReactedValueCap)
     {
         int newCap = nextCapacity(Ws.deviceReactedValueCap, reactedValues);
-        if (Ws.d_reacted) cudaFree(Ws.d_reacted);
+        if (Ws.d_reacted) managedCudaFree(Ws.d_reacted);
         Ws.d_reacted = NULL;
-        if (cudaMalloc((void **)&Ws.d_reacted, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
+        if (managedCudaMalloc((void **)&Ws.d_reacted, (size_t)newCap * sizeof(double)) != cudaSuccess) return 1;
         Ws.deviceReactedValueCap = newCap;
     }
     if (errSize > Ws.errCap)
     {
-        if (Ws.d_err) cudaFree(Ws.d_err);
-        if (cudaMalloc(&Ws.d_err, errSize) != cudaSuccess)
+        if (Ws.d_err) managedCudaFree(Ws.d_err);
+        if (managedCudaMalloc(&Ws.d_err, errSize) != cudaSuccess)
         {
             Ws.d_err = NULL;
             Ws.errCap = 0;
@@ -425,10 +427,10 @@ extern "C" int MSXreactTransfer_init(char *errmsg, int errmsgLen)
         if (errmsg && errmsgLen > 0) snprintf(errmsg, (size_t)errmsgLen, "CUDA react transfer cudaSetDevice failed: %s", cudaGetErrorString(err));
         return 1;
     }
-    err = cudaFree(0);
+    err = managedCudaFree(0);
     if (err != cudaSuccess)
     {
-        if (errmsg && errmsgLen > 0) snprintf(errmsg, (size_t)errmsgLen, "CUDA react transfer cudaFree(0) failed: %s", cudaGetErrorString(err));
+        if (errmsg && errmsgLen > 0) snprintf(errmsg, (size_t)errmsgLen, "CUDA react transfer managedCudaFree(0) failed: %s", cudaGetErrorString(err));
         return 1;
     }
     if (errmsg && errmsgLen > 0) errmsg[0] = '\0';
@@ -439,54 +441,54 @@ extern "C" void MSXreactTransfer_close(void)
 {
     free(Ws.activeFlagByLink);
     free(Ws.countByLink);
-    if (Ws.activeLink) cudaFreeHost(Ws.activeLink);
-    if (Ws.segOffset) cudaFreeHost(Ws.segOffset);
-    if (Ws.segCount) cudaFreeHost(Ws.segCount);
-    if (Ws.segRow) cudaFreeHost(Ws.segRow);
-    if (Ws.segPipe) cudaFreeHost(Ws.segPipe);
-    if (Ws.segVol) cudaFreeHost(Ws.segVol);
-    if (Ws.hstep) cudaFreeHost(Ws.hstep);
+    if (Ws.activeLink) managedCudaFreeHost(Ws.activeLink);
+    if (Ws.segOffset) managedCudaFreeHost(Ws.segOffset);
+    if (Ws.segCount) managedCudaFreeHost(Ws.segCount);
+    if (Ws.segRow) managedCudaFreeHost(Ws.segRow);
+    if (Ws.segPipe) managedCudaFreeHost(Ws.segPipe);
+    if (Ws.segVol) managedCudaFreeHost(Ws.segVol);
+    if (Ws.hstep) managedCudaFreeHost(Ws.hstep);
     free(Ws.segPtrs);
-    if (Ws.unpackOrder) cudaFreeHost(Ws.unpackOrder);
-    if (Ws.c) cudaFreeHost(Ws.c);
-    if (Ws.cOde) cudaFreeHost(Ws.cOde);
-    if (Ws.hyd) cudaFreeHost(Ws.hyd);
-    if (Ws.reacted) cudaFreeHost(Ws.reacted);
+    if (Ws.unpackOrder) managedCudaFreeHost(Ws.unpackOrder);
+    if (Ws.c) managedCudaFreeHost(Ws.c);
+    if (Ws.cOde) managedCudaFreeHost(Ws.cOde);
+    if (Ws.hyd) managedCudaFreeHost(Ws.hyd);
+    if (Ws.reacted) managedCudaFreeHost(Ws.reacted);
     free(Ws.unpackSpecies);
-    if (Ws.rk5Nfcn) cudaFreeHost(Ws.rk5Nfcn);
-    if (Ws.rk5Naccpt) cudaFreeHost(Ws.rk5Naccpt);
-    if (Ws.rk5Nrejct) cudaFreeHost(Ws.rk5Nrejct);
-    if (Ws.rk5Err) cudaFreeHost(Ws.rk5Err);
-    if (Ws.rk5LastHstep) cudaFreeHost(Ws.rk5LastHstep);
-    if (Ws.ros2Nfcn) cudaFreeHost(Ws.ros2Nfcn);
-    if (Ws.ros2Njac) cudaFreeHost(Ws.ros2Njac);
-    if (Ws.ros2Naccept) cudaFreeHost(Ws.ros2Naccept);
-    if (Ws.ros2Nreject) cudaFreeHost(Ws.ros2Nreject);
-    if (Ws.ros2Err) cudaFreeHost(Ws.ros2Err);
-    if (Ws.ros2LastHstep) cudaFreeHost(Ws.ros2LastHstep);
-    if (Ws.d_segRow) cudaFree(Ws.d_segRow);
-    if (Ws.d_segPipe) cudaFree(Ws.d_segPipe);
-    if (Ws.d_activeLink) cudaFree(Ws.d_activeLink);
-    if (Ws.d_pipeSegOffset) cudaFree(Ws.d_pipeSegOffset);
-    if (Ws.d_pipeSegCount) cudaFree(Ws.d_pipeSegCount);
-    if (Ws.d_segVol) cudaFree(Ws.d_segVol);
-    if (Ws.d_hstep) cudaFree(Ws.d_hstep);
-    if (Ws.d_c) cudaFree(Ws.d_c);
-    if (Ws.d_cOde) cudaFree(Ws.d_cOde);
-    if (Ws.d_hyd) cudaFree(Ws.d_hyd);
-    if (Ws.d_reacted) cudaFree(Ws.d_reacted);
-    if (Ws.d_rk5Nfcn) cudaFree(Ws.d_rk5Nfcn);
-    if (Ws.d_rk5Naccpt) cudaFree(Ws.d_rk5Naccpt);
-    if (Ws.d_rk5Nrejct) cudaFree(Ws.d_rk5Nrejct);
-    if (Ws.d_rk5Err) cudaFree(Ws.d_rk5Err);
-    if (Ws.d_rk5LastHstep) cudaFree(Ws.d_rk5LastHstep);
-    if (Ws.d_ros2Nfcn) cudaFree(Ws.d_ros2Nfcn);
-    if (Ws.d_ros2Njac) cudaFree(Ws.d_ros2Njac);
-    if (Ws.d_ros2Naccept) cudaFree(Ws.d_ros2Naccept);
-    if (Ws.d_ros2Nreject) cudaFree(Ws.d_ros2Nreject);
-    if (Ws.d_ros2Err) cudaFree(Ws.d_ros2Err);
-    if (Ws.d_ros2LastHstep) cudaFree(Ws.d_ros2LastHstep);
-    if (Ws.d_err) cudaFree(Ws.d_err);
+    if (Ws.rk5Nfcn) managedCudaFreeHost(Ws.rk5Nfcn);
+    if (Ws.rk5Naccpt) managedCudaFreeHost(Ws.rk5Naccpt);
+    if (Ws.rk5Nrejct) managedCudaFreeHost(Ws.rk5Nrejct);
+    if (Ws.rk5Err) managedCudaFreeHost(Ws.rk5Err);
+    if (Ws.rk5LastHstep) managedCudaFreeHost(Ws.rk5LastHstep);
+    if (Ws.ros2Nfcn) managedCudaFreeHost(Ws.ros2Nfcn);
+    if (Ws.ros2Njac) managedCudaFreeHost(Ws.ros2Njac);
+    if (Ws.ros2Naccept) managedCudaFreeHost(Ws.ros2Naccept);
+    if (Ws.ros2Nreject) managedCudaFreeHost(Ws.ros2Nreject);
+    if (Ws.ros2Err) managedCudaFreeHost(Ws.ros2Err);
+    if (Ws.ros2LastHstep) managedCudaFreeHost(Ws.ros2LastHstep);
+    if (Ws.d_segRow) managedCudaFree(Ws.d_segRow);
+    if (Ws.d_segPipe) managedCudaFree(Ws.d_segPipe);
+    if (Ws.d_activeLink) managedCudaFree(Ws.d_activeLink);
+    if (Ws.d_pipeSegOffset) managedCudaFree(Ws.d_pipeSegOffset);
+    if (Ws.d_pipeSegCount) managedCudaFree(Ws.d_pipeSegCount);
+    if (Ws.d_segVol) managedCudaFree(Ws.d_segVol);
+    if (Ws.d_hstep) managedCudaFree(Ws.d_hstep);
+    if (Ws.d_c) managedCudaFree(Ws.d_c);
+    if (Ws.d_cOde) managedCudaFree(Ws.d_cOde);
+    if (Ws.d_hyd) managedCudaFree(Ws.d_hyd);
+    if (Ws.d_reacted) managedCudaFree(Ws.d_reacted);
+    if (Ws.d_rk5Nfcn) managedCudaFree(Ws.d_rk5Nfcn);
+    if (Ws.d_rk5Naccpt) managedCudaFree(Ws.d_rk5Naccpt);
+    if (Ws.d_rk5Nrejct) managedCudaFree(Ws.d_rk5Nrejct);
+    if (Ws.d_rk5Err) managedCudaFree(Ws.d_rk5Err);
+    if (Ws.d_rk5LastHstep) managedCudaFree(Ws.d_rk5LastHstep);
+    if (Ws.d_ros2Nfcn) managedCudaFree(Ws.d_ros2Nfcn);
+    if (Ws.d_ros2Njac) managedCudaFree(Ws.d_ros2Njac);
+    if (Ws.d_ros2Naccept) managedCudaFree(Ws.d_ros2Naccept);
+    if (Ws.d_ros2Nreject) managedCudaFree(Ws.d_ros2Nreject);
+    if (Ws.d_ros2Err) managedCudaFree(Ws.d_ros2Err);
+    if (Ws.d_ros2LastHstep) managedCudaFree(Ws.d_ros2LastHstep);
+    if (Ws.d_err) managedCudaFree(Ws.d_err);
     memset(&Ws, 0, sizeof(Ws));
 }
 

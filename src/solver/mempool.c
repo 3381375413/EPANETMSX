@@ -55,6 +55,11 @@ typedef struct alloc_root_s
     FILE *audit;
     MSXBudgetAllocation backing;
     char owner[24];
+    alloc_hdr_t *forecastCurrent;
+    char *forecastFree;
+    uint64_t forecastRetainedNext;
+    uint64_t forecastBlockCount;
+    MSXBudgetTicket *peakReservation;
 }  alloc_root_t;
 
 /*
@@ -63,6 +68,17 @@ typedef struct alloc_root_s
 
 static alloc_root_t *root;
 static uint64_t nextPoolId;
+#ifdef MSX_RESIDENT_TEST_API
+static unsigned testFailBlock;
+void AllocTestFailBlock(unsigned n) { testFailBlock=n; }
+#endif
+
+int AllocBindReservation(alloc_handle_t *handle,MSXBudgetTicket *ticket)
+{
+    alloc_root_t *pool=(alloc_root_t *)handle;if(!pool)return 0;
+    if(ticket&&pool->peakReservation)return 0;
+    pool->peakReservation=ticket;return 1;
+}
 
 static void auditPool(alloc_root_t *pool, const char *event)
 {
@@ -94,10 +110,17 @@ static alloc_hdr_t * AllocHdr(alloc_root_t *pool)
     alloc_hdr_t     *hdr;
     char            *block;
     MSXBudgetTicket ticket = {0};
-    MSXResidentBudget *budget = MSXresidentBudget_global();
+    MSXResidentBudget *budget = (MSXResidentBudget *)pool->backing.budgetOwner;
+#ifdef MSX_RESIDENT_TEST_API
+    if(testFailBlock && !--testFailBlock){
+        ++pool->stats.failedAllocations;
+        return NULL;
+    }
+#endif
 
-    if (MSXresidentBudget_reserve(budget, MSX_MEMORY_PAGEABLE,
-            ALLOC_BLOCK_SIZE + sizeof(*hdr), &ticket) != MSX_BUDGET_OK)
+    if ((pool->peakReservation?MSXresidentBudget_split(pool->peakReservation,budget,
+            ALLOC_BLOCK_SIZE+sizeof(*hdr),&ticket):MSXresidentBudget_reserve(budget,MSX_MEMORY_PAGEABLE,
+            ALLOC_BLOCK_SIZE + sizeof(*hdr), &ticket)) != MSX_BUDGET_OK)
     {
         ++pool->stats.failedAllocations;
         auditPool(pool, "block_budget_rejected");
@@ -148,7 +171,8 @@ alloc_handle_t * AllocInitNamed(const char *owner)
 {
     alloc_root_t *pool;
     MSXBudgetTicket ticket = {0};
-    MSXResidentBudget *budget = MSXresidentBudget_global();
+    MSXResidentBudget *budget = owner && !strcmp(owner,"QualPool")?
+        MSXresidentBudget_domain(MSX_BUDGET_CPU_POOL):MSXresidentBudget_global();
     const char *audit = getenv("MSX_RESIDENT_MEMORY_AUDIT");
     if (MSXresidentBudget_reserve(budget, MSX_MEMORY_PAGEABLE,
             sizeof(*pool), &ticket) != MSX_BUDGET_OK) return NULL;
@@ -297,6 +321,64 @@ int AllocGetPoolStats(alloc_handle_t *pool, AllocPoolStats *stats)
     *stats = ((alloc_root_t *)pool)->stats;
     return 1;
 }
+int AllocForecastBegin(alloc_handle_t *handle,AllocForecast *forecast)
+{
+    alloc_root_t *pool=(alloc_root_t *)handle;alloc_hdr_t *hdr;
+    if(!pool||!forecast)return 0;
+    hdr=pool->current;
+    if(pool->forecastCurrent!=hdr || pool->forecastFree!=hdr->free ||
+       pool->forecastBlockCount!=pool->stats.blockCount){
+        pool->forecastRetainedNext=0;
+        for(alloc_hdr_t *p=hdr->next;p;p=p->next)++pool->forecastRetainedNext;
+        pool->forecastCurrent=hdr;pool->forecastFree=hdr->free;
+        pool->forecastBlockCount=pool->stats.blockCount;
+    }
+    forecast->remaining=(uint64_t)(hdr->end-hdr->free);
+    forecast->retained=pool->forecastRetainedNext;forecast->bytes=0;
+    return 1;
+}
+int AllocForecastAppend(AllocForecast *forecast,const uint64_t *pattern,
+                        unsigned count,uint64_t repeats)
+{
+    uint64_t r,remaining,extra,retained,visited=0,seenRepeat[16]={0},seenBlocks[16]={0};
+    unsigned k;unsigned char seen[16]={0};
+    if(!forecast||!pattern||!count||count>16)return 0;
+    for(k=0;k<count;++k)if(!pattern[k]||pattern[k]>ALLOC_BLOCK_SIZE)return 0;
+    remaining=forecast->remaining;retained=forecast->retained;extra=forecast->bytes;
+    for(r=0;r<repeats;++r)for(k=0;k<count;++k){
+        uint64_t size=(pattern[k]+3)&~UINT64_C(3);
+        if(size>remaining){
+            /* A fresh block at the same pattern index has the same future.
+               Skip whole cycles, charging only blocks beyond retained ones. */
+            if(seen[k] && r>seenRepeat[k]){
+                uint64_t period=r-seenRepeat[k],blocks=visited-seenBlocks[k];
+                uint64_t cycles=(repeats-1-r)/period,skip;
+                if(cycles && blocks){
+                    if(cycles>UINT64_MAX/blocks)return 0;skip=cycles*blocks;
+                    uint64_t fresh=skip>retained?skip-retained:0;
+                    if(fresh>(UINT64_MAX-extra)/(ALLOC_BLOCK_SIZE+sizeof(alloc_hdr_t)))return 0;
+                    extra+=fresh*(ALLOC_BLOCK_SIZE+sizeof(alloc_hdr_t));
+                    retained=skip<retained?retained-skip:0;r+=cycles*period;visited+=skip;
+                }
+            }else {seen[k]=1;seenRepeat[k]=r;seenBlocks[k]=visited;}
+            ++visited;
+            if(retained)--retained;
+            else {if(extra>UINT64_MAX-ALLOC_BLOCK_SIZE-sizeof(alloc_hdr_t))return 0;
+                extra+=ALLOC_BLOCK_SIZE+sizeof(alloc_hdr_t);}
+            remaining=ALLOC_BLOCK_SIZE;
+        }
+        remaining-=size;
+    }
+    forecast->remaining=remaining;forecast->retained=retained;forecast->bytes=extra;return 1;
+}
+int AllocAdditionalBacking(alloc_handle_t *handle,const uint64_t *pattern,
+                          unsigned count,uint64_t repeats,uint64_t *bytes)
+{
+    AllocForecast forecast;
+    if(!bytes||!AllocForecastBegin(handle,&forecast)||
+       !AllocForecastAppend(&forecast,pattern,count,repeats))return 0;
+    *bytes=forecast.bytes;return 1;
+}
 
 
 /*
@@ -319,7 +401,7 @@ void  AllocFreePool()
         tmp = hdr->next;
         free((char *) hdr->block);
         free((char *) hdr);
-        MSXresidentBudget_releaseAllocation(MSXresidentBudget_global(), &backing);
+        MSXresidentBudget_releaseAllocation((MSXResidentBudget *)backing.budgetOwner, &backing);
         hdr = tmp;
     }
     root->stats.blockCount = root->stats.backingBytes = 0;
@@ -328,7 +410,7 @@ void  AllocFreePool()
     {
         MSXBudgetAllocation backing = root->backing;
         free((char *) root);
-        MSXresidentBudget_releaseAllocation(MSXresidentBudget_global(), &backing);
+        MSXresidentBudget_releaseAllocation((MSXResidentBudget *)backing.budgetOwner, &backing);
     }
     root = NULL;
 }

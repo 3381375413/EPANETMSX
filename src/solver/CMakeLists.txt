@@ -25,6 +25,11 @@ file(GLOB
     CONFIGURE_DEPENDS
     RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *.c *.h *.dat
 )
+# The full golden initial-state exporter is confined to isolated test builds.
+if(NOT MSX_RESIDENT_TEST_API)
+    list(REMOVE_ITEM EPANETMSX_SOURCES msxresident_initial_golden.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_initial_golden.c)
+endif()
 # The glob sees the non-CUDA implementation too.  It must never be linked
 # with the CUDA object because both export the same ABI.
 list(REMOVE_ITEM EPANETMSX_SOURCES
@@ -59,6 +64,10 @@ if(EPANETMSX_REACT_TRANSFER_STATIC_CUDA)
             -Xcompiler=/MD
             ${REACT_TRANSFER_CUDA_OPENMP_FLAG}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msxreact_transfer_cuda.cu
+                ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_cuda_alloc.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_alloc_redirect.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_alloc.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/msxresident_budget.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/msxreact_transfer_cuda.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/msxsegment_storage.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/msxtypes.h
@@ -95,6 +104,9 @@ else()
 endif()
 
 if(MSVC)
+    if(MSX_RESIDENT_TEST_API)
+        target_compile_definitions(epanetmsx PRIVATE MSX_RESIDENT_TEST_API)
+    endif()
     set_property(TARGET epanetmsx PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
     )

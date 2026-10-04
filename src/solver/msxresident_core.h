@@ -26,7 +26,7 @@ typedef enum {
  MSX_RESIDENT_PATCH_INVALIDATE = 2,
  MSX_RESIDENT_PATCH_META = 3
 } MSXResidentPatchKind;
-typedef struct { uint32_t linkIndex,slot,generation,used; MSXResidentPatchKind kind; MSXResidentPayload payload; } MSXResidentSlotPatch;
+typedef struct { uint32_t linkIndex,slot,generation,used; MSXResidentPatchKind kind; MSXResidentPayload payload; uint64_t uploadRevision; } MSXResidentSlotPatch;
 typedef struct { uint32_t linkIndex,reserved; MSXResidentPipeDesc descriptor; } MSXResidentDescriptorPatch;
 typedef struct { const MSXResidentDescriptorPatch *descriptor; uint32_t descriptorCount; const MSXResidentSlotPatch *slot; uint32_t slotCount; } MSXResidentPatchBatch;
 typedef struct { uint32_t linkIndex,slot,generation,boundarySide; uint64_t pipeEpoch; double requestedVolume; } MSXResidentHandoffItem;
@@ -73,6 +73,8 @@ MSXResidentStatus MSXresident_stageReverse(uint32_t);
 MSXResidentStatus MSXresident_getSlotForParcel(uint32_t,uint64_t,uint32_t*,uint32_t*);
 MSXResidentStatus MSXresident_getSlotGeneration(uint32_t,uint32_t,uint32_t*);
 MSXResidentStatus MSXresident_getSlotPayload(uint32_t,uint32_t,uint32_t,MSXResidentPayload*);
+/* Scalar/identity metadata only. Concentrations require Runtime GPU fetch. */
+MSXResidentStatus MSXresident_getSlotMetadata(uint32_t,uint32_t,uint32_t,MSXResidentPayload*);
 /* Read the stable identity tuple needed by selected GPU fetches.  This does
    not expose the CPU concentration image as an authoritative value. */
 MSXResidentStatus MSXresident_getSlotIdentity(uint32_t,uint32_t,uint32_t*,
@@ -132,6 +134,11 @@ const MSXResidentStats *MSXresident_stats(void);
    relative to the next module allocation; -1 disables injection. */
 uint64_t MSXresident_testAllocationCount(void);
 uint64_t MSXresident_testAllocationBytes(void);
+#ifdef MSX_RESIDENT_TEST_API
+/* Golden initial-state read-only access, including unused physical slots. */
+MSXResidentStatus MSXresident_testInitialDescriptor(uint32_t,MSXResidentPipeDesc *);
+MSXResidentStatus MSXresident_testInitialSlot(uint32_t,uint32_t,uint32_t *,uint32_t *,uint64_t *);
+#endif
 void MSXresident_testResetAllocationCount(void);
 void MSXresident_testFailAllocationAfter(int64_t allocationIndex);
 #ifdef __cplusplus

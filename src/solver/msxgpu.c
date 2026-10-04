@@ -41,6 +41,8 @@ typedef char MSXresidentHydStrideAbiAssert[
 #include "msxreact_transfer_cuda.h"
 #endif
 #include "msxsegment_storage.h"
+#include "msxresident_alloc_redirect.h"
+#include "msxresident_driver_alloc.h"
 
 extern MSXproject MSX;
 
@@ -2882,9 +2884,9 @@ void MSXgpu_closeResidentPrograms(void)
 {
     if (GpuContext) cuCtxSetCurrent(GpuContext);
 #ifdef EPANETMSX_CUDA_ENABLED
-    if (ResidentProgram.h_err) cuMemFreeHost(ResidentProgram.h_err);
+    if (ResidentProgram.h_err) managedCuMemFreeHost(ResidentProgram.h_err);
 #endif
-#define RP_FREE_D(x) do { if (ResidentProgram.x) cuMemFree(ResidentProgram.x); } while (0)
+#define RP_FREE_D(x) do { if (ResidentProgram.x) managedCuMemFree(ResidentProgram.x); } while (0)
     RP_FREE_D(d_rateAtol); RP_FREE_D(d_rateRtol); RP_FREE_D(d_rateSpecies);
     RP_FREE_D(d_eqSpecies); RP_FREE_D(d_formulaSpecies); RP_FREE_D(d_speciesType);
     RP_FREE_D(d_params); RP_FREE_D(d_consts); RP_FREE_D(d_linkDiam); RP_FREE_D(d_instr);
@@ -2928,15 +2930,15 @@ int MSXgpu_openResidentPrograms(void)
     for(m=1;m<=nConsts;m++)ResidentProgram.consts[m]=MSX.Const[m].value;
     for(k=1;k<=nLinks;k++){ResidentProgram.linkDiam[k]=MSX.Link[k].diam;for(m=1;m<=nParams;m++)ResidentProgram.params[k*(nParams+1)+m]=MSX.Link[k].param[m];}
     err=buildPrograms(&ResidentProgram.instr,&nInstr,&ResidentProgram.speciesProg,&ResidentProgram.termProg); if(err)goto fail; ResidentProgram.nInstr=nInstr; memset(&zeroErr,0,sizeof(zeroErr));
-#define RP_ALLOC_COPY(x,h,n) do { ResidentProgram.fixedMemory.deviceBytes+=(uint64_t)(n); err=checkResidentAllocation(cuMemAlloc(&ResidentProgram.x,(n)));if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.x,(h),(n),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto fail;} while(0)
+#define RP_ALLOC_COPY(x,h,n) do { ResidentProgram.fixedMemory.deviceBytes+=(uint64_t)(n); err=checkResidentAllocation(managedCuMemAlloc(&ResidentProgram.x,(n)));if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.x,(h),(n),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto fail;} while(0)
     RP_ALLOC_COPY(d_rateAtol,ResidentProgram.rateAtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateRtol,ResidentProgram.rateRtol,(rateCount+1)*sizeof(double)); RP_ALLOC_COPY(d_rateSpecies,ResidentProgram.rateSpecies,(rateCount+1)*sizeof(int)); RP_ALLOC_COPY(d_eqSpecies,ResidentProgram.eqSpecies,(eqCount+1)*sizeof(int)); RP_ALLOC_COPY(d_formulaSpecies,ResidentProgram.formulaSpecies,(formulaCount+1)*sizeof(int)); RP_ALLOC_COPY(d_speciesType,ResidentProgram.speciesType,(nSpecies+1)*sizeof(int)); RP_ALLOC_COPY(d_params,ResidentProgram.params,(size_t)(nLinks+1)*(nParams+1)*sizeof(double)); RP_ALLOC_COPY(d_consts,ResidentProgram.consts,(nConsts+1)*sizeof(double)); RP_ALLOC_COPY(d_linkDiam,ResidentProgram.linkDiam,(nLinks+1)*sizeof(double)); RP_ALLOC_COPY(d_instr,ResidentProgram.instr,(nInstr?nInstr:1)*sizeof(GpuInstrHost)); RP_ALLOC_COPY(d_speciesProg,ResidentProgram.speciesProg,(nSpecies+1)*sizeof(GpuProgramHost)); RP_ALLOC_COPY(d_termProg,ResidentProgram.termProg,(MSX.Nobjects[TERM]+1)*sizeof(GpuProgramHost));
 #undef RP_ALLOC_COPY
-    ResidentProgram.fixedMemory.deviceBytes+=sizeof(zeroErr);err=checkResidentAllocation(cuMemAlloc(&ResidentProgram.d_err,sizeof(zeroErr)));if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.d_err,&zeroErr,sizeof(zeroErr),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto fail;
+    ResidentProgram.fixedMemory.deviceBytes+=sizeof(zeroErr);err=checkResidentAllocation(managedCuMemAlloc(&ResidentProgram.d_err,sizeof(zeroErr)));if(err)goto fail;err=checkCu(profileCuMemcpyHtoD(ResidentProgram.d_err,&zeroErr,sizeof(zeroErr),MSX_PROFILE_TRANSFER_SCOPE_OTHER),ERR_GPU_KERNEL_RUNTIME_ERROR);if(err)goto fail;
     /* The error copy is enqueued before the ready event.  Keep its host
        destination pinned for the complete resident-program lifetime: the
        caller's lifecycle token is commonly stack storage and is not valid as
        an asynchronous Driver-API destination. */
-    ResidentProgram.fixedMemory.pinnedBytes+=sizeof(zeroErr);err=checkResidentAllocation(cuMemHostAlloc((void **)&ResidentProgram.h_err,sizeof(zeroErr),CU_MEMHOSTALLOC_PORTABLE));if(err)goto fail;
+    ResidentProgram.fixedMemory.pinnedBytes+=sizeof(zeroErr);err=checkResidentAllocation(managedCuMemHostAlloc((void **)&ResidentProgram.h_err,sizeof(zeroErr),CU_MEMHOSTALLOC_PORTABLE));if(err)goto fail;
     memset(ResidentProgram.h_err,0,sizeof(zeroErr));
     /* The resident CUDA core owns the Runtime stream.  This Driver event is
        recorded on the exact stream handle returned by prepareActive; it is
@@ -2953,18 +2955,19 @@ int MSXgpu_openResidentPrograms(void)
             err=checkResidentAllocation(cuEventCreate(&ResidentProgram.evStop[i],CU_EVENT_DEFAULT));if(err)goto fail;
         }
     }
-    if(ResidentProgram.rateSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.rateSpecies);
-    if(ResidentProgram.eqSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.eqSpecies);
-    if(ResidentProgram.formulaSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.formulaSpecies);
-    if(ResidentProgram.speciesType)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.speciesType);
-    if(ResidentProgram.rateAtol)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.rateAtol);
-    if(ResidentProgram.rateRtol)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.rateRtol);
-    if(ResidentProgram.params)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.params);
-    if(ResidentProgram.consts)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.consts);
-    if(ResidentProgram.linkDiam)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.linkDiam);
-    if(ResidentProgram.instr)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.instr);
-    if(ResidentProgram.speciesProg)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.speciesProg);
-    if(ResidentProgram.termProg)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)_msize(ResidentProgram.termProg);
+    if(ResidentProgram.rateSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.rateSpecies);
+    if(ResidentProgram.eqSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.eqSpecies);
+    if(ResidentProgram.formulaSpecies)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.formulaSpecies);
+    if(ResidentProgram.speciesType)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.speciesType);
+    if(ResidentProgram.rateAtol)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.rateAtol);
+    if(ResidentProgram.rateRtol)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.rateRtol);
+    if(ResidentProgram.params)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.params);
+    if(ResidentProgram.consts)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.consts);
+    if(ResidentProgram.linkDiam)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.linkDiam);
+    if(ResidentProgram.instr)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.instr);
+    if(ResidentProgram.speciesProg)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.speciesProg);
+    if(ResidentProgram.termProg)ResidentProgram.fixedMemory.hostBytes+=(uint64_t)MSXresidentAlloc_chargedBytes(ResidentProgram.termProg);
+    ResidentProgram.fixedMemory.hostBytes+=14*MSXresidentExternal_recordBytes();
     ResidentProgram.ready=1; ResidentProgram.allocCount++; return 0;
 fail: MSXgpu_closeResidentPrograms(); return err;
 }
@@ -3465,7 +3468,7 @@ int MSXgpu_reactPipeSegments(double dt)
     d_err = (CUdeviceptr)transfer.d_err;
 
     if (timing) timer = MSXgpu_wallTimeMs();
-#define GPU_ALLOC_COPY(ptr, host, bytes) do { err = checkCu(cuMemAlloc(&(ptr), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; err = checkCu(profileCuMemcpyHtoD((ptr), (host), (bytes), MSX_PROFILE_TRANSFER_SCOPE_OTHER), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; } while (0)
+#define GPU_ALLOC_COPY(ptr, host, bytes) do { err = checkCu(managedCuMemAlloc(&(ptr), (bytes)), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; err = checkCu(profileCuMemcpyHtoD((ptr), (host), (bytes), MSX_PROFILE_TRANSFER_SCOPE_OTHER), ERR_GPU_MEMORY_ALLOCATION_FAILED); if (err) goto cleanup; } while (0)
     GPU_ALLOC_COPY(d_rateAtol, rateAtol, (rateCount + 1) * sizeof(double));
     GPU_ALLOC_COPY(d_rateRtol, rateRtol, (rateCount + 1) * sizeof(double));
     GPU_ALLOC_COPY(d_rateSpecies, rateSpecies, (rateCount + 1) * sizeof(int));
@@ -3737,18 +3740,18 @@ cleanup:
             if (evStop[i]) cuEventDestroy(evStop[i]);
         }
     }
-    if (d_rateAtol) cuMemFree(d_rateAtol);
-    if (d_rateRtol) cuMemFree(d_rateRtol);
-    if (d_rateSpecies) cuMemFree(d_rateSpecies);
-    if (d_eqSpecies) cuMemFree(d_eqSpecies);
-    if (d_formulaSpecies) cuMemFree(d_formulaSpecies);
-    if (d_speciesType) cuMemFree(d_speciesType);
-    if (d_params) cuMemFree(d_params);
-    if (d_consts) cuMemFree(d_consts);
-    if (d_linkDiam) cuMemFree(d_linkDiam);
-    if (d_instr) cuMemFree(d_instr);
-    if (d_speciesProg) cuMemFree(d_speciesProg);
-    if (d_termProg) cuMemFree(d_termProg);
+    if (d_rateAtol) managedCuMemFree(d_rateAtol);
+    if (d_rateRtol) managedCuMemFree(d_rateRtol);
+    if (d_rateSpecies) managedCuMemFree(d_rateSpecies);
+    if (d_eqSpecies) managedCuMemFree(d_eqSpecies);
+    if (d_formulaSpecies) managedCuMemFree(d_formulaSpecies);
+    if (d_speciesType) managedCuMemFree(d_speciesType);
+    if (d_params) managedCuMemFree(d_params);
+    if (d_consts) managedCuMemFree(d_consts);
+    if (d_linkDiam) managedCuMemFree(d_linkDiam);
+    if (d_instr) managedCuMemFree(d_instr);
+    if (d_speciesProg) managedCuMemFree(d_speciesProg);
+    if (d_termProg) managedCuMemFree(d_termProg);
     free(params);
     free(consts);
     free(linkDiam);

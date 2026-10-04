@@ -2,6 +2,7 @@
 #define MSXRESIDENT_CAPACITY_H
 #include "msxresident_core_cuda.h"
 MSXResidentStatus MSXresidentCapacity_memoryConfig(MSXResidentMemoryConfig *);
+MSXResidentStatus MSXresidentCapacity_fileBudget(const MSXResidentLayout *);
 typedef struct {
  double volume,qmin,qmax,vmin;
  uint64_t positiveSteps,zeroMs,reversals;
@@ -15,6 +16,7 @@ int MSXresidentCapacity_getPrediction(uint32_t,MSXResidentCapacityPipe *);
 int MSXresidentCapacity_prepare(void);
 MSXResidentStatus MSXresidentCapacity_openPlan(const char *);
 int MSXresidentCapacity_retryBudget(void);
+void MSXresidentCapacity_noteStartupRetry(const char *reason);
 int MSXresidentCapacity_startupAttempt(void);
 void MSXresidentCapacity_close(void);
 void MSXresidentCapacity_recordOwnership(void);

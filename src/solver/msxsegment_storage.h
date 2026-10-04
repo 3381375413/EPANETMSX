@@ -54,6 +54,9 @@ int  MSXsegStorage_hybridReserve(const MSXResidentLayout *layout);
    without touching FirstSeg/LastSeg/prev/next/nsegs. Commit is a preflighted,
    allocation-free topology replacement. */
 int  MSXsegStorage_hybridPrepareInitialImage(void);
+int  MSXsegStorage_hybridStageDirectInitialPipe(int link,uint32_t count,double volume,const double *c);
+int  MSXsegStorage_hybridValidateDirectInitial(void);
+void MSXsegStorage_hybridDirectInitialCounts(uint64_t *pipes,uint64_t *cpu,uint64_t *core);
 int  MSXsegStorage_hybridStageInitialImage(void);
 int  MSXsegStorage_hybridCommitInitialImage(void);
 void MSXsegStorage_hybridAbortInitialImage(void);
@@ -115,6 +118,7 @@ int  MSXsegStorage_hybridAcquireBoundary(Pseg *segment);
 int  MSXsegStorage_hybridEnsureBoundaryPoolFree(uint32_t required);
 uint64_t MSXsegStorage_hybridCpuPoolGrowthCount(void);
 uint64_t MSXsegStorage_hybridFixedHostBytes(uint32_t,uint32_t,uint32_t);
+uint64_t MSXsegStorage_hybridExistingHostBytes(void);
 uint64_t MSXsegStorage_testAllocationBytes(void);
 int  MSXsegStorage_hybridReleaseBoundary(Pseg segment);
 /* Explicit audit seam: poison only dense Hybrid Core c/lastc mirrors. */

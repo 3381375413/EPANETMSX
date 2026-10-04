@@ -20,6 +20,7 @@
 #include "msxtypes.h"
 #include "msxsegment_storage.h"
 #include "epanet2.h"
+#include "msxresident_alloc_redirect.h"
 
 extern MSXproject MSX;
 

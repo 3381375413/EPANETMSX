@@ -19,6 +19,8 @@
 #include "msxgpu.h"
 #include "msxresident_runtime.h"
 #include "msxsegment_storage.h"
+#define MSX_RESIDENT_WORKSPACE_DOMAIN MSX_BUDGET_SCRATCH
+#include "msxresident_alloc_redirect.h"
 
 //  External variables
 //--------------------

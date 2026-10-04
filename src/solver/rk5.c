@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "rk5.h"
+#include "msxresident_alloc_redirect.h"
 
 #define fmin(x,y) (((x)<=(y)) ? (x) : (y))     /* minimum of x and y    */
 #define fmax(x,y) (((x)>=(y)) ? (x) : (y))     /* maximum of x and y    */

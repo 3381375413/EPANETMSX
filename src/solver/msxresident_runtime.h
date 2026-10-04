@@ -3,8 +3,15 @@
 
 #include "msxresident_core.h"
 uint64_t MSXresidentRuntime_fixedHostBytes(uint32_t,uint32_t,uint32_t);
+typedef struct MSXResidentInitialTankDraft {
+    struct Sseg *first, *last;
+    uint32_t count;
+} MSXResidentInitialTankDraft;
+uint64_t MSXresidentRuntime_initialScratchBytes(uint32_t links,uint32_t tanks,uint32_t stride);
 #include "msxresident_core_cuda.h"
 #include "msxgpu.h"
+#include "msxresident_transaction.h"
+void MSXresidentRuntime_transactionSnapshot(MSXResidentTransaction *);
 
 /* Resident close summaries are diagnostics, not part of the cache protocol.
    Keep this predicate pure so the CPU contract harness can cover the off and
@@ -17,6 +24,10 @@ static int MSXresidentRuntime_diagnosticSummaryGate(int diagnosticDetail,
 
 /* Phase 3C-1 lifecycle boundary.  These hooks never alter segment topology. */
 int MSXresidentRuntime_preHybridInit(void);
+int MSXresidentRuntime_prepareDirectInitial(void);
+int MSXresidentRuntime_finishDirectInitial(void);
+int MSXresidentRuntime_completeDirectInitial(void);
+int MSXresidentRuntime_directInitialPlanning(void);
 int MSXresidentRuntime_afterHybridInit(void);
 int MSXresidentRuntime_flushPatches(void);
 void MSXresidentRuntime_close(void);

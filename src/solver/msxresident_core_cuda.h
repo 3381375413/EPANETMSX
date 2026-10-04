@@ -88,6 +88,8 @@ MSXResidentStatus MSXresidentGpu_getFixedMemory(const MSXResidentGpu *,MSXReside
 MSXResidentStatus MSXresidentGpu_writeAllocationManifest(const MSXResidentGpu *,const char *);
 MSXResidentStatus MSXresidentGpu_initialUpload(MSXResidentGpu *, const MSXResidentPatchBatch *);
 MSXResidentStatus MSXresidentGpu_applyPatches(MSXResidentGpu *, const MSXResidentPatchBatch *);
+/* H2D to independent IMPORT staging only; acknowledgment permits lease reuse. */
+MSXResidentStatus MSXresidentGpu_stageImports(MSXResidentGpu *,const MSXResidentSlotPatch *,uint32_t);
 MSXResidentStatus MSXresidentGpu_fetchHandoffs(MSXResidentGpu *, const MSXResidentHandoffPlan *, MSXResidentGpuFetchOutput *, uint32_t);
 /* Fetch a flat set of handoff rows in one GPU gather and one D2H triplet.
    Items may belong to different links and boundary plans; the caller keeps

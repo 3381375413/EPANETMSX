@@ -1,5 +1,7 @@
 #include "msxresident_core_cuda.h"
 #include "msxresident_memory_config.h"
+MSXResidentStatus MSXresidentGpu_stageImports(MSXResidentGpu *g,const MSXResidentSlotPatch *p,uint32_t n)
+{(void)g;(void)p;(void)n;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_writeAllocationManifest(const MSXResidentGpu*g,const char*p)
 {(void)g;(void)p;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_fetchHandoffTargets(MSXResidentGpu *g,const MSXResidentHandoffItem *i,

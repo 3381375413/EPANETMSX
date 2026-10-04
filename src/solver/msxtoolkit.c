@@ -28,6 +28,7 @@
 #include "msxutils.h"                                                          
 #include "epanet2.h"
 #include "epanetmsx.h"
+#include "msxresident_alloc_redirect.h"
 
 //  External variables
 //--------------------

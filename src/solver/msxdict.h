@@ -30,7 +30,9 @@ static char *OptionTypeWords[] = {"AREA_UNITS", "RATE_UNITS", "SOLVER", "COUPLIN
                                   "SEGMENT_STORAGE", "PIPE_RING_CAP", "GPU_CORE_MODE",
                                   "GPU_CORE_GUARD", "GPU_CORE_CAPACITY_FILE",
                                   "GPU_CORE_OVERFLOW", "GPU_CORE_CAPACITY_MODE",
-                                  "GPU_CORE_MEMORY_MB", NULL};
+                                  "GPU_CORE_MEMORY_MB", "GPU_CORE_HOST_MEMORY_MB",
+                                  "GPU_CORE_TRANSFER_BATCH_ROWS", "GPU_CORE_CPU_POOL_BUDGET_MB",
+                                  "GPU_CORE_UPLOAD_BUDGET_MB", NULL};
 static char *CompilerWords[]   = {"NONE", "VC", "GC", NULL};                      
 static char *SourceTypeWords[] = {"CONC", "MASS", "SETPOINT", "FLOW", NULL};      
 static char *MixingTypeWords[] = {"MIXED", "2COMP", "FIFO", "LIFO", NULL};
