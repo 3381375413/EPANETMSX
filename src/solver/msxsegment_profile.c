@@ -984,3 +984,27 @@ void MSXsegProfile_close(void)
     if (P.steps) fclose(P.steps);
     free_arrays();
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Profile(MSXInventory *s)
+{
+ INV_HEAP(s,P.pre_count);
+ INV_HEAP(s,P.post_count);
+ INV_HEAP(s,P.pre_offset);
+ INV_HEAP(s,P.post_offset);
+ INV_HEAP(s,P.pre_tokens);
+ INV_HEAP(s,P.post_tokens);
+ INV_HEAP(s,P.step_visits);
+ INV_HEAP(s,P.step_down_complete);
+ INV_HEAP(s,P.step_down_partial);
+ INV_HEAP(s,P.step_up_new);
+ INV_HEAP(s,P.step_up_merge);
+ INV_HEAP(s,P.step_reversals);
+ INV_HEAP(s,P.link);
+ INV_HEAP(s,P.generations);
+ INV_HEAP(s,P.shadow_hash);
+ INV_HEAP(s,P.shadow_indices);
+ if(P.link){uint32_t k;for(k=0;k<=(uint32_t)P.nlinks;k++){INV_INDEX(s,"Profile.bins",k,0,P.link[k].downstream_delete_burst.bins);INV_INDEX(s,"Profile.bins",k,1,P.link[k].upstream_create_burst.bins);INV_INDEX(s,"Profile.bins",k,2,P.link[k].combined_burst.bins);}}
+}
+#endif

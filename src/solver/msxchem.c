@@ -13,6 +13,9 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "msxtypes.h"
 #include "rk5.h"
@@ -20,6 +23,7 @@
 #include "newton.h"
 #include "msxfuncs.h"                                                          
 #include "msxgpu.h"
+#include "msxboundary_visit.h"
 #include "msxsegment_storage.h"
 #include "msxsegment_profile.h"
 #include "msxresident_runtime.h"
@@ -87,8 +91,8 @@ static void   setTankChemistry(void);
 //static void   evalHydVariables(int k);           
 static int    evalPipeSegmentReaction(int k, double dt, Pseg seg);
 static int    evalPipeReactions(int k, double dt);
-static int    evalPipeHybridReactions(int k, double dt);
-static int    evalPipeHybridBoundaryReactions(int k, double dt);
+static int    evalPipeHybridReactions(int k, double dt, uint64_t *cpuRows);
+static int    evalPipeHybridBoundaryReactions(int k, double dt, uint64_t *cpuRows, uint64_t *coreWalked);
 static int    evalPipeRingReactions(int k, double dt);
 static int    evalTankReactions(int k, double dt);
 static int    evalPipeEquil(double *c);
@@ -304,34 +308,57 @@ int MSXchem_react(double dt)
         int residentErr = 0;
         int stageTiming = MSXgpu_profileStageEnabled();
         int detailTiming = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM);
+        int diagnostic = MSXgpu_profileResidentDiagnosticEnabled();
+        double submitStart = 0.0;
+        residentErr = MSXgpu_profileResidentDiagnosticBegin();
+        if (residentErr) return residentErr;
+        if (diagnostic) submitStart = MSXgpu_wallTimeMs();
         residentErr = MSXresidentRuntime_submitCore(dt, &residentToken);
+        if (diagnostic) MSXgpu_profileResidentHostInterval(MSX_HOST_SUBMIT, submitStart, MSXgpu_wallTimeMs());
         if (!residentErr) residentSubmitted = 1;
         double boundaryStart = stageTiming ? MSXgpu_wallTimeMs() : 0.0;
         /* CPU owns only boundary Psegs.  Core rows have no CPU chemistry
            writeback path in RESIDENT mode. */
 #pragma omp parallel
         {
-#pragma omp for private(k)
+            uint64_t diagLinks = 0, diagRows = 0, diagCore = 0;
+            int diagThread = 0;
+#ifdef _OPENMP
+            diagThread = omp_get_thread_num();
+#endif
+#pragma omp for private(k) schedule(dynamic,16) nowait
             for (k = 1; k <= MSX.Nobjects[LINK]; k++)
             {
                 int linkErr = 0;
                 if (MSX.Link[k].len == 0.0) continue;
+                if (diagnostic) ++diagLinks;
                 for (int hi = 1; hi < MAX_HYD_VARS; hi++) HydVar[hi] = MSX.Link[k].HydVar[hi];
                 if (MSXresidentRuntime_linkFallback(k))
                 {
                     double fallbackStart = detailTiming ? MSXgpu_wallTimeMs() : 0.0;
-                    linkErr = evalPipeHybridReactions(k, dt);
+                    linkErr = evalPipeHybridReactions(k, dt, diagnostic ? &diagRows : NULL);
 #pragma omp critical(msx_resident_fallback_timing)
                     { if (detailTiming) MSX.GpuTimingRecord.resident_fallback_ms += MSXgpu_wallTimeMs() - fallbackStart; }
                 }
-                else linkErr = evalPipeHybridBoundaryReactions(k, dt);
+                else linkErr = evalPipeHybridBoundaryReactions(k, dt, diagnostic ? &diagRows : NULL,
+                                                              diagnostic ? &diagCore : NULL);
                 if (linkErr)
                 {
 #pragma omp critical(msx_resident_boundary_react_error)
                     { if (!residentErr) residentErr = linkErr; }
                 }
             }
+            /* Record before the implicit region barrier to retain tail imbalance. */
+            if (diagnostic) {
+                int diagErr = MSXgpu_profileResidentThread(diagThread, diagLinks, diagRows,
+                                                          diagCore, MSXgpu_wallTimeMs());
+                if (diagErr) {
+#pragma omp critical(msx_resident_boundary_react_error)
+                    { if (!residentErr) residentErr = diagErr; }
+                }
+            }
         }
+        if (diagnostic) MSXgpu_profileResidentHostInterval(MSX_HOST_BOUNDARY, boundaryStart, MSXgpu_wallTimeMs());
         if (stageTiming)
         {
             double boundaryMs = MSXgpu_wallTimeMs() - boundaryStart;
@@ -391,7 +418,7 @@ int MSXchem_react(double dt)
                 if (MSX.Link[k].len == 0.0) continue;
                 for (int hi = 1; hi < MAX_HYD_VARS; hi++)
                     HydVar[hi] = MSX.Link[k].HydVar[hi];
-                linkErr = evalPipeHybridReactions(k, dt);
+                linkErr = evalPipeHybridReactions(k, dt, NULL);
                 if (linkErr)
                 {
                     /* Do not return out of an OpenMP structured block and
@@ -477,6 +504,8 @@ int MSXchem_react(double dt)
         if (MSXgpu_profileStageEnabled())
             MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_CPU_TANK,
                                    MSXgpu_wallTimeMs() - tankStart);
+        if (MSXresidentRuntime_isResident() && MSXgpu_profileResidentDiagnosticEnabled())
+            MSXgpu_profileResidentHostInterval(MSX_HOST_TANK, tankStart, MSXgpu_wallTimeMs());
     }
     if (residentSubmitted)
     {
@@ -487,7 +516,10 @@ int MSXchem_react(double dt)
         }
         else
         {
+            double waitStart = MSXgpu_profileResidentDiagnosticEnabled() ? MSXgpu_wallTimeMs() : 0.0;
             errcode = MSXresidentRuntime_finishCore(&residentToken);
+            if (MSXgpu_profileResidentDiagnosticEnabled())
+                MSXgpu_profileResidentHostInterval(MSX_HOST_WAIT, waitStart, MSXgpu_wallTimeMs());
             residentSubmitted = 0;
         }
     }
@@ -853,7 +885,7 @@ int evalPipeReactions(int k, double dt)
     return errcode;
 }
 
-static int evalPipeHybridReactions(int k, double dt)
+static int evalPipeHybridReactions(int k, double dt, uint64_t *cpuRows)
 {
     int errcode = 0;
     Pseg seg, coreTail, *coreSpan;
@@ -875,6 +907,7 @@ static int evalPipeHybridReactions(int k, double dt)
     {
         errcode = evalPipeSegmentReaction(k, dt, seg);
         if (errcode) return errcode;
+        if (cpuRows) ++*cpuRows;
         seg = seg->prev;
     }
     if (timing) boundaryMs += MSXgpu_wallTimeMs() - timer;
@@ -899,6 +932,7 @@ static int evalPipeHybridReactions(int k, double dt)
                 if (!seg || !seg->inHybridCore) return ERR_PIPE_RING_CAPACITY;
                 errcode = evalPipeSegmentReaction(k, dt, seg);
                 if (errcode) return errcode;
+                if (cpuRows) ++*cpuRows;
             }
         }
         if (timing) coreMs = MSXgpu_wallTimeMs() - timer;
@@ -912,6 +946,7 @@ static int evalPipeHybridReactions(int k, double dt)
     {
         errcode = evalPipeSegmentReaction(k, dt, seg);
         if (errcode) return errcode;
+        if (cpuRows) ++*cpuRows;
         seg = seg->prev;
     }
     if (timing) boundaryMs += MSXgpu_wallTimeMs() - timer;
@@ -921,24 +956,45 @@ static int evalPipeHybridReactions(int k, double dt)
     return errcode;
 }
 
-static int evalPipeHybridBoundaryReactions(int k, double dt)
+typedef struct { int link; double dt; } BoundaryReactionContext;
+
+static int reactBoundarySegment(Pseg seg, void *opaque)
 {
-    int errcode = 0;
+    BoundaryReactionContext *context = (BoundaryReactionContext *)opaque;
+    if (MSXResidentCapacityAuditEnabled &&
+        MSXresidentCapacity_auditReact((uint32_t)context->link,seg->hybridId,0))
+        return ERR_GPU_SEGMENT_PACK_FAILED;
+    return evalPipeSegmentReaction(context->link, context->dt, seg);
+}
+
+/* C04 certificate fast path stays disabled until the complete C01 mutation
+   and production read-window gate is accepted. No user option is added. */
+#define MSX_BOUNDARY_TRUSTED_FAST 1
+
+static int evalPipeHybridBoundaryReactions(int k, double dt, uint64_t *cpuRows, uint64_t *coreWalked)
+{
+    int errcode;
+    BoundaryReactionContext context = { k, dt };
+    MSXBoundaryCoreInterval interval;
+    const MSXBoundaryCoreInterval *certified = NULL;
     double capacityStart=MSX.GpuCoreOverflow?MSXgpu_wallTimeMs():0.0;
-    Pseg seg = MSX.FirstSeg[k];
-    MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
-    while (seg)
-    {
-        if (!MSXsegStorage_isHybridCoreSegment(seg))
-        {
-            if (MSXResidentCapacityAuditEnabled &&
-                MSXresidentCapacity_auditReact((uint32_t)k,seg->hybridId,0))
-                return ERR_GPU_SEGMENT_PACK_FAILED;
-            errcode = evalPipeSegmentReaction(k, dt, seg);
-            if (errcode) return errcode;
-        }
-        seg = seg->prev;
+#if MSX_BOUNDARY_TRUSTED_FAST
+    const MSXHybridPartitionView *view = NULL;
+    errcode = MSXsegStorage_hybridGetPartitionView(k, &view);
+    if (errcode) return errcode;
+    if (view &&
+        view->valid && view->continuityProven && view->coreCount >= 0) {
+        interval.head = view->firstCore; interval.tail = view->lastCore;
+        interval.count = (uint64_t)view->coreCount;
+        certified = &interval;
     }
+#else
+    (void)interval;
+#endif
+    MSXsegProfile_reactVisitsForLink(k, MSX.Link[k].nsegs);
+    errcode = MSXboundary_visit(MSX.FirstSeg[k], certified, reactBoundarySegment,
+                                &context, cpuRows, coreWalked);
+    if (errcode) return errcode;
     if(MSX.GpuCoreOverflow)
         MSXresidentCapacity_addCpuReactMs((uint32_t)k,MSXgpu_wallTimeMs()-capacityStart);
     return 0;
@@ -1633,3 +1689,26 @@ void getTankEquil(double t, double y[], int n, double f[])
     }
 }
 
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Chemistry(MSXInventory *s)
+{
+ INV_HEAP(s,PipeRateSpecies);
+ INV_HEAP(s,TankRateSpecies);
+ INV_HEAP(s,PipeEquilSpecies);
+ INV_HEAP(s,TankEquilSpecies);
+ INV_HEAP(s,Atol);
+ INV_HEAP(s,Rtol);
+#pragma omp parallel
+ {
+#pragma omp critical(msx_inventory)
+ {  INV_INDEX(s,"Chem.worker",(uint32_t)omp_get_thread_num(),0,Yrate);
+ INV_INDEX(s,"Chem.worker",(uint32_t)omp_get_thread_num(),0,Yequil);
+ INV_INDEX(s,"Chem.worker",(uint32_t)omp_get_thread_num(),0,F);
+ INV_INDEX(s,"Chem.worker",(uint32_t)omp_get_thread_num(),0,ChemC1);
+ MSXinv_Newton(s);MSXinv_RK5(s);MSXinv_ROS2(s);
+ }
+ }
+}
+#endif

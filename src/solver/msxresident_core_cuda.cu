@@ -46,11 +46,19 @@ typedef struct { uint32_t link,capacity,head,tail,count; int32_t orient; uint64_
 typedef struct { uint32_t link; DDesc descriptor; } DDescStage;
 typedef struct { uint32_t link,row,generation,used,kind,payloadRow; uint64_t id; double v,h,hr,ur,dr; } Stage;
 typedef struct {uint64_t id,revision;uint32_t generation,link;} ImportStamp;
+typedef struct {
+    FILE *csv;
+    uint64_t checks;
+    uintptr_t device[37];
+    uint32_t linkCount;
+    /* base[linkCount+1] then capacity[linkCount+1] in the same charged block. */
+} FixedLayoutAudit;
 struct MSXResidentGpu {
     /* Embedded tokens are part of the charged control allocation.  The fixed
        buffers have at most 64 pinned/device allocations in either layout. */
     struct { void *ptr; MSXBudgetAllocation allocation; } backing[64];
     uint32_t backingCount;
+    FixedLayoutAudit *layoutAudit;
     FILE *inventory;
     MSXResidentMemoryEstimate fixedMemory;
     uint32_t n,slots,owned,stride,activeCount,batchRows,allocatedHydLayout;
@@ -85,6 +93,21 @@ struct MSXResidentGpu {
     MSXResidentGpuReduction *dred,*hAggLink,*dAggLink,c,aggregate;
     double *hAggMass,*dAggMass,*aggregateMass;
 };
+#ifdef MSX_RESIDENT_ACTIVE_STAMP_TEST_API
+extern "C" int MSXresidentGpu_testPinnedPayloadOwners(MSXResidentGpu *g,uint64_t *addresses,uint32_t *tickets)
+{
+    if(!g||!addresses||!tickets)return 0;
+    addresses[0]=(uint64_t)(uintptr_t)g->hPatchC;
+    addresses[1]=(uint64_t)(uintptr_t)g->hGatherC;
+    addresses[2]=(uint64_t)(uintptr_t)g->hPatchL;
+    addresses[3]=(uint64_t)(uintptr_t)g->hGatherL;
+    *tickets=0;
+    for(uint32_t i=0;i<g->backingCount;++i)
+        if(g->backing[i].allocation.memoryClass==MSX_MEMORY_PINNED&&
+           (g->backing[i].ptr==g->hPatchC||g->backing[i].ptr==g->hPatchL))++*tickets;
+    return 1;
+}
+#endif
 static cudaError_t trackedCopyAsync(MSXResidentGpu *g,void *dst,const void *src,
                                     size_t bytes,cudaMemcpyKind kind,
                                     int direction,int scope)
@@ -242,7 +265,9 @@ static void gone(MSXResidentGpu*g)
     freeDevice(g->daLast);freeDevice(g->daReacted);
     freePinned(g->hd);freePinned(g->hPatchDesc);freePinned(g->hPatch);
     freePinned(g->hGather);freePinned(g->hPatchC);freePinned(g->hPatchL);
-    freePinned(g->hGatherC);freePinned(g->hGatherL);
+    /* hPatchC/L own the two pinned payload arenas. Gather views alias them;
+       only the owners have allocation tickets and may be freed. */
+    g->hGatherC=NULL;g->hGatherL=NULL;
     freePinned(g->haPipe);freePinned(g->haRow);freePinned(g->haNf);
     freePinned(g->haNj);freePinned(g->haNa);freePinned(g->haNr);
     freePinned(g->haErr);freePinned(g->haVol);freePinned(g->haHyd);free(g->hCandidateHyd);freePinned(g->hSubmittedHyd);
@@ -250,12 +275,81 @@ static void gone(MSXResidentGpu*g)
     free(g->cap);free(g->base);free(g->hu);free(g->hg);free(g->he);free(g->hi);
     free(g->fetchSeen);free(g->activeSeen);free(g->haGen);free(g->haEpoch);free(g->haH);
     free(g->uploadStamp);
+    if(g->layoutAudit){if(g->layoutAudit->csv)fclose(g->layoutAudit->csv);free(g->layoutAudit);}
     freePinned(g->hAggLink);freePinned(g->hAggMass);free(g->aggregateMass);
     for(uint32_t i=0;i<g->backingCount;++i)if(g->backing[i].allocation.live){
         fprintf(stderr,"RESIDENT_ERROR,stage=free_backing,status=CUDA_RELEASE_FAILED\n");return;}
     free(g);
 }
 extern "C" int MSXresidentGpu_isEnabled(void){return 1;}
+/* Explicit diagnostic entry only: production callers gate this by DIAGNOSTIC.
+   No audit storage is allocated, hashed or scanned unless this is called. */
+extern "C" MSXResidentStatus MSXresidentGpu_auditFixedLayout(MSXResidentGpu *g)
+{
+    static const char *names[37]={"dPatchDesc","dd","dPatchStage","dGatherStage",
+        "dPatchC","dPatchL","dGatherC","dGatherL","du","dg","di","dv","dh",
+        "dhr","dur","ddr","dc","dl","dmass","dred","daPipe","daRow","daVol",
+        "daHyd","dPipeHyd","daH","daNf","daNj","daNa","daNr","daErr","dError",
+        "dAggLink","dAggMass","dBase","daLast","daReacted"};
+    uintptr_t now[37];
+    FixedLayoutAudit *a;uint32_t *base,*cap;
+    if(!g||!g->uploaded)return MSX_RESIDENT_ERR_ARGUMENT;
+    if(g->poisoned)return MSX_RESIDENT_ERR_POISONED;
+    const void *ptrs[37]={g->dPatchDesc,g->dd,g->dPatchStage,g->dGatherStage,
+        g->dPatchC,g->dPatchL,g->dGatherC,g->dGatherL,g->du,g->dg,g->di,g->dv,g->dh,
+        g->dhr,g->dur,g->ddr,g->dc,g->dl,g->dmass,g->dred,g->daPipe,g->daRow,g->daVol,
+        g->daHyd,g->dPipeHyd,g->daH,g->daNf,g->daNj,g->daNa,g->daNr,g->daErr,g->dError,
+        g->dAggLink,g->dAggMass,g->dBase,g->daLast,g->daReacted};
+    for(uint32_t i=0;i<37;++i)now[i]=(uintptr_t)ptrs[i];
+    a=g->layoutAudit;
+    if(!a){
+        size_t links=(size_t)g->n+1;
+        if(links>(SIZE_MAX-sizeof(*a))/(2*sizeof(uint32_t)))return MSX_RESIDENT_ERR_OVERFLOW;
+        a=(FixedLayoutAudit*)MSXresidentAlloc_callocBudget(
+            MSXresidentBudget_domain(MSX_BUDGET_TEMPORARY),1,
+            sizeof(*a)+2*links*sizeof(uint32_t),__FILE__,__LINE__);
+        if(!a)return MSX_RESIDENT_ERR_MEMORY;
+        a->csv=fopen("resident_device_address_audit.csv","wb");
+        if(!a->csv){free(a);return MSX_RESIDENT_ERR_PATH;}
+        a->linkCount=g->n;base=(uint32_t*)(a+1);cap=base+links;
+        memcpy(a->device,now,sizeof(now));memcpy(base,g->base,links*sizeof(uint32_t));
+        memcpy(cap,g->cap,links*sizeof(uint32_t));
+        fprintf(a->csv,"record,check,array,pointer,link,base,capacity,expected,actual\n");
+        fprintf(a->csv,"CONFIG,0,allocated_hyd_layout,,,,,%u,%u\n",
+                g->allocatedHydLayout,g->allocatedHydLayout);
+        for(uint32_t i=0;i<37;++i)
+            fprintf(a->csv,"CAPTURE,0,%s,%llu,,,,,\n",names[i],(unsigned long long)now[i]);
+        for(uint32_t k=1;k<=g->n;++k)
+            fprintf(a->csv,"LAYOUT,0,,,%u,%u,%u,,\n",k,base[k],cap[k]);
+        if(fflush(a->csv)||ferror(a->csv)){fclose(a->csv);free(a);return MSX_RESIDENT_ERR_PATH;}
+        g->layoutAudit=a;return MSX_RESIDENT_OK;
+    }
+    base=(uint32_t*)(a+1);cap=base+(size_t)a->linkCount+1;
+    ++a->checks;
+    const char *field=NULL;uint32_t link=0;uint64_t expected=0,actual=0;
+    if(a->linkCount!=g->n){field="linkCount";expected=a->linkCount;actual=g->n;}
+    for(uint32_t i=0;!field&&i<37;++i)
+        if(a->device[i]!=now[i]){field=names[i];expected=a->device[i];actual=now[i];}
+    for(uint32_t k=1;!field&&k<=g->n;++k){
+        if(base[k]!=g->base[k]){field="base";link=k;expected=base[k];actual=g->base[k];}
+        else if(cap[k]!=g->cap[k]){field="capacity";link=k;expected=cap[k];actual=g->cap[k];}
+    }
+    if(field)fprintf(a->csv,"FAIL,%llu,%s,,%u,,,%llu,%llu\n",
+        (unsigned long long)a->checks,field,link,(unsigned long long)expected,(unsigned long long)actual);
+    else fprintf(a->csv,"CHECK_PASS,%llu,,,,,,,\n",(unsigned long long)a->checks);
+    if(fflush(a->csv)||ferror(a->csv))return MSX_RESIDENT_ERR_PATH;
+    return field?MSX_RESIDENT_ERR_GENERATION:MSX_RESIDENT_OK;
+}
+#ifdef MSX_RESIDENT_ACTIVE_STAMP_TEST_API
+extern "C" MSXResidentStatus MSXresidentGpu_testAuditFlip(MSXResidentGpu *g,uint32_t index)
+{
+    if(!g||!g->layoutAudit||index>=39)return MSX_RESIDENT_ERR_ARGUMENT;
+    if(index<37)g->layoutAudit->device[index]^=1;
+    else {uint32_t *base=(uint32_t*)(g->layoutAudit+1);
+        base[index==37?1:(size_t)g->layoutAudit->linkCount+2]^=1;}
+    return MSX_RESIDENT_OK;
+}
+#endif
 /* One allocation-size ledger serves both dry-run budgeting and allocation. */
 template<class T> static MSXResidentStatus fixedAllocNamed(T **ptr,size_t bytes,int kind,int dry,
                                         MSXResidentMemoryEstimate *m,const char *name,FILE *inventory,uint32_t layout,MSXResidentGpu *g)
@@ -299,8 +393,9 @@ static MSXResidentStatus fixedBuffers(MSXResidentGpu *g,int dry,MSXResidentMemor
  {MSXResidentStatus z=fixedAlloc(&g->hGather,(size_t)g->batchRows*sizeof(Stage),1,dry,m);if(z)return z;}
  {MSXResidentStatus z=fixedAlloc(&g->hPatchC,brb,1,dry,m);if(z)return z;}
  {MSXResidentStatus z=fixedAlloc(&g->hPatchL,brb,1,dry,m);if(z)return z;}
- {MSXResidentStatus z=fixedAlloc(&g->hGatherC,brb,1,dry,m);if(z)return z;}
- {MSXResidentStatus z=fixedAlloc(&g->hGatherL,brb,1,dry,m);if(z)return z;}
+ /* Import H2D and gather D2H payload phases are synchronous and disjoint.
+    Keep C/lastC distinct, but reuse each owner's pinned backing by phase. */
+ if(!dry){g->hGatherC=g->hPatchC;g->hGatherL=g->hPatchL;}
  {MSXResidentStatus z=fixedAlloc(&g->hPatchDesc,(size_t)g->n*sizeof(DDescStage),1,dry,m);if(z)return z;}
  {MSXResidentStatus z=fixedAlloc(&g->haPipe,(size_t)g->owned*sizeof(uint32_t),1,dry,m);if(z)return z;}
  {MSXResidentStatus z=fixedAlloc(&g->haRow,(size_t)g->owned*sizeof(uint32_t),1,dry,m);if(z)return z;}
@@ -378,7 +473,14 @@ extern "C" MSXResidentStatus MSXresidentGpu_writeAllocationManifest(const MSXRes
  copy.inventory=fopen(path,"wb");if(!copy.inventory)return MSX_RESIDENT_ERR_PATH;
  fprintf(copy.inventory,"allocation_id,module,buffer_name,memory_kind,element_size,count_basis,element_count,requested_bytes,backing_allocation_owner,lifetime_begin,lifetime_end,shared_with,mode_condition\n");
  fprintf(copy.inventory,"gpu_control,CUDA_CORE,gpu_control,pageable,%llu,object,1,%llu,gpu_control,open,close,exclusive,all\n",(unsigned long long)sizeof(copy),(unsigned long long)sizeof(copy));
- MSXResidentStatus z=fixedBuffers(&copy,1,&m);int failed=ferror(copy.inventory);fclose(copy.inventory);
+ MSXResidentStatus z=fixedBuffers(&copy,1,&m);
+ if(z==MSX_RESIDENT_OK){
+     fprintf(copy.inventory,"&g->hGatherC,CUDA_CORE,&g->hGatherC,pinned,%llu,batch,%llu,0,&g->hPatchC,open,close,&g->hPatchC,hyd_layout_%u\n",
+         (unsigned long long)sizeof(double),(unsigned long long)g->batchRows*g->stride,g->allocatedHydLayout);
+     fprintf(copy.inventory,"&g->hGatherL,CUDA_CORE,&g->hGatherL,pinned,%llu,batch,%llu,0,&g->hPatchL,open,close,&g->hPatchL,hyd_layout_%u\n",
+         (unsigned long long)sizeof(double),(unsigned long long)g->batchRows*g->stride,g->allocatedHydLayout);
+ }
+ int failed=ferror(copy.inventory);fclose(copy.inventory);
  return failed?MSX_RESIDENT_ERR_PATH:z;
 }
 extern "C" MSXResidentStatus MSXresidentGpu_estimateMemory(uint32_t links,uint32_t slots,uint32_t stride,MSXResidentMemoryEstimate *m)
@@ -1005,7 +1107,7 @@ extern "C" MSXResidentStatus MSXresidentGpu_beginActive(
     g->activeWriter = w; g->activeBuilding = 1; g->activeSealed = 0;
     return MSX_RESIDENT_OK;
 }
-extern "C" MSXResidentStatus MSXresidentGpu_appendActive(
+static inline MSXResidentStatus appendActiveRow(
     MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,
     const MSXResidentActiveRow *x)
 {
@@ -1041,6 +1143,72 @@ argument:
     w->valid = 0; clearActiveSeen(g, w); w->count = 0;
     resetActiveWriter(g, w); return MSX_RESIDENT_ERR_ARGUMENT;
 }
+extern "C" MSXResidentStatus MSXresidentGpu_appendActive(
+    MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,
+    const MSXResidentActiveRow *x)
+{
+    return appendActiveRow(g, w, x);
+}
+extern "C" MSXResidentStatus MSXresidentGpu_appendActivePipe(
+    MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,
+    const MSXResidentActiveRow *rows, uint32_t count,
+    MSXResidentActiveRowCheck before, MSXResidentActiveRowCheck after,
+    void *context)
+{
+    /* Preserve logical row order and error precedence.  A callback failure
+       retains the successful prefix for the caller's existing abort path. */
+    if (count && !rows) return MSX_RESIDENT_ERR_ARGUMENT;
+    for (uint32_t i = 0; i < count; ++i) {
+        MSXResidentStatus z;
+        if (before && (z = before(&rows[i], context)) != MSX_RESIDENT_OK)
+            return z;
+        z = appendActiveRow(g, w, &rows[i]);
+        if (z != MSX_RESIDENT_OK) return z;
+        if (after && (z = after(&rows[i], context)) != MSX_RESIDENT_OK)
+            return z;
+    }
+    return MSX_RESIDENT_OK;
+}
+extern "C" MSXResidentStatus MSXresidentGpu_appendActivePipeView(
+    MSXResidentGpu *g,MSXResidentGpuActiveWriter *w,
+    const MSXResidentActivePipeView *pipe,
+    MSXResidentActiveRowCheck before,MSXResidentActiveRowCheck after,void *context)
+{
+    if(!pipe)return MSX_RESIDENT_ERR_ARGUMENT;
+    if(!pipe->count)return MSX_RESIDENT_OK;
+    if(!pipe->readWindow||!pipe->windowToken||
+       *pipe->readWindow!=pipe->windowToken)return MSX_RESIDENT_ERR_GENERATION;
+    if(!pipe->generation||!pipe->parcelId||!pipe->scalar||!pipe->scalarStride)
+        return MSX_RESIDENT_ERR_ARGUMENT;
+    uint32_t slot=pipe->head,seen=0;
+    while(seen<pipe->count)
+    {
+        uint32_t length=1;
+        if(pipe->orient==1)length=pipe->capacity-slot;
+        else if(pipe->orient==-1)length=slot+1;
+        if(length>pipe->count-seen)length=pipe->count-seen;
+        for(uint32_t i=0;i<length;++i)
+        {
+            MSXResidentActiveRow row;MSXResidentStatus status;
+            row.linkIndex=pipe->linkIndex;row.slot=slot;
+            row.globalRow=pipe->base+slot;row.generation=pipe->generation[slot];
+            row.descriptorHead=pipe->head;row.descriptorCount=pipe->count;
+            row.descriptorOrient=pipe->orient;row.descriptorEpoch=pipe->epoch;
+            row.parcelId=pipe->parcelId[slot];
+            row.volume=pipe->scalar[(size_t)slot*pipe->scalarStride];
+            if(before&&(status=before(&row,context))!=MSX_RESIDENT_OK)return status;
+            status=appendActiveRow(g,w,&row);if(status!=MSX_RESIDENT_OK)return status;
+            if(after&&(status=after(&row,context))!=MSX_RESIDENT_OK)return status;
+            ++seen;
+            if(pipe->orient==1)++slot;
+            else if(pipe->orient==-1)--slot;
+            else slot=(uint32_t)(((int64_t)slot+pipe->orient+(int64_t)pipe->capacity)%(int64_t)pipe->capacity);
+        }
+        if(pipe->orient==1&&slot==pipe->capacity)slot=0;
+        else if(pipe->orient==-1&&slot==UINT32_MAX)slot=pipe->capacity-1;
+    }
+    return MSX_RESIDENT_OK;
+}
 extern "C" MSXResidentStatus MSXresidentGpu_sealActive(
     MSXResidentGpu *g, MSXResidentGpuActiveWriter *w,
     uint64_t topologyVersion)
@@ -1055,11 +1223,30 @@ extern "C" MSXResidentStatus MSXresidentGpu_sealActive(
         w->valid = 0; clearActiveSeen(g, w); w->count = 0;
         resetActiveWriter(g, w); return MSX_RESIDENT_ERR_CAPACITY;
     }
-    clearActiveSeen(g, w);
+    /* Membership is scoped by buildSequence, not by a zero sentinel.  Keep
+       successful stamps until the next build; beginActive clears on wrap. */
     w->building = 0; w->sealed = 1;
     g->activeBuilding = 0; g->activeSealed = 1;
     return MSX_RESIDENT_OK;
 }
+#ifdef MSX_RESIDENT_ACTIVE_STAMP_TEST_API
+/* Private phase2b seams: absent from production builds and public headers. */
+extern "C" MSXResidentStatus MSXresidentGpu_testActiveStamp(
+    MSXResidentGpu *g, uint32_t row, uint64_t *stamp)
+{
+    if (!g || !stamp || row >= g->slots) return MSX_RESIDENT_ERR_ARGUMENT;
+    *stamp = g->activeSeen[row];
+    return MSX_RESIDENT_OK;
+}
+extern "C" MSXResidentStatus MSXresidentGpu_testActiveSequence(
+    MSXResidentGpu *g, uint64_t sequence)
+{
+    if (!g || g->activePrepared || g->activeBuilding || g->activeSealed ||
+        g->activeWriter) return MSX_RESIDENT_ERR_ARGUMENT;
+    g->activeBuildSequence = sequence;
+    return MSX_RESIDENT_OK;
+}
+#endif
 extern "C" MSXResidentStatus MSXresidentGpu_abortActiveBuild(
     MSXResidentGpu *g, MSXResidentGpuActiveWriter *w)
 {
@@ -1465,3 +1652,112 @@ extern "C" MSXResidentStatus MSXresidentGpu_getTransferStats(const MSXResidentGp
 extern "C" MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu*g){if(!use(g))return badgpu(g,MSX_RESIDENT_ERR_GPU);if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(g->activeWriter&&!g->activePrepared){clearActiveSeen(g,g->activeWriter);g->activeWriter->count=0;resetActiveWriter(g,g->activeWriter);return MSX_RESIDENT_OK;}if(!g->activePrepared)return g->poisoned?MSX_RESIDENT_ERR_POISONED:MSX_RESIDENT_OK;if(!ck(cudaStreamSynchronize(g->stream)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);invalidateHydCache(g);g->activePrepared=0;g->activeCount=0;g->completionEnqueued=0;if(g->activeWriter)resetActiveWriter(g,g->activeWriter);g->poisoned=1;g->c.cudaPoisons++;return MSX_RESIDENT_OK;}
 extern "C" MSXResidentStatus MSXresidentGpu_invalidateHyd(MSXResidentGpu*g){if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(g->activePrepared)return MSX_RESIDENT_ERR_ARGUMENT;invalidateHydCache(g);return MSX_RESIDENT_OK;}
 extern "C" MSXResidentStatus MSXresidentGpu_poison(MSXResidentGpu*g){if(!g)return MSX_RESIDENT_ERR_ARGUMENT;if(g->activePrepared&&!ck(cudaStreamSynchronize(g->stream)))return badgpu(g,MSX_RESIDENT_ERR_TRANSFER);invalidateHydCache(g);g->activePrepared=0;g->activeCount=0;g->completionEnqueued=0;if(!g->poisoned){g->poisoned=1;g->c.cudaPoisons++;}g->aggregateValid=0;return MSX_RESIDENT_OK;}
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+extern "C" void MSXinv_CUDA(MSXInventory *s,void *handle)
+{
+ MSXResidentGpu *g=(MSXResidentGpu *)handle;uint32_t i;char key[128];if(!g)return;INV_HEAP(s,g);
+ for(i=0;i<g->backingCount;i++){snprintf(key,sizeof(key),"CUDA.backing[%u]",i);MSXinv_ticket(s,key,g->backing[i].ptr,g->backing[i].allocation.bytes,&g->backing[i].allocation);}
+ INV_HEAP(s,g->activeSeen);
+ INV_HEAP(s,g->aggregateMass);
+ INV_HEAP(s,g->base);
+ INV_HEAP(s,g->cap);
+ INV_HEAP(s,g->fetchSeen);
+ INV_HEAP(s,g->hCandidateHyd);
+ INV_HEAP(s,g->haEpoch);
+ INV_HEAP(s,g->haGen);
+ INV_HEAP(s,g->haH);
+ INV_HEAP(s,g->he);
+ INV_HEAP(s,g->hg);
+ INV_HEAP(s,g->hi);
+ INV_HEAP(s,g->hu);
+ INV_HEAP(s,g->layoutAudit);
+ INV_HEAP(s,g->uploadStamp);
+ MSXinv_alias(s,"CUDA.logical.activeSeen",g->activeSeen,g->activeSeen);
+ MSXinv_alias(s,"CUDA.logical.aggregateMass",g->aggregateMass,g->aggregateMass);
+ MSXinv_alias(s,"CUDA.logical.base",g->base,g->base);
+ MSXinv_alias(s,"CUDA.logical.cap",g->cap,g->cap);
+ MSXinv_alias(s,"CUDA.logical.dAggLink",g->dAggLink,g->dAggLink);
+ MSXinv_alias(s,"CUDA.logical.dAggMass",g->dAggMass,g->dAggMass);
+ MSXinv_alias(s,"CUDA.logical.dBase",g->dBase,g->dBase);
+ MSXinv_alias(s,"CUDA.logical.dError",g->dError,g->dError);
+ MSXinv_alias(s,"CUDA.logical.dGatherC",g->dGatherC,g->dGatherC);
+ MSXinv_alias(s,"CUDA.logical.dGatherL",g->dGatherL,g->dGatherL);
+ MSXinv_alias(s,"CUDA.logical.dGatherStage",g->dGatherStage,g->dGatherStage);
+ MSXinv_alias(s,"CUDA.logical.dPatchC",g->dPatchC,g->dPatchC);
+ MSXinv_alias(s,"CUDA.logical.dPatchDesc",g->dPatchDesc,g->dPatchDesc);
+ MSXinv_alias(s,"CUDA.logical.dPatchL",g->dPatchL,g->dPatchL);
+ MSXinv_alias(s,"CUDA.logical.dPatchStage",g->dPatchStage,g->dPatchStage);
+ MSXinv_alias(s,"CUDA.logical.dPipeHyd",g->dPipeHyd,g->dPipeHyd);
+ MSXinv_alias(s,"CUDA.logical.daErr",g->daErr,g->daErr);
+ MSXinv_alias(s,"CUDA.logical.daH",g->daH,g->daH);
+ MSXinv_alias(s,"CUDA.logical.daHyd",g->daHyd,g->daHyd);
+ MSXinv_alias(s,"CUDA.logical.daLast",g->daLast,g->daLast);
+ MSXinv_alias(s,"CUDA.logical.daNa",g->daNa,g->daNa);
+ MSXinv_alias(s,"CUDA.logical.daNf",g->daNf,g->daNf);
+ MSXinv_alias(s,"CUDA.logical.daNj",g->daNj,g->daNj);
+ MSXinv_alias(s,"CUDA.logical.daNr",g->daNr,g->daNr);
+ MSXinv_alias(s,"CUDA.logical.daPipe",g->daPipe,g->daPipe);
+ MSXinv_alias(s,"CUDA.logical.daReacted",g->daReacted,g->daReacted);
+ MSXinv_alias(s,"CUDA.logical.daRow",g->daRow,g->daRow);
+ MSXinv_alias(s,"CUDA.logical.daVol",g->daVol,g->daVol);
+ MSXinv_alias(s,"CUDA.logical.dc",g->dc,g->dc);
+ MSXinv_alias(s,"CUDA.logical.dd",g->dd,g->dd);
+ MSXinv_alias(s,"CUDA.logical.ddr",g->ddr,g->ddr);
+ MSXinv_alias(s,"CUDA.logical.dg",g->dg,g->dg);
+ MSXinv_alias(s,"CUDA.logical.dh",g->dh,g->dh);
+ MSXinv_alias(s,"CUDA.logical.dhr",g->dhr,g->dhr);
+ MSXinv_alias(s,"CUDA.logical.di",g->di,g->di);
+ MSXinv_alias(s,"CUDA.logical.dl",g->dl,g->dl);
+ MSXinv_alias(s,"CUDA.logical.dmass",g->dmass,g->dmass);
+ MSXinv_alias(s,"CUDA.logical.dred",g->dred,g->dred);
+ MSXinv_alias(s,"CUDA.logical.du",g->du,g->du);
+ MSXinv_alias(s,"CUDA.logical.dur",g->dur,g->dur);
+ MSXinv_alias(s,"CUDA.logical.dv",g->dv,g->dv);
+ MSXinv_alias(s,"CUDA.logical.fetchSeen",g->fetchSeen,g->fetchSeen);
+ MSXinv_alias(s,"CUDA.logical.hAggLink",g->hAggLink,g->hAggLink);
+ MSXinv_alias(s,"CUDA.logical.hAggMass",g->hAggMass,g->hAggMass);
+ MSXinv_alias(s,"CUDA.logical.hCandidateHyd",g->hCandidateHyd,g->hCandidateHyd);
+ MSXinv_alias(s,"CUDA.logical.hGather",g->hGather,g->hGather);
+ MSXinv_alias(s,"CUDA.logical.hGatherC",g->hGatherC,g->hGatherC);
+ MSXinv_alias(s,"CUDA.logical.hGatherL",g->hGatherL,g->hGatherL);
+ MSXinv_alias(s,"CUDA.logical.hPatch",g->hPatch,g->hPatch);
+ MSXinv_alias(s,"CUDA.logical.hPatchC",g->hPatchC,g->hPatchC);
+ MSXinv_alias(s,"CUDA.logical.hPatchDesc",g->hPatchDesc,g->hPatchDesc);
+ MSXinv_alias(s,"CUDA.logical.hPatchL",g->hPatchL,g->hPatchL);
+ MSXinv_alias(s,"CUDA.logical.hSubmittedHyd",g->hSubmittedHyd,g->hSubmittedHyd);
+ MSXinv_alias(s,"CUDA.logical.haEpoch",g->haEpoch,g->haEpoch);
+ MSXinv_alias(s,"CUDA.logical.haErr",g->haErr,g->haErr);
+ MSXinv_alias(s,"CUDA.logical.haGen",g->haGen,g->haGen);
+ MSXinv_alias(s,"CUDA.logical.haH",g->haH,g->haH);
+ MSXinv_alias(s,"CUDA.logical.haHyd",g->haHyd,g->haHyd);
+ MSXinv_alias(s,"CUDA.logical.haLast",g->haLast,g->haLast);
+ MSXinv_alias(s,"CUDA.logical.haNa",g->haNa,g->haNa);
+ MSXinv_alias(s,"CUDA.logical.haNf",g->haNf,g->haNf);
+ MSXinv_alias(s,"CUDA.logical.haNj",g->haNj,g->haNj);
+ MSXinv_alias(s,"CUDA.logical.haNr",g->haNr,g->haNr);
+ MSXinv_alias(s,"CUDA.logical.haPipe",g->haPipe,g->haPipe);
+ MSXinv_alias(s,"CUDA.logical.haReacted",g->haReacted,g->haReacted);
+ MSXinv_alias(s,"CUDA.logical.haRow",g->haRow,g->haRow);
+ MSXinv_alias(s,"CUDA.logical.haVol",g->haVol,g->haVol);
+ MSXinv_alias(s,"CUDA.logical.hd",g->hd,g->hd);
+ MSXinv_alias(s,"CUDA.logical.he",g->he,g->he);
+ MSXinv_alias(s,"CUDA.logical.hg",g->hg,g->hg);
+ MSXinv_alias(s,"CUDA.logical.hi",g->hi,g->hi);
+ MSXinv_alias(s,"CUDA.logical.hu",g->hu,g->hu);
+ MSXinv_alias(s,"CUDA.logical.layoutAudit",g->layoutAudit,g->layoutAudit);
+ MSXinv_alias(s,"CUDA.logical.uploadStamp",g->uploadStamp,g->uploadStamp);
+ MSXinv_tag(s,"CUDA.allocatedHydLayout",g->allocatedHydLayout);MSXinv_tag(s,"CUDA.runtimeHydLayout",g->hydLayout);MSXinv_tag(s,"CUDA.links",g->n);MSXinv_tag(s,"CUDA.slots",g->slots);MSXinv_tag(s,"CUDA.batchRows",g->batchRows);MSXinv_tag(s,"CUDA.owned",g->owned);MSXinv_tag(s,"CUDA.stride",g->stride);MSXinv_tag(s,"CUDA.pipeMajor",g->allocatedHydLayout==MSX_RESIDENT_HYD_PIPE_MAJOR);
+ {MSXResidentMemoryConfig config={1,g->allocatedHydLayout,g->batchRows};
+  MSXResidentMemoryEstimate model={},startup={};
+  MSXResidentStatus modelStatus=MSXresidentGpu_estimateConfigured(g->n,g->slots,g->stride,&config,&model);
+  MSXResidentStatus startupStatus=MSXresidentGpu_getFixedMemory(g,&startup);
+  MSXinv_tag(s,"CUDA.model.status",(uint64_t)modelStatus);
+  MSXinv_tag(s,"CUDA.startup.status",(uint64_t)startupStatus);
+  MSXinv_tag(s,"CUDA.model.pageable",model.hostBytes);MSXinv_tag(s,"CUDA.model.pinned",model.pinnedBytes);MSXinv_tag(s,"CUDA.model.device",model.deviceBytes);
+  MSXinv_tag(s,"CUDA.startup.pageable",startup.hostBytes);MSXinv_tag(s,"CUDA.startup.pinned",startup.pinnedBytes);MSXinv_tag(s,"CUDA.startup.device",startup.deviceBytes);
+ }
+
+}
+#endif

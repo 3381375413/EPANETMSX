@@ -55,6 +55,22 @@ typedef struct {
     int sealed;
     int valid;
 } MSXResidentGpuActiveWriter;
+typedef MSXResidentStatus (*MSXResidentActiveRowCheck)(
+    const MSXResidentActiveRow *, void *);
+/* C05 ordered pipe batch: before -> scalar checks/write -> after per row.
+   Callback failures retain the successful prefix until caller abort. */
+MSXResidentStatus MSXresidentGpu_appendActivePipe(
+    MSXResidentGpu *, MSXResidentGpuActiveWriter *,
+    const MSXResidentActiveRow *, uint32_t,
+    MSXResidentActiveRowCheck before, MSXResidentActiveRowCheck after, void *);
+/* C06 borrowed view, only valid in its owner's exclusive read window. */
+MSXResidentStatus MSXresidentGpu_appendActivePipeView(
+    MSXResidentGpu *, MSXResidentGpuActiveWriter *,
+    const MSXResidentActivePipeView *,
+    MSXResidentActiveRowCheck before, MSXResidentActiveRowCheck after, void *);
+/* Explicit DIAGNOSTIC call only. First call captures charged object-owned
+   device pointers and pipe base/cap; later calls compare and emit audit CSV. */
+MSXResidentStatus MSXresidentGpu_auditFixedLayout(MSXResidentGpu *);
 /* Read-only source table supplied for a Resident reaction.  The caller must
    initialize every (linkCount+1)*stride double before submit. */
 typedef struct { const double *pipeHyd; uint32_t linkCount,hydStride,hydLayout; } MSXResidentHydView;

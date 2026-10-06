@@ -29,6 +29,7 @@
 #include "epanet2.h"
 #include "epanetmsx.h"
 #include "msxresident_alloc_redirect.h"
+#include "msxsegment_storage.h"
 
 //  External variables
 //--------------------
@@ -39,7 +40,7 @@ static char PendingInpFileName[MAXFNAME];
 //--------------------
 int    MSXproj_open(char *fname);
 void   MSXproj_setInpFile(const char *fname);
-int    MSXproj_close(void);
+void   MSXproj_close(void);
 int    MSXproj_addObject(int type, char *id, int n);
 int    MSXproj_findObject(int type, char *id);
 char * MSXproj_findID(int type, char *id);
@@ -70,6 +71,7 @@ int MSXDLLEXPORT   MSXENopen(const char *inpFile, const char *rptFile, const cha
 **    an error code (or 0 for no error);
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int err = 0;
     if (inpFile && strlen(inpFile) < MAXFNAME) strcpy(PendingInpFileName, inpFile);
     else PendingInpFileName[0] = '\0';
@@ -84,6 +86,7 @@ int MSXDLLEXPORT   MSXENclose(void)
 **
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int err = 0;
     err = ENclose();
     PendingInpFileName[0] = '\0';
@@ -103,6 +106,7 @@ int  MSXDLLEXPORT  MSXopen(char *fname)
 **    an error code (or 0 for no error).
 */
 {
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
     int err = 0;
     if (!fname || strlen(fname) >= MAXFNAME) return ERR_OPEN_MSX_FILE;
     if (MSX.ProjectOpened) return(ERR_MSX_OPENED);
@@ -133,6 +137,7 @@ int   MSXDLLEXPORT  MSXsolveH()
 **    an error code (or 0 for no error).
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int err = 0;
 
 // --- check that an MSX project was opened
@@ -175,6 +180,7 @@ int   MSXDLLEXPORT  MSXusehydfile(char *fname)
 **    an error code (or 0 for no error).
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     INT4 magic;
     INT4 version;
     INT4 n;
@@ -231,6 +237,7 @@ int  MSXDLLEXPORT  MSXsolveQ()
 **    an error code (or 0 for no error).
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     double t, tleft = 0;
     int err = 0;
     if ( !MSX.ProjectOpened ) return ERR_MSX_NOT_OPENED;
@@ -254,6 +261,7 @@ int  MSXDLLEXPORT  MSXinit(int saveFlag)
 **    an error code (or 0 for no error).
 */
 {
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
     int err= 0;
     if ( !MSX.ProjectOpened ) return ERR_MSX_NOT_OPENED;
     MSX.Saveflag = saveFlag;
@@ -279,6 +287,7 @@ int  MSXDLLEXPORT  MSXstep(double *t, double *tleft)
 **    an error code (or 0 for no error).
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     if ( !MSX.ProjectOpened ) return ERR_MSX_NOT_OPENED;
     return MSXqual_step(t, tleft);
 }
@@ -347,7 +356,10 @@ int  MSXDLLEXPORT  MSXclose()
 **    an error code (or 0 for no error).
 */
 {
-    MSXqual_close();
+    int error;
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
+    error = MSXqual_close();
+    if (error) return error;
     MSXproj_close();
     return 0;
 }

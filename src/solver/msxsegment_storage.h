@@ -20,6 +20,35 @@ void MSXsegStorage_close(void);
 void MSXsegStorage_reset(void);
 int MSXsegStorage_hybridResetUncommitted(void);
 
+/* Borrowed committed topology. Scalar payload is deliberately not cached.
+   Get never repairs an invalid view. BeginRead locks before enumeration;
+   ValidateReadWindow checks invalid views after existing Active checks. */
+typedef struct {
+    int link, coreCount, head, tail, orient;
+    uint64_t lifecycle, revision, firstCoreId, lastCoreId;
+    Pseg firstCore, lastCore;
+    int valid, continuityProven;
+} MSXHybridPartitionView;
+int MSXsegStorage_hybridGetPartitionView(int link,
+                                       const MSXHybridPartitionView **view);
+int MSXsegStorage_hybridRefreshPartitionView(int link);
+int MSXsegStorage_hybridBeginReadWindow(uint64_t *token);
+int MSXsegStorage_hybridValidateReadWindow(uint64_t token);
+int MSXsegStorage_hybridEndReadWindow(uint64_t token);
+int MSXsegStorage_hybridWriteAllowed(void);
+int MSXsegStorage_hybridLifecycleAllowed(void);
+int MSXsegStorage_hybridPrepareTopologyChange(int link, uint64_t changes);
+void MSXsegStorage_hybridCommitTopologyChange(int link);
+void MSXsegStorage_hybridInvalidatePartitionView(int link);
+/* C08 development-only source: these own the precise CPU endpoint rewire;
+   an arbitrary generic topology commit can never certify continuity. */
+int MSXsegStorage_hybridAppendCpuBoundary(int link, Pseg segment);
+int MSXsegStorage_hybridRemoveCpuHead(int link, Pseg segment);
+#if defined(MSX_RESIDENT_TEST_API) || defined(MSX_RESIDENT_PARTITION_TEST_API)
+int MSXsegStorage_testPartitionCounters(int link, uint64_t lifecycle,
+                                      uint64_t revision, uint64_t sequence);
+#endif
+
 int  MSXsegStorage_preparePrivate(Pseg seg);
 void MSXsegStorage_initPrivateValues(Pseg seg, const double c[]);
 int  MSXsegStorage_bindPipeSegment(int k, Pseg seg);
@@ -67,6 +96,32 @@ int  MSXsegStorage_hybridRemoveHead(int k, Pseg seg);
    at round start.  Demote planning/commit and ordinary promote consume that
    image; the read-only audit seam below remains an independent reference
    rescan and is not part of the normal path. */
+typedef struct {
+    int linkIndex, total, coreCount, downCount, upCount;
+    Pseg firstCore, lastCore;
+    uint64_t firstCoreId, lastCoreId;
+    int head, tail, orient, guard;
+    uint64_t scanCoreVisits, scanBoundaryVisits;
+    uint64_t captureCoreRows;
+    int captureTrusted;
+    int captureStatus, captureBackend;
+} MSXHybridRebalanceSnapshot;
+enum { MSX_SNAPSHOT_SERIAL_FULL, MSX_SNAPSHOT_OMP_STATIC,
+       MSX_SNAPSHOT_OMP_DYNAMIC16, MSX_SNAPSHOT_ENDPOINT_BOUNDARY };
+/* Computes a private draft only. Publishing remains in the old link order,
+   immediately before each link's fallible empty-Core initialization. */
+int MSXsegStorage_hybridCaptureSnapshotReadOnly(int link,
+                                              MSXHybridRebalanceSnapshot *draft);
+int MSXsegStorage_hybridCaptureIncrementalSnapshotReadOnly(int link,
+                                      MSXHybridRebalanceSnapshot *snapshot);
+void MSXsegStorage_hybridIncrementalMetrics(uint64_t *published,
+                                          uint64_t *fallback);
+int MSXsegStorage_hybridCaptureSnapshotBackend(int link, int backend,
+                                             MSXHybridRebalanceSnapshot *draft);
+/* Captures all private drafts, including each per-link error. It does not
+   publish any draft or choose an error over an earlier fallible init. */
+int MSXsegStorage_hybridCaptureSnapshotsReadOnly(int backend,
+    MSXHybridRebalanceSnapshot *drafts, size_t capacity);
 void MSXsegStorage_hybridRebalanceAll(void);
 /* A0 Rebalance detail hooks.  They are inert unless the detail demote group
    is active, so runtime fetch/flush callers need no profile-mode branches. */
@@ -118,8 +173,12 @@ int  MSXsegStorage_hybridAcquireBoundary(Pseg *segment);
 int  MSXsegStorage_hybridEnsureBoundaryPoolFree(uint32_t required);
 uint64_t MSXsegStorage_hybridCpuPoolGrowthCount(void);
 uint64_t MSXsegStorage_hybridFixedHostBytes(uint32_t,uint32_t,uint32_t);
+uint64_t MSXsegStorage_hybridFixedHostBytesWithInitial(uint32_t,uint32_t,uint32_t,int,uint32_t);
+uint32_t MSXsegStorage_hybridInitialScratchCapacity(void);
 uint64_t MSXsegStorage_hybridExistingHostBytes(void);
 uint64_t MSXsegStorage_testAllocationBytes(void);
+/* Read-only allocation audit; returned slab is never caller-owned. */
+int MSXsegStorage_hybridAuditCoreSlab(int link, Pseg *base, uint32_t *capacity);
 int  MSXsegStorage_hybridReleaseBoundary(Pseg segment);
 /* Explicit audit seam: poison only dense Hybrid Core c/lastc mirrors. */
 int  MSXsegStorage_hybridAuditPoisonCoreMirrors(void);

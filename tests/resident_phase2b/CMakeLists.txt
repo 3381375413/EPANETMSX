@@ -16,7 +16,8 @@ add_custom_command(OUTPUT ${RESIDENT_CUDA_OBJ}
     -I${CMAKE_CURRENT_SOURCE_DIR}/../../src/solver
     -I${CMAKE_CURRENT_SOURCE_DIR}/../../src
     -I${CMAKE_CURRENT_SOURCE_DIR}/../../EPANET2.2/SRC_engines/include
-    ${RESIDENT_CUDA_INCLUDE_ARGS} -D_CRT_SECURE_NO_WARNINGS -Xcompiler=/MD
+    ${RESIDENT_CUDA_INCLUDE_ARGS} -D_CRT_SECURE_NO_WARNINGS
+    -DMSX_RESIDENT_ACTIVE_STAMP_TEST_API -Xcompiler=/MD
   DEPENDS ../../src/solver/msxresident_core_cuda.cu
           ../../src/solver/msxresident_core_cuda.h
           ../../src/solver/msxresident_memory_config.h

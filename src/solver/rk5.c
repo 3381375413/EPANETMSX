@@ -286,3 +286,12 @@ int rk5_integrate(double y[], int n, double t, double tnext,
     }
     return nfcn;
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_RK5(MSXInventory *s)
+{
+ INV_INDEX(s,"RK5.worker",(uint32_t)omp_get_thread_num(),0,MSXRungeKuttaSolver.Ynew);
+ INV_INDEX(s,"RK5.worker",(uint32_t)omp_get_thread_num(),0,MSXRungeKuttaSolver.Ak);
+}
+#endif

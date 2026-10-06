@@ -31,7 +31,11 @@ typedef struct { MSXResidentPipeDesc d; uint32_t guard,admissionLimit; unsigned 
 typedef struct { MSXResidentHandoffPlan plan; MSXResidentHandoffItem *item; MSXResidentHandoffResult *result; Pseg *boundary; uint32_t count,capacity,patchReserve; int active,payloadReady; MSXHybridResidentMaterialization storage; } Tx;
 typedef struct { int open,strict,initialStaging,initialCommitted,poisoned,compact; MSXResidentMode mode; uint32_t nlinks,stride,rowWidth; size_t slots; char hash[65]; Pipe *p; uint32_t *dirty,*capacity,*base,*guard,*admissionLimit; MSXResidentDescriptorPatch *desc,*initialDesc; MSXResidentSlotPatch *slot,*initialSlot; MSXResidentHandoffItem *hand; Tx *tx; uint32_t ndesc,nslot,nh; MSXResidentStats stat; } State;
 static State S={0};
-#ifdef MSX_RESIDENT_TEST_API
+#if defined(MSX_RESIDENT_TEST_API) || defined(MSX_RESIDENT_ACTIVE_TEST_API)
+MSXResidentStatus MSXresident_testActiveDescriptor(uint32_t k,const MSXResidentPipeDesc *d)
+{if(!S.open||!k||k>S.nlinks||!d)return MSX_RESIDENT_ERR_ARGUMENT;S.p[k].d=*d;return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_testActiveUsed(uint32_t k,uint32_t slot,uint32_t used)
+{if(!S.open||!k||k>S.nlinks||slot>=S.capacity[k]||used>1)return MSX_RESIDENT_ERR_ARGUMENT;S.p[k].used[slot]=(unsigned char)used;return MSX_RESIDENT_OK;}
 /* Read-only physical storage inspection; concentration storage is embedded
    in row only for the compatibility representation. */
 void MSXresident_testStorageOwnership(uint64_t *v)
@@ -56,7 +60,7 @@ MSXResidentStatus MSXresident_testInitialSlot(uint32_t k,uint32_t slot,
 uint64_t MSXresident_testAllocationBytes(void){return ResidentAllocationBytes;}
 static int mul(size_t a,size_t b,size_t*o){if(a&&b>SIZE_MAX/a)return 0;*o=a*b;return 1;}
 static void txreset(Tx *t);
-static void freestate(void){uint32_t k;if(S.tx){for(k=1;k<=S.nlinks;k++){txreset(&S.tx[k]);free(S.tx[k].item);free(S.tx[k].result);free(S.tx[k].boundary);}free(S.tx);}if(S.p)for(k=1;k<=S.nlinks;k++){free(S.p[k].used);free(S.p[k].gen);free(S.p[k].patch);free(S.p[k].obsI2s);free(S.p[k].obsKeep);free(S.p[k].id);free(S.p[k].revision);free(S.p[k].row);}free(S.p);free(S.dirty);free(S.capacity);free(S.base);free(S.guard);free(S.admissionLimit);free(S.desc);free(S.initialDesc);free(S.slot);free(S.initialSlot);free(S.hand);memset(&S,0,sizeof(S));}
+static void freestate(void){uint32_t k;if(S.p)for(k=1;k<=S.nlinks;k++)MSXsegStorage_hybridInvalidatePartitionView((int)k);if(S.tx){for(k=1;k<=S.nlinks;k++){txreset(&S.tx[k]);free(S.tx[k].item);free(S.tx[k].result);free(S.tx[k].boundary);}free(S.tx);}if(S.p)for(k=1;k<=S.nlinks;k++){free(S.p[k].used);free(S.p[k].gen);free(S.p[k].patch);free(S.p[k].obsI2s);free(S.p[k].obsKeep);free(S.p[k].id);free(S.p[k].revision);free(S.p[k].row);}free(S.p);free(S.dirty);free(S.capacity);free(S.base);free(S.guard);free(S.admissionLimit);free(S.desc);free(S.initialDesc);free(S.slot);free(S.initialSlot);free(S.hand);memset(&S,0,sizeof(S));}
 static int hashok(const char*s){int i;if(!s)return 0;for(i=0;i<64;i++)if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='A'&&s[i]<='F')||(s[i]>='a'&&s[i]<='f')))return 0;return s[64]==0;}
 static void hashupper(char*s){int i;for(i=0;i<64;i++)if(s[i]>='a'&&s[i]<='f')s[i]=(char)(s[i]-'a'+'A');}
 static int hashcmp(const char*a,const char*b){char x[65],y[65];if(!hashok(a)||!hashok(b))return 1;memcpy(x,a,65);memcpy(y,b,65);hashupper(x);hashupper(y);return strcmp(x,y);}
@@ -124,6 +128,7 @@ MSXResidentStatus MSXresident_openPlan(uint32_t links,const uint32_t *limit,
  uint32_t k,base=0;size_t b,n;Pipe *p;
  if(!links||links!=(uint32_t)MSX.Nobjects[LINK]||!limit||!guards||!hashok(hash))
    return MSX_RESIDENT_ERR_ARGUMENT;
+ if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
  freestate();S.compact=MSX.GpuCoreMode==2;S.nlinks=links;strcpy(S.hash,hash);hashupper(S.hash);
  if(!mul((size_t)links+1,sizeof(Pipe),&b))goto ov;
  S.p=(Pipe*)calloc(1,b);if(!S.p)goto mem;
@@ -146,6 +151,7 @@ MSXResidentStatus MSXresident_open(const char *path)
  FILE *f;char line[1024],id[EN_MAXID+1],h[65],hash[65],*e;
  uint32_t k,cap,core,burst,guard,row=0,links=(uint32_t)MSX.Nobjects[LINK];
  uint32_t *limit=NULL,*guards=NULL;MSXResidentStatus z;
+ if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
  freestate();if(!path)return MSX_RESIDENT_ERR_ARGUMENT;z=validatecsv(path,0,NULL);if(z)return z;
  f=fopen(path,"rb");if(!f)return MSX_RESIDENT_ERR_PATH;
  limit=(uint32_t*)calloc((size_t)links+1,sizeof(*limit));
@@ -162,7 +168,7 @@ MSXResidentStatus MSXresident_open(const char *path)
 done:fclose(f);free(limit);free(guards);return z;
 }
 
-void MSXresident_close(void){freestate();}int MSXresident_isOpen(void){return S.open;}void MSXresident_setMode(MSXResidentMode m,int strict){S.mode=m<=MSX_RESIDENT_RESIDENT?m:MSX_RESIDENT_OFF;S.strict=!!strict;}MSXResidentMode MSXresident_mode(void){return S.mode;}
+void MSXresident_close(void){if(MSXsegStorage_hybridWriteAllowed())return;freestate();}int MSXresident_isOpen(void){return S.open;}void MSXresident_setMode(MSXResidentMode m,int strict){if(MSXsegStorage_hybridWriteAllowed())return;S.mode=m<=MSX_RESIDENT_RESIDENT?m:MSX_RESIDENT_OFF;S.strict=!!strict;}MSXResidentMode MSXresident_mode(void){return S.mode;}
 MSXResidentStatus MSXresident_validateFeatures(int w,int d){if(!S.open)return MSX_RESIDENT_DISABLED;return w?MSX_RESIDENT_ERR_UNSUPPORTED_WALL:d?MSX_RESIDENT_ERR_UNSUPPORTED_DISPERSION:MSX_RESIDENT_OK;}MSXResidentStatus MSXresident_verifyCaseHash(const char*h){char want[65];if(!S.open||!h||!hashok(h))return MSX_RESIDENT_ERR_CASE_HASH;memcpy(want,h,65);hashupper(want);return!strcmp(want,S.hash)?MSX_RESIDENT_OK:MSX_RESIDENT_ERR_CASE_HASH;}
 static MSXResidentStatus checkcsv(const char *path,int guard,const char *want)
 { return validatecsv(path,guard,want); }
@@ -195,6 +201,7 @@ MSXResidentStatus MSXresident_observePipe(uint32_t k,const uint64_t*id,const MSX
     if(S.compact&&S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT;
     if ((count && (!id || !in)) || count > p->admissionLimit ||
         (orient != 1 && orient != -1)) return MSX_RESIDENT_ERR_ARGUMENT;
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     i2s = p->obsI2s; keep = p->obsKeep;
     memset(keep, 0, (size_t)p->d.capacity * sizeof(*keep));
     for (i = 0; i < count; ++i)
@@ -285,6 +292,7 @@ MSXResidentStatus MSXresident_observePipe(uint32_t k,const uint64_t*id,const MSX
         p->d.head = count ? i2s[0] : NONE;
         p->d.tail = count ? i2s[count - 1] : NONE;
         p->d.epoch++; markdesc(k);
+        MSXsegStorage_hybridInvalidatePartitionView((int)k);
     }
     return MSX_RESIDENT_OK;
 }
@@ -305,12 +313,14 @@ MSXResidentStatus MSXresident_stageInsert(uint32_t k,int side,const MSXResidentP
         return MSX_RESIDENT_ERR_CAPACITY;
     if (p->gen[s] == UINT32_MAX) return MSX_RESIDENT_ERR_GENERATION;
     if (p->patch[s] == NONE && S.nslot >= S.slots) return MSX_RESIDENT_ERR_CAPACITY;
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     p->gen[s]++; p->used[s] = 1; writePayload(p, s, x);
     if (!p->d.count) p->d.head = p->d.tail = s;
     else if (side) p->d.tail = s;
     else p->d.head = s;
     p->d.count++; p->d.epoch++;
     markslot(k, s, 1, MSX_RESIDENT_PATCH_IMPORT); markdesc(k);
+    MSXsegStorage_hybridInvalidatePartitionView((int)k);
     if (slotOut) *slotOut = s;
     if (generationOut) *generationOut = p->gen[s];
     return MSX_RESIDENT_OK;
@@ -326,6 +336,7 @@ MSXResidentStatus MSXresident_stageRemove(uint32_t k,uint32_t s,uint32_t generat
     else if (s == p->d.tail) side = 1;
     else return MSX_RESIDENT_ERR_ARGUMENT;
     if (p->d.epoch == UINT64_MAX) return MSX_RESIDENT_ERR_OVERFLOW;
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     p->used[s] = 0; p->id[s] = 0;
     memset(crow(p, s), 0, (S.compact?1:2) * (size_t)S.rowWidth * sizeof(double));
     if (p->d.count == 1) p->d.head = p->d.tail = NONE;
@@ -333,6 +344,7 @@ MSXResidentStatus MSXresident_stageRemove(uint32_t k,uint32_t s,uint32_t generat
     else p->d.tail = prevslot(p, p->d.tail, p->d.orient);
     p->d.count--; p->d.epoch++;
     markslot(k, s, 0, MSX_RESIDENT_PATCH_INVALIDATE); markdesc(k);
+    MSXsegStorage_hybridInvalidatePartitionView((int)k);
     return MSX_RESIDENT_OK;
 }
 static MSXResidentStatus validateRemoveBatchInternal(uint32_t k,
@@ -384,6 +396,7 @@ MSXResidentStatus MSXresident_stageRemoveBatch(
     Pipe *p; MSXResidentStatus z; uint32_t i, head, tail, remaining;
     z = validateRemoveBatchInternal(k, items, count, &p);
     if (z || S.mode == MSX_RESIDENT_OFF || !count) return z;
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     head = p->d.head; tail = p->d.tail; remaining = p->d.count;
     for (i = 0; i < count; ++i)
     {
@@ -402,6 +415,7 @@ MSXResidentStatus MSXresident_stageRemoveBatch(
     }
     p->d.head = head; p->d.tail = tail; p->d.count = remaining;
     p->d.epoch += count; markdesc(k);
+    MSXsegStorage_hybridInvalidatePartitionView((int)k);
     return MSX_RESIDENT_OK;
 }
 void MSXresident_poison(void) { if (S.open) S.poisoned = 1; }
@@ -411,6 +425,7 @@ MSXResidentStatus MSXresident_auditPoisonCpuMirrors(void)
     uint32_t k, s, m;
     if (!S.open) return MSX_RESIDENT_DISABLED;
     if(S.compact)return MSX_RESIDENT_OK; /* No Core concentration mirror exists. */
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     /* This is intentionally an explicit audit-only walk.  Production runs
        never call it unless the runtime audit environment switch is enabled. */
     for (k = 1; k <= S.nlinks; ++k)
@@ -442,6 +457,7 @@ MSXResidentStatus MSXresident_stageClear(uint32_t k)
         return p->d.epoch == UINT64_MAX ? MSX_RESIDENT_ERR_OVERFLOW :
                                           MSX_RESIDENT_ERR_CAPACITY;
     /* All fallible checks are complete before the first invalidation. */
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     for (s = 0; s < p->d.capacity; ++s)
         if (p->used[s])
         {
@@ -451,6 +467,7 @@ MSXResidentStatus MSXresident_stageClear(uint32_t k)
         }
     p->d.count = 0; p->d.head = p->d.tail = NONE;
     p->d.epoch++; markdesc(k);
+    MSXsegStorage_hybridInvalidatePartitionView((int)k);
     return MSX_RESIDENT_OK;
 }
 MSXResidentStatus MSXresident_stageMeta(uint32_t k,uint32_t s,uint32_t generation,
@@ -463,6 +480,7 @@ MSXResidentStatus MSXresident_stageMeta(uint32_t k,uint32_t s,uint32_t generatio
     if (s >= p->d.capacity || !p->used[s] || p->gen[s] != generation)
         return MSX_RESIDENT_ERR_GENERATION;
     if (x->parcelId && x->parcelId != p->id[s]) return MSX_RESIDENT_ERR_GENERATION;
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     r = crow(p, s);
     if (r[0] == x->volume && r[1] == x->hstep && r[2] == x->hresponse &&
         r[3] == x->uresponse && r[4] == x->dresponse)
@@ -479,8 +497,10 @@ MSXResidentStatus MSXresident_stageReverse(uint32_t k)
     z = pipeok(k, &p); if (z) return z;
     if (p->d.count <= 1) return MSX_RESIDENT_OK;
     if (p->d.epoch == UINT64_MAX) return MSX_RESIDENT_ERR_OVERFLOW;
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     { uint32_t s = p->d.head; p->d.head = p->d.tail; p->d.tail = s; }
     p->d.orient = -p->d.orient; p->d.epoch++; markdesc(k);
+    MSXsegStorage_hybridInvalidatePartitionView((int)k);
     return MSX_RESIDENT_OK;
 }
 MSXResidentStatus MSXresident_getSlotForParcel(uint32_t k,uint64_t parcelId,
@@ -522,35 +542,129 @@ MSXResidentStatus MSXresident_getSlotIdentity(uint32_t k,uint32_t s,
 MSXResidentStatus MSXresident_getSlotMetadata(uint32_t k,uint32_t s,uint32_t g,MSXResidentPayload*x){Pipe*p;MSXResidentStatus z;if(!x)return MSX_RESIDENT_ERR_ARGUMENT;z=pipeok(k,&p);if(z)return z;if(s>=p->d.capacity||!p->used[s]||p->gen[s]!=g){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}getpayload(p,s,x);x->c=x->lastc=NULL;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_getSlotPayload(uint32_t k,uint32_t s,uint32_t g,MSXResidentPayload*x)
 {MSXResidentStatus status=MSXresident_getSlotMetadata(k,s,g,x);if(status)return status;if(S.compact)return MSX_RESIDENT_ERR_ARGUMENT;getpayload(&S.p[k],s,x);return MSX_RESIDENT_OK;}
-MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow*r,const MSXResidentPayload*x,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if(S.compact)return MSX_RESIDENT_ERR_ARGUMENT;if((!r||!x)&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].globalRow!=S.base[r[i].linkIndex]+r[i].slot||r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].descriptorEpoch||p->id[r[i].slot]!=r[i].parcelId||!x[i].c||!x[i].lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=x[i].volume;q[1]=x[i].hstep;q[2]=x[i].hresponse;q[3]=x[i].uresponse;q[4]=x[i].dresponse;for(m=0;m<S.stride;m++){q[5+m]=x[i].c[m];lrow(p,r[i].slot)[5+m]=x[i].lastc[m];}}}return MSX_RESIDENT_OK;}
+MSXResidentStatus MSXresident_applyActivePayload(const MSXResidentActiveRow*r,const MSXResidentPayload*x,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if(S.compact)return MSX_RESIDENT_ERR_ARGUMENT;if((!r||!x)&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].globalRow!=S.base[r[i].linkIndex]+r[i].slot||r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].descriptorEpoch||p->id[r[i].slot]!=r[i].parcelId||!x[i].c||!x[i].lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}if(n&&MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=x[i].volume;q[1]=x[i].hstep;q[2]=x[i].hresponse;q[3]=x[i].uresponse;q[4]=x[i].dresponse;for(m=0;m<S.stride;m++){q[5+m]=x[i].c[m];lrow(p,r[i].slot)[5+m]=x[i].lastc[m];}}}return MSX_RESIDENT_OK;}
 uint64_t MSXresident_testAllocationCount(void){return ResidentAllocationCount;}
 void MSXresident_testResetAllocationCount(void){ResidentAllocationCount=0;}
 void MSXresident_testFailAllocationAfter(int64_t allocationIndex){ResidentAllocationFailAfter=allocationIndex;}
 MSXResidentStatus MSXresident_getPatches(MSXResidentPatchBatch*b){if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;if(S.poisoned)return MSX_RESIDENT_ERR_POISONED;b->descriptor=S.desc;b->descriptorCount=S.ndesc;b->slot=S.slot;b->slotCount=S.nslot;return MSX_RESIDENT_OK;}
 void MSXresident_clearPatches(void)
-{ uint32_t i,k,s; if(!S.open)return; for(i=0;i<S.ndesc;i++){k=S.desc[i].linkIndex;if(k&&k<=S.nlinks)S.dirty[k]=NONE;} for(i=0;i<S.nslot;i++){k=S.slot[i].linkIndex;s=S.slot[i].slot;if(k&&k<=S.nlinks&&s<S.p[k].d.capacity)S.p[k].patch[s]=NONE;} S.ndesc=S.nslot=0; }
+{ uint32_t i,k,s; if(!S.open)return;if(MSXsegStorage_hybridWriteAllowed())return; for(i=0;i<S.ndesc;i++){k=S.desc[i].linkIndex;if(k&&k<=S.nlinks)S.dirty[k]=NONE;} for(i=0;i<S.nslot;i++){k=S.slot[i].linkIndex;s=S.slot[i].slot;if(k&&k<=S.nlinks&&s<S.p[k].d.capacity)S.p[k].patch[s]=NONE;} S.ndesc=S.nslot=0; }
 MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *o){uint32_t k;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(!S.open||!S.capacity||!S.base)return MSX_RESIDENT_DISABLED;if(!S.guard){S.guard=(uint32_t*)calloc((size_t)S.nlinks+1,sizeof(*S.guard));if(!S.guard)return MSX_RESIDENT_ERR_MEMORY;for(k=1;k<=S.nlinks;k++)S.guard[k]=S.p[k].guard;}o->nLinks=S.nlinks;o->totalSlots=(uint32_t)S.slots;o->speciesStride=S.stride;o->capacity=S.capacity;o->base=S.base;o->guard=S.guard;o->admissionLimit=S.admissionLimit;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,uint32_t cap,uint32_t *count)
 { uint32_t k,s,n=0,total=0,base=0; if(!count||(!rows&&cap))return MSX_RESIDENT_ERR_ARGUMENT;*count=0;if(!S.open)return MSX_RESIDENT_DISABLED;
   for(k=1;k<=S.nlinks;k++){Pipe*p=&S.p[k];uint32_t seen=0;if(p->d.count>p->d.capacity||(p->d.count&&p->d.head>=p->d.capacity))return MSX_RESIDENT_ERR_CAPACITY;s=p->d.head;while(seen<p->d.count){if(s>=p->d.capacity||!p->used[s])return MSX_RESIDENT_ERR_GENERATION;if(n>=cap)return MSX_RESIDENT_ERR_CAPACITY;rows[n].linkIndex=k;rows[n].slot=s;rows[n].globalRow=base+s;rows[n].generation=p->gen[s];rows[n].descriptorHead=p->d.head;rows[n].descriptorCount=p->d.count;rows[n].descriptorOrient=p->d.orient;rows[n].descriptorEpoch=p->d.epoch;rows[n].parcelId=p->id[s];rows[n].volume=crow(p,s)[0];n++;seen++;s=(uint32_t)(((int64_t)s+p->d.orient+(int64_t)p->d.capacity)%(int64_t)p->d.capacity);}if(base>UINT32_MAX-p->d.capacity)return MSX_RESIDENT_ERR_OVERFLOW;base+=p->d.capacity;total+=seen;}
   if(total!=n||n>S.slots)return MSX_RESIDENT_ERR_OVERFLOW;*count=n;return MSX_RESIDENT_OK; }
-MSXResidentStatus MSXresident_getInitialBatch(MSXResidentPatchBatch *b){uint32_t k,s,n=0;if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;if(!S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT;/* Initial image construction reuses the patch arenas; discard the staging
+MSXResidentStatus MSXresident_enumerateActiveSpans(MSXResidentActiveRow *rows,
+                                                 uint32_t cap,uint32_t *count)
+{
+    uint32_t k,n=0,total=0,base=0;
+    if(!count||(!rows&&cap))return MSX_RESIDENT_ERR_ARGUMENT;
+    *count=0;
+    if(!S.open)return MSX_RESIDENT_DISABLED;
+    for(k=1;k<=S.nlinks;k++)
+    {
+        Pipe *p=&S.p[k];
+        const uint32_t capacity=p->d.capacity,head=p->d.head,number=p->d.count;
+        const int32_t orient=p->d.orient;
+        uint32_t seen=0,s=head;
+        if(number>capacity||(number&&head>=capacity))return MSX_RESIDENT_ERR_CAPACITY;
+        while(seen<number)
+        {
+            uint32_t length=1,j;
+            /* Malformed orientations retain the scalar modulo/check order.
+               In particular, do not normalize orientation or precheck payload. */
+            if(orient==1)length=capacity-s;
+            else if(orient==-1)length=s+1;
+            if(length>number-seen)length=number-seen;
+            for(j=0;j<length;j++)
+            {
+                MSXResidentActiveRow *r;
+                if(s>=capacity||!p->used[s])return MSX_RESIDENT_ERR_GENERATION;
+                if(n>=cap)return MSX_RESIDENT_ERR_CAPACITY;
+                r=&rows[n];
+                r->linkIndex=k;r->slot=s;r->globalRow=base+s;
+                r->generation=p->gen[s];r->descriptorHead=head;
+                r->descriptorCount=number;r->descriptorOrient=orient;
+                r->descriptorEpoch=p->d.epoch;r->parcelId=p->id[s];
+                r->volume=crow(p,s)[0];
+                ++n;++seen;
+                if(orient==1)++s;
+                else if(orient==-1)--s;
+                else s=(uint32_t)(((int64_t)s+orient+(int64_t)capacity)%(int64_t)capacity);
+            }
+            if(orient==1&&s==capacity)s=0;
+            else if(orient==-1&&s==UINT32_MAX)s=capacity-1;
+        }
+        if(base>UINT32_MAX-capacity)return MSX_RESIDENT_ERR_OVERFLOW;
+        base+=capacity;total+=seen;
+    }
+    if(total!=n||n>S.slots)return MSX_RESIDENT_ERR_OVERFLOW;
+    *count=n;return MSX_RESIDENT_OK;
+}
+/* DEVELOPMENT_NOT_ADOPTED. Keep the original scalar traversal/check order
+   independent from C05's row-building implementation. No identity, finite
+   volume, device mirror or duplicate check belongs in this phase. */
+MSXResidentStatus MSXresident_preflightActive(MSXResidentActivePipeView *pipes,
+    uint32_t pipeCapacity,uint32_t rowCapacity,uint32_t *count)
+{
+    uint32_t k,n=0,total=0,base=0;
+    if(!count||(!pipes&&pipeCapacity))return MSX_RESIDENT_ERR_ARGUMENT;
+    *count=0;
+    if(!S.open)return MSX_RESIDENT_DISABLED;
+    if(pipeCapacity<=S.nlinks||!pipes)return MSX_RESIDENT_ERR_ARGUMENT;
+    for(k=1;k<=S.nlinks;k++)
+    {
+        Pipe *p=&S.p[k];uint32_t seen=0,s=p->d.head,start=n;
+        MSXResidentActivePipeView *view=&pipes[k];
+        if(p->d.count>p->d.capacity||(p->d.count&&p->d.head>=p->d.capacity))
+            return MSX_RESIDENT_ERR_CAPACITY;
+        while(seen<p->d.count)
+        {
+            uint32_t length=1,i;
+            if(p->d.orient==1)length=p->d.capacity-s;
+            else if(p->d.orient==-1)length=s+1;
+            if(length>p->d.count-seen)length=p->d.count-seen;
+            for(i=0;i<length;i++)
+            {
+                if(s>=p->d.capacity||!p->used[s])return MSX_RESIDENT_ERR_GENERATION;
+                if(n>=rowCapacity)return MSX_RESIDENT_ERR_CAPACITY;
+                ++n;++seen;
+                if(p->d.orient==1)++s;
+                else if(p->d.orient==-1)--s;
+                else s=(uint32_t)(((int64_t)s+p->d.orient+(int64_t)p->d.capacity)%(int64_t)p->d.capacity);
+            }
+            if(p->d.orient==1&&s==p->d.capacity)s=0;
+            else if(p->d.orient==-1&&s==UINT32_MAX)s=p->d.capacity-1;
+        }
+        if(base>UINT32_MAX-p->d.capacity)return MSX_RESIDENT_ERR_OVERFLOW;
+        view->linkIndex=k;view->base=base;view->activeOffset=start;
+        view->capacity=p->d.capacity;view->head=p->d.head;
+        view->count=p->d.count;view->orient=p->d.orient;view->epoch=p->d.epoch;
+        view->generation=p->gen;view->parcelId=p->id;view->scalar=p->row;
+        view->scalarStride=(size_t)(S.compact?1:2)*S.rowWidth;
+        view->readWindow=NULL;view->windowToken=0;
+        base+=p->d.capacity;total+=seen;
+    }
+    if(total!=n||n>S.slots)return MSX_RESIDENT_ERR_OVERFLOW;
+    *count=n;return MSX_RESIDENT_OK;
+}
+MSXResidentStatus MSXresident_getInitialBatch(MSXResidentPatchBatch *b){uint32_t k,s,n=0;if(!b)return MSX_RESIDENT_ERR_ARGUMENT;memset(b,0,sizeof(*b));if(!S.open)return MSX_RESIDENT_DISABLED;if(!S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT;if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;/* Initial image construction reuses the patch arenas; discard the staging
    indices before filling the dense all-slot image so later incremental
    markslot() calls cannot address overwritten records. */MSXresident_clearPatches();for(k=1;k<=S.nlinks;k++){S.desc[k-1].linkIndex=k;S.desc[k-1].descriptor=S.p[k].d;for(s=0;s<S.p[k].d.capacity;s++){MSXResidentSlotPatch*q=&S.slot[n++];q->linkIndex=k;q->slot=s;q->generation=S.p[k].gen[s];q->used=S.p[k].used[s];q->kind=q->used?MSX_RESIDENT_PATCH_IMPORT:MSX_RESIDENT_PATCH_INVALIDATE;getpayload(&S.p[k],s,&q->payload);q->uploadRevision=q->used?S.p[k].revision[s]:0;}}b->descriptor=S.desc;b->descriptorCount=S.nlinks;b->slot=S.slot;b->slotCount=n;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_beginInitialImage(void)
-{ if(!S.open||S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT; S.initialStaging=1; return MSX_RESIDENT_OK; }
+{ if(!S.open||S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT; if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT; S.initialStaging=1; return MSX_RESIDENT_OK; }
 MSXResidentStatus MSXresident_stageInitialPipe(uint32_t k,const uint64_t *id,
     const MSXResidentPayload *payload,uint32_t count,int32_t orient)
 { if(!S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT; return MSXresident_observePipe(k,id,payload,count,orient); }
 MSXResidentStatus MSXresident_commitInitialImage(void)
-{ if(!S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT; MSXresident_clearPatches(); S.initialStaging=0; S.initialCommitted=1; return MSX_RESIDENT_OK; }
+{ if(!S.initialStaging||S.initialCommitted)return MSX_RESIDENT_ERR_ARGUMENT; if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT; MSXresident_clearPatches(); S.initialStaging=0; S.initialCommitted=1; return MSX_RESIDENT_OK; }
 void MSXresident_abortInitialImage(void)
-{ if(!S.open)return; S.initialStaging=0; S.initialCommitted=0; MSXresident_clearPatches(); }
+{ if(!S.open)return; if(MSXsegStorage_hybridWriteAllowed())return; S.initialStaging=0; S.initialCommitted=0; MSXresident_clearPatches(); }
 static uint32_t nth(Pipe*p,uint32_t base,int dir,uint32_t n){int64_t q=(int64_t)base+(int64_t)dir*n;while(q<0)q+=p->d.capacity;return(uint32_t)(q%p->d.capacity);}
 MSXResidentStatus MSXresident_planHandoff(uint32_t k,double flow,double dt,uint32_t side,double bv,int strict,MSXResidentHandoffPlan*o){Pipe*p;MSXResidentStatus z;double need;if(!o||dt<0||side>1)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));if(S.mode==MSX_RESIDENT_OFF)return MSX_RESIDENT_OK;z=pipeok(k,&p);if(z)return z;need=fabs(flow)*dt;o->linkIndex=k;o->boundarySide=side;o->pipeEpoch=p->d.epoch;o->flowVolume=need;if(need<=bv)return MSX_RESIDENT_OK;need-=bv;S.nh=0;while(need>0&&S.nh<p->d.count){uint32_t s=nth(p,side?p->d.tail:p->d.head,side?-p->d.orient:p->d.orient,S.nh);if(!p->used[s])return MSX_RESIDENT_ERR_GENERATION;S.hand[S.nh].linkIndex=k;S.hand[S.nh].slot=s;S.hand[S.nh].generation=p->gen[s];S.hand[S.nh].boundarySide=side;S.hand[S.nh].pipeEpoch=p->d.epoch;S.hand[S.nh].requestedVolume=crow(p,s)[0];need-=crow(p,s)[0];S.nh++;}S.stat.handoffRequests++;if(need>0){S.stat.fallbacks++;return strict||S.strict?MSX_RESIDENT_ERR_CAPACITY:MSX_RESIDENT_FALLBACK_WHOLE_LINK;}o->itemCount=S.nh;o->item=S.hand;return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_planHandoffInto(uint32_t k,double flow,double dt,uint32_t side,double bv,int strict,MSXResidentHandoffItem *item,uint32_t cap,MSXResidentHandoffPlan *o){MSXResidentStatus z;MSXResidentHandoffPlan q;if(!o)return MSX_RESIDENT_ERR_ARGUMENT;z=MSXresident_planHandoff(k,flow,dt,side,bv,strict,&q);if(z!=MSX_RESIDENT_OK)return z;if(q.itemCount>cap||(!item&&q.itemCount))return MSX_RESIDENT_ERR_CAPACITY;*o=q;o->item=item;if(q.itemCount)memcpy(item,q.item,(size_t)q.itemCount*sizeof(*item));return MSX_RESIDENT_OK;}
 MSXResidentStatus MSXresident_planAllHandoffInto(uint32_t k,uint32_t side,MSXResidentHandoffItem *item,uint32_t cap,MSXResidentHandoffPlan *o){Pipe*p;MSXResidentStatus z;uint32_t i;if(!o||side>1)return MSX_RESIDENT_ERR_ARGUMENT;memset(o,0,sizeof(*o));z=pipeok(k,&p);if(z)return z;if(p->d.count>cap||(!item&&p->d.count))return MSX_RESIDENT_ERR_CAPACITY;o->linkIndex=k;o->boundarySide=side;o->pipeEpoch=p->d.epoch;o->itemCount=p->d.count;o->item=item;for(i=0;i<p->d.count;i++){uint32_t s=nth(p,side?p->d.tail:p->d.head,side?-p->d.orient:p->d.orient,i);if(!p->used[s])return MSX_RESIDENT_ERR_GENERATION;item[i].linkIndex=k;item[i].slot=s;item[i].generation=p->gen[s];item[i].boundarySide=side;item[i].pipeEpoch=p->d.epoch;item[i].requestedVolume=crow(p,s)[0];}return MSX_RESIDENT_OK;}
-MSXResidentStatus MSXresident_applyHandoff(const MSXResidentHandoffResult*r,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if(S.compact)return MSX_RESIDENT_ERR_ARGUMENT;if(!r&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].pipeEpoch||r[i].boundarySide>1||!r[i].payload.c||!r[i].payload.lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=r[i].payload.volume;q[1]=r[i].payload.hstep;q[2]=r[i].payload.hresponse;q[3]=r[i].payload.uresponse;q[4]=r[i].payload.dresponse;for(m=0;m<S.stride;m++){q[5+m]=r[i].payload.c[m];lrow(p,r[i].slot)[5+m]=r[i].payload.lastc[m];}}}return MSX_RESIDENT_OK;}const MSXResidentStats*MSXresident_stats(void){return&S.stat;}
+MSXResidentStatus MSXresident_applyHandoff(const MSXResidentHandoffResult*r,uint32_t n){uint32_t i,m;Pipe*p;MSXResidentStatus z;if(S.compact)return MSX_RESIDENT_ERR_ARGUMENT;if(!r&&n)return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){z=pipeok(r[i].linkIndex,&p);if(z)return z;if(r[i].slot>=p->d.capacity||!p->used[r[i].slot]||p->gen[r[i].slot]!=r[i].generation||p->d.epoch!=r[i].pipeEpoch||r[i].boundarySide>1||!r[i].payload.c||!r[i].payload.lastc){S.stat.generationFailures++;return MSX_RESIDENT_ERR_GENERATION;}}if(n&&MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;for(i=0;i<n;i++){p=&S.p[r[i].linkIndex];{double*q=crow(p,r[i].slot);q[0]=r[i].payload.volume;q[1]=r[i].payload.hstep;q[2]=r[i].payload.hresponse;q[3]=r[i].payload.uresponse;q[4]=r[i].payload.dresponse;for(m=0;m<S.stride;m++){q[5+m]=r[i].payload.c[m];lrow(p,r[i].slot)[5+m]=r[i].payload.lastc[m];}}}return MSX_RESIDENT_OK;}const MSXResidentStats*MSXresident_stats(void){return&S.stat;}
 
 static void txreset(Tx *t)
 {
@@ -602,6 +716,7 @@ MSXResidentStatus MSXresident_prepareHandoffTransaction(const MSXResidentHandoff
     z = txvalidate(plan, r, n,1); if (z) return z;
     t = &S.tx[plan->linkIndex];
     if (t->active || n > t->capacity) return MSX_RESIDENT_ERR_CAPACITY;
+    if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     if (MSXsegStorage_hybridEnsureBoundaryPoolFree(n)) return MSX_RESIDENT_ERR_MEMORY;
     /* All mutable transaction rows were allocated in MSXresident_open(). */
     t->active = 1;
@@ -656,6 +771,7 @@ MSXResidentStatus MSXresident_prepareHandoffLeases(const MSXResidentHandoffPlan 
     /* Metadata preflight does not consume concentrations. */
 }
  z=txvalidate(plan,r,n,0);if(z)return z;
+ if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
  if(MSXsegStorage_hybridEnsureBoundaryPoolFree(n))return MSX_RESIDENT_ERR_MEMORY;
  for(i=0;i<n;++i)if(S.p[plan->linkIndex].patch[r[i].slot]==NONE)++reserve;
  if(reserve>S.slots-S.nslot)return MSX_RESIDENT_ERR_CAPACITY;
@@ -672,6 +788,7 @@ MSXResidentStatus MSXresident_finishHandoffLeases(MSXResidentHandoffTransaction 
  Tx*t;uint32_t i;MSXResidentStatus z;
  if(!x||!(t=(Tx*)x->opaque)||!t->active||t->payloadReady)return MSX_RESIDENT_ERR_ARGUMENT;
  z=txvalidate(&t->plan,r,t->count,1);if(z)return z;
+ if(MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
  for(i=0;i<t->count;++i){Pseg b=t->boundary[i];
     if(r[i].payload.c!=b->c||r[i].payload.lastc!=b->lastc)return MSX_RESIDENT_ERR_ARGUMENT;
     b->v=r[i].payload.volume;b->hstep=r[i].payload.hstep;b->hresponse=r[i].payload.hresponse;
@@ -694,6 +811,7 @@ MSXResidentStatus MSXresident_validateHandoffTransactions(const MSXResidentHando
             !MSXsegStorage_hybridValidatePreparedResidentMaterialization(&t->storage))
             return MSX_RESIDENT_ERR_GENERATION;
     }
+    if(n&&MSXsegStorage_hybridWriteAllowed())return MSX_RESIDENT_ERR_ARGUMENT;
     return MSX_RESIDENT_OK;
 }
 
@@ -701,6 +819,9 @@ void MSXresident_commitHandoffTransaction(MSXResidentHandoffTransaction *x)
 {
     Tx *t; Pipe *p; uint32_t i;
     if (!x || !(t = (Tx *)x->opaque)) return;
+    if(MSXsegStorage_hybridWriteAllowed())return;
+    if(!MSXsegStorage_hybridValidatePreparedResidentMaterialization(&t->storage))
+    {MSXresident_poison();MSX.ErrCode=ERR_PIPE_RING_CAPACITY;return;}
     /* Required precondition: MSXresident_validateHandoffTransactions() has
        accepted the whole batch.  No validation, allocation, lookup, or error path. */
     MSXsegStorage_hybridCommitPreparedResidentMaterialization(&t->storage);
@@ -717,9 +838,45 @@ void MSXresident_commitHandoffTransaction(MSXResidentHandoffTransaction *x)
     else if (!t->plan.boundarySide) p->d.head = nth(p, p->d.head, p->d.orient, t->count);
     else p->d.tail = nth(p, p->d.tail, -p->d.orient, t->count);
     p->d.epoch++; markdesc(t->plan.linkIndex);
+    MSXsegStorage_hybridInvalidatePartitionView((int)t->plan.linkIndex);
     for (i = 0; i < t->count; i++) t->boundary[i] = NULL;
     txreset(t); x->opaque = NULL;
 }
 
 void MSXresident_abortHandoffTransaction(MSXResidentHandoffTransaction *x)
-{ if (!x) return; txreset((Tx *)x->opaque); x->opaque = NULL; }
+{ if (!x) return; if(MSXsegStorage_hybridWriteAllowed())return; txreset((Tx *)x->opaque); x->opaque = NULL; }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Core(MSXInventory *s)
+{
+ uint32_t k;Pipe *p;Tx *t;
+ INV_HEAP(s,S.p);
+ INV_HEAP(s,S.tx);
+ INV_HEAP(s,S.dirty);
+ INV_HEAP(s,S.capacity);
+ INV_HEAP(s,S.base);
+ INV_HEAP(s,S.guard);
+ INV_HEAP(s,S.admissionLimit);
+ INV_HEAP(s,S.desc);
+ INV_HEAP(s,S.initialDesc);
+ INV_HEAP(s,S.slot);
+ INV_HEAP(s,S.initialSlot);
+ INV_HEAP(s,S.hand);
+ if(S.p)for(k=1;k<=S.nlinks;k++){p=&S.p[k];
+ INV_INDEX(s,"Core.pipe",k,0,p->used);
+ INV_INDEX(s,"Core.pipe",k,0,p->gen);
+ INV_INDEX(s,"Core.pipe",k,0,p->patch);
+ INV_INDEX(s,"Core.pipe",k,0,p->obsI2s);
+ INV_INDEX(s,"Core.pipe",k,0,p->obsKeep);
+ INV_INDEX(s,"Core.pipe",k,0,p->id);
+ INV_INDEX(s,"Core.pipe",k,0,p->revision);
+ INV_INDEX(s,"Core.pipe",k,0,p->row);
+}
+ if(S.tx)for(k=1;k<=S.nlinks;k++){t=&S.tx[k];
+ INV_INDEX(s,"Core.tx",k,0,t->item);
+ INV_INDEX(s,"Core.tx",k,0,t->result);
+ INV_INDEX(s,"Core.tx",k,0,t->boundary);
+}
+}
+#endif

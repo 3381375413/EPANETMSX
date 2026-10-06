@@ -13,6 +13,7 @@
 #include <math.h>
 
 #include "msxtypes.h"
+#include "msxsegment_storage.h"
 
 //  External variables
 //--------------------
@@ -208,6 +209,8 @@ void  MSXtank_mix3(int i, double vin, double *massin, double vnet)
    double vout, vseg, vsum;
    Pseg   seg;
 
+    if (MSXsegStorage_hybridWriteAllowed()) return;
+
 // --- find inflows & outflows
 
     k = MSX.Nobjects[LINK] + i;
@@ -310,6 +313,8 @@ void  MSXtank_mix4(int i, double vin, double *massin, double vnet)
    int    k, m, n;
    double vsum, vseg;
    Pseg   seg;
+
+    if (MSXsegStorage_hybridWriteAllowed()) return;
 
 // --- find inflows & outflows
 

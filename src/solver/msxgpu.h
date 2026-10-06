@@ -14,6 +14,19 @@ int MSXgpu_cpuChemistryTimingEnabled(void);
 const char *MSXgpu_profileModeName(void);
 const char *MSXgpu_profileDetailName(void);
 void MSXgpu_recordInitTime(MSXInitPhase phase, double ms);
+/* C00: detail-only host clock intervals, relative to the current quality
+   step. Thread records and interval storage are budget-owned allocations. */
+enum { MSX_HOST_SUBMIT, MSX_HOST_BOUNDARY, MSX_HOST_TANK, MSX_HOST_WAIT,
+       MSX_HOST_INTERVAL_COUNT };
+int MSXgpu_profileResidentDiagnosticEnabled(void);
+int MSXgpu_profileResidentDiagnosticBegin(void);
+void MSXgpu_profileResidentHostInterval(int phase, double startMs, double endMs);
+int MSXgpu_profileResidentThread(int thread, uint64_t links, uint64_t cpuRows,
+                                 uint64_t coreWalked, double finishedMs);
+void MSXgpu_profileRecordActiveStages(double enumerateMs, double identityWriteMs,
+                                    double sealMs, uint64_t rowsRead,
+                                    uint64_t rowsWritten, int failureStage);
+void MSXgpu_profileRecordActivePrepare(double ms, int failed);
 
 /* Detail-only transfer counters.  They are intentionally opaque to the
    solver; the process summary owns their representation and coverage. */

@@ -1,6 +1,7 @@
 #ifndef MSXRESIDENT_CORE_H
 #define MSXRESIDENT_CORE_H
 #include <stdint.h>
+#include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +41,23 @@ typedef struct { uint32_t nLinks,totalSlots,speciesStride; const uint32_t *capac
 /* Read-only snapshot of one published resident row.  It deliberately exposes
    no CPU topology pointer: callers may only build GPU active batches. */
 typedef struct { uint32_t linkIndex,slot,globalRow,generation,descriptorHead,descriptorCount; int32_t descriptorOrient; uint64_t descriptorEpoch,parcelId; double volume; } MSXResidentActiveRow;
+/* DEVELOPMENT_NOT_ADOPTED: O(L) borrowed read-window metadata. Scalar rows
+   remain authoritative; volume is read only while constructing each row. */
+typedef struct {
+    uint32_t linkIndex,base,activeOffset,capacity,head,count;
+    int32_t orient;
+    uint64_t epoch;
+    const uint32_t *generation;
+    const uint64_t *parcelId;
+    const double *scalar;
+    size_t scalarStride;
+    /* Owner token storage must outlive any borrowed view. Runtime's token
+       has static lifetime; end/close clears it before freeing Core arrays. */
+    const uint64_t *readWindow;
+    uint64_t windowToken;
+} MSXResidentActivePipeView;
+MSXResidentStatus MSXresident_preflightActive(MSXResidentActivePipeView *,
+    uint32_t pipeCapacity,uint32_t rowCapacity,uint32_t *count);
 MSXResidentStatus MSXresident_open(const char*); void MSXresident_close(void); int MSXresident_isOpen(void);
 MSXResidentStatus MSXresident_openPlan(uint32_t,const uint32_t *,const uint32_t *,const char *);
 uint64_t MSXresident_fixedHostBytes(uint32_t,uint32_t,uint32_t);
@@ -91,6 +109,11 @@ MSXResidentStatus MSXresident_getLayout(MSXResidentLayout *);
 MSXResidentStatus MSXresident_enumerateActive(MSXResidentActiveRow *rows,
                                               uint32_t capacity,
                                               uint32_t *count);
+/* Same checks and partial-write/error order as the scalar reference above.
+   Legal +/-1 rings are read as at most two contiguous physical spans. */
+MSXResidentStatus MSXresident_enumerateActiveSpans(MSXResidentActiveRow *rows,
+                                                 uint32_t capacity,
+                                                 uint32_t *count);
 /* Complete fixed image: one descriptor per link and one patch per owned slot;
    unused rows are included with used=0. Valid until close/reset. */
 MSXResidentStatus MSXresident_getInitialBatch(MSXResidentPatchBatch *);
@@ -134,9 +157,12 @@ const MSXResidentStats *MSXresident_stats(void);
    relative to the next module allocation; -1 disables injection. */
 uint64_t MSXresident_testAllocationCount(void);
 uint64_t MSXresident_testAllocationBytes(void);
-#ifdef MSX_RESIDENT_TEST_API
+#if defined(MSX_RESIDENT_TEST_API) || defined(MSX_RESIDENT_ACTIVE_TEST_API)
 /* Golden initial-state read-only access, including unused physical slots. */
 MSXResidentStatus MSXresident_testInitialDescriptor(uint32_t,MSXResidentPipeDesc *);
+/* Test-only corruption seam; restores must be made before any mutation. */
+MSXResidentStatus MSXresident_testActiveDescriptor(uint32_t,const MSXResidentPipeDesc *);
+MSXResidentStatus MSXresident_testActiveUsed(uint32_t,uint32_t,uint32_t);
 MSXResidentStatus MSXresident_testInitialSlot(uint32_t,uint32_t,uint32_t *,uint32_t *,uint64_t *);
 #endif
 void MSXresident_testResetAllocationCount(void);

@@ -936,3 +936,17 @@ char* mathexpr_getStr(MathExpr* expr, char* exprStr,
     strcpy(exprStr, TermStack[stackindex].s);
     return exprStr;
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Expr(MSXInventory *s,void *handle,const char *name,uint32_t k)
+{ MathExpr *p=(MathExpr *)handle;uint32_t j=0;for(;p;p=p->next){INV_INDEX(s,name,k,j++,p);} }
+void MSXinv_TankExpr(MSXInventory *s,void *handle,void *pipeHandle,const char *name,uint32_t k)
+{ MathExpr *p=(MathExpr *)handle,*prior;uint32_t j=0;char key[128];
+  for(;p;p=p->next,++j){
+   for(prior=(MathExpr *)pipeHandle;prior&&prior!=p;prior=prior->next){}
+   if(prior){snprintf(key,sizeof(key),"%s[%u,%u].p",name,(unsigned)k,(unsigned)j);MSXinv_alias(s,key,p,p);}
+   else {INV_INDEX(s,name,k,j,p);}
+  }
+}
+#endif

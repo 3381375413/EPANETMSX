@@ -15,6 +15,17 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+/* Frozen candidate builds may override this internal compile constant.
+   Production remains serial until C01 and the bounded C07 screen pass. */
+#ifndef MSX_REBALANCE_SNAPSHOT_BACKEND
+#define MSX_REBALANCE_SNAPSHOT_BACKEND 1
+#endif
+#if (MSX_REBALANCE_SNAPSHOT_BACKEND == 1 || MSX_REBALANCE_SNAPSHOT_BACKEND == 2) && !defined(_OPENMP)
+#error OMP snapshot candidates require an OpenMP-enabled build
+#endif
 
 #include "msxsegment_storage.h"
 #include "msxresident_core.h"
@@ -26,6 +37,8 @@
 #include "msxresident_alloc.h"
 #include "msxresident_pool.h"
 #include "mempool.h"
+#include "msxqual_shared.h"
+#include "msxresident_runtime.h"
 
 extern MSXproject MSX;
 static uint64_t HybridAllocationBytes;
@@ -45,22 +58,7 @@ typedef struct HybridDemoteRequest HybridDemoteRequest;
    demote plan/commit and ordinary promote phases.  Pseg pointers are valid
    until the corresponding phase commits; endpoint pointers are refreshed from
    the dense view after every successful topology mutation. */
-typedef struct RebalanceSnapshot
-{
-    int linkIndex;
-    int total;
-    int coreCount;
-    int downCount;
-    int upCount;
-    Pseg firstCore;
-    Pseg lastCore;
-    uint64_t firstCoreId;
-    uint64_t lastCoreId;
-    int head;
-    int tail;
-    int orient;
-    int guard;
-} RebalanceSnapshot;
+typedef MSXHybridRebalanceSnapshot RebalanceSnapshot;
 
 typedef struct PipeRingStorage
 {
@@ -93,6 +91,11 @@ static PipeRingStorage Ring = {0};
 
 typedef struct HybridPipe
 {
+    /* Allocation ownership is set before the first fallible allocation.
+       fixedCap is a capacity contract, not an allocator discriminator. */
+    enum { HYBRID_OBJECTS_INDIVIDUAL, HYBRID_OBJECTS_SLAB } allocationKind;
+    enum { HYBRID_OBSERVER_PRIVATE, HYBRID_OBSERVER_SHARED } observerAllocationKind;
+    Pseg coreSlab;
     int cap;
     int fixedCap;
     int admissionLimit;
@@ -130,6 +133,7 @@ typedef struct HybridPipe
     int directInitial;
     uint32_t directCount;
     Pseg directFirst, directLast;
+    MSXHybridPartitionView partition;
 } HybridPipe;
 
 struct HybridDemoteRequest
@@ -154,10 +158,15 @@ typedef struct HybridResidentTx
     int oldHead, oldTail, oldCount, nextEndpoint, active;
     Pseg *oldCore, *boundary, *down, *up;
     int *slot;
+    uint64_t lifecycle, revision;
 } HybridResidentTx;
 
 typedef struct HybridStorage
 {
+    uint64_t *initialScratchId;
+    MSXResidentPayload *initialScratchPayload;
+    uint32_t initialScratchCapacity;
+    int sharedInitialObserver;
     int opened;
     int metadataOnly;
     int nLinks;
@@ -201,6 +210,17 @@ typedef struct HybridStorage
 } HybridStorage;
 
 static HybridStorage Hybrid = {0};
+int MSXsegStorage_hybridAuditCoreSlab(int link,Pseg *base,uint32_t *capacity)
+{
+    HybridPipe *p;
+    if(base)*base=NULL;
+    if(capacity)*capacity=0;
+    if(!base||!capacity||!Hybrid.pipe||link<1||link>Hybrid.nLinks)return 0;
+    p=&Hybrid.pipe[link];
+    if(p->allocationKind!=HYBRID_OBJECTS_SLAB||!p->coreSlab)return 0;
+    *base=p->coreSlab;*capacity=(uint32_t)p->cap;
+    return 1;
+}
 #ifdef MSX_RESIDENT_TEST_API
 static int PoolTestFault;
 #endif
@@ -230,14 +250,37 @@ static void hybridAuditPool(const char *event, uint64_t newTableBytes)
 }
 uint64_t MSXsegStorage_hybridFixedHostBytes(uint32_t links,uint32_t slots,uint32_t stride)
 {
+    /* Compatibility retains the complete prepare-time per-pipe snapshot.
+       Direct planning passes its exact geometry and captured path explicitly. */
+    return MSXsegStorage_hybridFixedHostBytesWithInitial(links,slots,stride,0,0);
+}
+uint32_t MSXsegStorage_hybridInitialScratchCapacity(void)
+{return Hybrid.initialScratchCapacity;}
+uint64_t MSXsegStorage_hybridFixedHostBytesWithInitial(uint32_t links,uint32_t slots,uint32_t stride,int sharedInitial,uint32_t initialRows)
+{
     uint64_t l=(uint64_t)links+1,s=slots;
-    return ((uint64_t)(MSX.GpuCoreMode==2?19:21)*links+s+9)*MSXresidentAlloc_headerBytes()+
+    sharedInitial=MSX.GpuCoreMode==2&&sharedInitial;
+    return ((MSX.GpuCoreMode==2?(uint64_t)(sharedInitial?16:18)*links+(sharedInitial&&initialRows?2:0):
+                              (uint64_t)21*links+s)+9)*MSXresidentAlloc_headerBytes()+
       l*(sizeof(HybridPipe)+sizeof(RebalanceSnapshot))+
       (uint64_t)links*sizeof(HybridResidentTx)+
-      s*(2*sizeof(struct Sseg)+6*sizeof(Pseg)+2+5*sizeof(int)+
-         sizeof(uint64_t)+sizeof(MSXResidentPayload)+sizeof(HybridDemoteRequest)+
+      s*(2*sizeof(struct Sseg)+6*sizeof(Pseg)+2+
+         (MSX.GpuCoreMode==2?3:5)*sizeof(int)+
+         (sharedInitial?0:sizeof(uint64_t)+sizeof(MSXResidentPayload))+sizeof(HybridDemoteRequest)+
          sizeof(MSXResidentHandoffResult)+sizeof(MSXResidentHandoffItem)+sizeof(uint32_t)+
-         ((uint64_t)(MSX.GpuCoreMode==2?2:4)*stride+5)*sizeof(double)+sizeof(MSXResidentHandoffTarget));
+         ((uint64_t)(MSX.GpuCoreMode==2?2:4)*stride+5)*sizeof(double)+sizeof(MSXResidentHandoffTarget))+
+      (sharedInitial?(uint64_t)initialRows*(sizeof(uint64_t)+sizeof(MSXResidentPayload)):0);
+}
+static int hybridReserveInitialScratch(uint32_t rows)
+{
+    uint64_t *id;MSXResidentPayload *payload;
+    if(!Hybrid.metadataOnly||!rows)return 0;
+    if(Hybrid.initialScratchCapacity)return rows<=Hybrid.initialScratchCapacity?0:ERR_PIPE_RING_CAPACITY;
+    id=(uint64_t *)calloc(rows,sizeof(*id));
+    payload=(MSXResidentPayload *)calloc(rows,sizeof(*payload));
+    if(!id||!payload){FREE(id);FREE(payload);return ERR_MEMORY;}
+    Hybrid.initialScratchId=id;Hybrid.initialScratchPayload=payload;
+    Hybrid.initialScratchCapacity=rows;return 0;
 }
 uint64_t MSXsegStorage_hybridExistingHostBytes(void)
 {
@@ -248,6 +291,275 @@ uint64_t MSXsegStorage_hybridExistingHostBytes(void)
            (uint64_t)MSXresidentAlloc_chargedBytes(Hybrid.rebalanceSnapshot);
 }
 static MSXResidentStatus HybridResidentStatus = MSX_RESIDENT_OK;
+
+/* These owners survive Storage reset/free. Address reuse and reopening must
+   never resurrect a borrowed view or a previous read-window token. */
+static uint64_t PartitionLifecycle, PartitionReadSequence, PartitionReadToken;
+static int partitionReject(MSXResidentStatus status)
+{
+    HybridResidentStatus = status;
+    MSX.ErrCode = ERR_PIPE_RING_CAPACITY;
+    return ERR_PIPE_RING_CAPACITY;
+}
+int MSXsegStorage_hybridWriteAllowed(void)
+{
+    return PartitionReadToken ? partitionReject(MSX_RESIDENT_ERR_ARGUMENT) : 0;
+}
+static int partitionNextLifecycle(void)
+{
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
+    ++PartitionLifecycle;
+    return 0;
+}
+int MSXsegStorage_hybridLifecycleAllowed(void)
+{
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
+    return PartitionLifecycle == UINT64_MAX ?
+        partitionReject(MSX_RESIDENT_ERR_OVERFLOW) : 0;
+}
+int MSXsegStorage_hybridPrepareTopologyChange(int k, uint64_t changes)
+{
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
+    if (MSXsegStorage_isHybridLink(k) &&
+        changes > UINT64_MAX - Hybrid.pipe[k].partition.revision)
+        return partitionReject(MSX_RESIDENT_ERR_OVERFLOW);
+    return 0;
+}
+void MSXsegStorage_hybridCommitTopologyChange(int k)
+{
+    if (MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return;
+    if (!MSXsegStorage_isHybridLink(k)) return;
+    /* Callers preflight before Resident accepts the associated mutation. */
+    ++Hybrid.pipe[k].partition.revision;
+    Hybrid.pipe[k].partition.valid = FALSE;
+    Hybrid.pipe[k].partition.continuityProven = FALSE;
+}
+void MSXsegStorage_hybridInvalidatePartitionView(int k)
+{
+    if (MSXsegStorage_hybridWriteAllowed()) return;
+    if (!MSXsegStorage_isHybridLink(k)) return;
+    Hybrid.pipe[k].partition.valid = FALSE;
+    Hybrid.pipe[k].partition.continuityProven = FALSE;
+}
+static int partitionRefresh(int k, uint64_t owner)
+{
+    HybridPipe *p; MSXHybridPartitionView v;
+    Pseg s, previous = NULL, slow, fast;
+    int count = 0, total = 0, phase = 0, slot;
+    if (!MSXsegStorage_isHybridLink(k) || !MSX.FirstSeg || !MSX.LastSeg)
+        return ERR_PIPE_RING_CAPACITY;
+    if (PartitionReadToken && owner != PartitionReadToken)
+        return partitionReject(MSX_RESIDENT_ERR_ARGUMENT);
+    p = &Hybrid.pipe[k];
+    memset(&v, 0, sizeof(v));
+    v.link = k; v.lifecycle = PartitionLifecycle;
+    v.revision = p->partition.revision;
+    v.head = p->head; v.tail = p->tail; v.orient = p->orient;
+    /* Detect cycles without allocating a visited set in production. */
+    slow = fast = MSX.FirstSeg[k];
+    while (fast && fast->prev) {
+        slow = slow->prev; fast = fast->prev->prev;
+        if (slow == fast) return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    }
+    if (p->count < 0 || p->count > p->cap || (p->orient != 1 && p->orient != -1))
+        return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    slot = p->head;
+    for (s = MSX.FirstSeg[k]; s; s = s->prev) {
+        if (total == INT_MAX || s->next != previous)
+            return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+        ++total;
+        if (s->inHybridCore) {
+            uint32_t generation; uint64_t parcel, epoch; int residentSlot;
+            if (phase == 2 || count >= p->count || slot < 0 || slot >= p->cap ||
+                !p->used[slot] || p->view[slot] != s || s->hybridSlot != slot ||
+                s->ownerLink != k || !s->hybridId)
+                return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+            if (MSXresident_isOpen()) {
+                residentSlot = p->residentSlot[slot];
+                if (residentSlot < 0 || residentSlot >= p->cap ||
+                    p->coreSlotForResident[residentSlot] != slot ||
+                    MSXresident_getSlotIdentity((uint32_t)k, (uint32_t)residentSlot,
+                        &generation, &parcel, &epoch) != MSX_RESIDENT_OK ||
+                    !generation || parcel != s->hybridId)
+                    return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+            }
+            if (!count) { v.firstCore = s; v.firstCoreId = s->hybridId; }
+            v.lastCore = s; v.lastCoreId = s->hybridId;
+            ++count; phase = 1;
+            slot = (slot + p->orient + p->cap) % p->cap;
+        } else if (phase == 1) phase = 2;
+        previous = s;
+    }
+    if (previous != MSX.LastSeg[k] || total != MSX.Link[k].nsegs ||
+        count != p->count || (count && v.lastCore->hybridSlot != p->tail) ||
+        (!count && (p->head != -1 || p->tail != -1)))
+        return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    v.coreCount = count; v.valid = v.continuityProven = TRUE;
+    p->partition = v;
+    return 0;
+}
+int MSXsegStorage_hybridRefreshPartitionView(int k)
+{
+    return partitionRefresh(k, 0);
+}
+int MSXsegStorage_hybridGetPartitionView(int k, const MSXHybridPartitionView **view)
+{
+    if (!view || !MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    *view = &Hybrid.pipe[k].partition;
+    if ((*view)->valid && (*view)->lifecycle != PartitionLifecycle)
+        return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    return 0;
+}
+int MSXsegStorage_hybridBeginReadWindow(uint64_t *token)
+{
+    if (!token || *token || PartitionReadToken)
+        return partitionReject(MSX_RESIDENT_ERR_ARGUMENT);
+    if (PartitionReadSequence == UINT64_MAX)
+        return partitionReject(MSX_RESIDENT_ERR_OVERFLOW);
+    *token = PartitionReadToken = ++PartitionReadSequence;
+    return 0;
+}
+int MSXsegStorage_hybridValidateReadWindow(uint64_t token)
+{
+    int k;
+    if (!token || token != PartitionReadToken)
+        return partitionReject(MSX_RESIDENT_ERR_ARGUMENT);
+    for (k = 1; k <= Hybrid.nLinks && Hybrid.opened; ++k)
+        if (!Hybrid.pipe[k].partition.valid && partitionRefresh(k, token))
+            return ERR_PIPE_RING_CAPACITY;
+    return 0;
+}
+int MSXsegStorage_hybridEndReadWindow(uint64_t token)
+{
+    if (!token || token != PartitionReadToken)
+        return partitionReject(MSX_RESIDENT_ERR_ARGUMENT);
+    PartitionReadToken = 0;
+    return 0;
+}
+/* C08a isolated development: only these bounded writers may preserve a
+   continuity proof. The generic CommitTopologyChange always invalidates.
+   A token obtained from an invalid view can never certify a new interval. */
+enum { PART_CPU_APPEND, PART_CPU_REMOVE_HEAD, PART_PROMOTE_DOWN,
+       PART_PROMOTE_UP, PART_DEMOTE_DOWN, PART_DEMOTE_UP, PART_CORE_REMOVE,
+       PART_CLEAR };
+typedef struct {
+    MSXHybridPartitionView before;
+    Pseg oldSegment, newSegment, down, up;
+    int kind, trusted;
+} PartitionProof;
+static uint64_t IncrementalPublished, IncrementalFallback;
+static int partitionProofBegin(int k,int kind,Pseg oldSegment,Pseg newSegment,
+                               PartitionProof *proof)
+{
+    HybridPipe *p=&Hybrid.pipe[k];const MSXHybridPartitionView *v=&p->partition;
+    memset(proof,0,sizeof(*proof));proof->kind=kind;
+    proof->oldSegment=oldSegment;proof->newSegment=newSegment;
+    if(oldSegment){proof->down=oldSegment->next;proof->up=oldSegment->prev;}
+    if(!v->valid||!v->continuityProven)return 0;
+    if(v->lifecycle!=PartitionLifecycle||v->coreCount!=p->count||
+       v->head!=p->head||v->tail!=p->tail||v->orient!=p->orient||
+       (v->coreCount&&(!v->firstCore||!v->lastCore||
+         v->firstCore->hybridId!=v->firstCoreId||v->lastCore->hybridId!=v->lastCoreId)))
+        return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    if(kind==PART_PROMOTE_DOWN||kind==PART_PROMOTE_UP) {
+        /* Empty Core creation is an explicit complex fallback, never an
+           endpoint-only continuity certification. */
+        if(!v->coreCount)return 0;
+        if(!oldSegment||oldSegment->inHybridCore||
+           oldSegment!=(kind==PART_PROMOTE_DOWN?v->firstCore->next:v->lastCore->prev))
+            return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    } else if(kind==PART_DEMOTE_DOWN||kind==PART_DEMOTE_UP||kind==PART_CORE_REMOVE) {
+        if(!oldSegment||!oldSegment->inHybridCore||
+           oldSegment!=(kind==PART_DEMOTE_UP?v->lastCore:v->firstCore)||
+           (kind==PART_CORE_REMOVE&&MSX.FirstSeg[k]!=oldSegment))
+            return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    } else if(kind==PART_CPU_REMOVE_HEAD) {
+        if(!oldSegment||oldSegment->inHybridCore||MSX.FirstSeg[k]!=oldSegment)
+            return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    }
+    proof->before=*v;proof->trusted=TRUE;return 0;
+}
+static int partitionProofPublish(int k,const PartitionProof *proof)
+{
+    HybridPipe *p=&Hybrid.pipe[k];MSXHybridPartitionView v=proof->before;
+    int count=v.coreCount;Pseg first=v.firstCore,last=v.lastCore;
+    if(!proof->trusted){if(IncrementalFallback!=UINT64_MAX)++IncrementalFallback;return 0;}
+    if(proof->kind==PART_PROMOTE_DOWN){++count;first=proof->newSegment;}
+    else if(proof->kind==PART_PROMOTE_UP){++count;last=proof->newSegment;}
+    else if(proof->kind==PART_DEMOTE_DOWN||proof->kind==PART_CORE_REMOVE){--count;first=proof->up;}
+    else if(proof->kind==PART_DEMOTE_UP){--count;last=proof->down;}
+    else if(proof->kind==PART_CLEAR){count=0;first=last=NULL;}
+    if(!count)first=last=NULL;
+    if(v.lifecycle!=PartitionLifecycle||v.revision==UINT64_MAX||
+       p->partition.revision!=v.revision+1||count!=p->count||
+       (count&&(p->head<0||p->head>=p->cap||p->tail<0||p->tail>=p->cap||
+         p->view[p->head]!=first||p->view[p->tail]!=last||
+         !first->inHybridCore||!last->inHybridCore||
+         first->ownerLink!=k||last->ownerLink!=k))||
+       (!count&&(p->head!=-1||p->tail!=-1))) {
+        MSXresident_poison();return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    }
+    v.revision=p->partition.revision;v.coreCount=count;
+    v.head=p->head;v.tail=p->tail;v.orient=p->orient;
+    v.firstCore=first;v.lastCore=last;
+    v.firstCoreId=first?first->hybridId:0;v.lastCoreId=last?last->hybridId:0;
+    v.valid=v.continuityProven=TRUE;p->partition=v;
+    if(IncrementalPublished!=UINT64_MAX)++IncrementalPublished;
+    return 0;
+}
+void MSXsegStorage_hybridIncrementalMetrics(uint64_t *published,
+                                          uint64_t *fallback)
+{
+    if(published)*published=IncrementalPublished;
+    if(fallback)*fallback=IncrementalFallback;
+}
+static int hybridCaptureEndpointSnapshot(int k, RebalanceSnapshot *s);
+int MSXsegStorage_hybridCaptureIncrementalSnapshotReadOnly(int k,
+                                      MSXHybridRebalanceSnapshot *snapshot)
+{
+    return hybridCaptureEndpointSnapshot(k, snapshot);
+}
+int MSXsegStorage_hybridAppendCpuBoundary(int k,Pseg segment)
+{
+    PartitionProof proof;
+    if(!MSXsegStorage_isHybridLink(k)||!segment||segment->inHybridCore)
+        return ERR_PIPE_RING_CAPACITY;
+    if(segment->next||segment->prev||segment==MSX.FirstSeg[k]||segment==MSX.LastSeg[k]||
+       (segment->hybridSlot>=0&&segment->hybridSlot<Hybrid.pipe[k].cap&&
+        Hybrid.pipe[k].view[segment->hybridSlot]==segment))
+        return partitionReject(MSX_RESIDENT_ERR_GENERATION);
+    if(MSXsegStorage_hybridPrepareTopologyChange(k,1)||
+       partitionProofBegin(k,PART_CPU_APPEND,NULL,segment,&proof))return ERR_PIPE_RING_CAPACITY;
+    segment->prev=NULL;segment->next=MSX.LastSeg[k];
+    if(segment->next)segment->next->prev=segment;else MSX.FirstSeg[k]=segment;
+    MSX.LastSeg[k]=segment;++MSX.Link[k].nsegs;
+    MSXsegStorage_hybridCommitTopologyChange(k);
+    return partitionProofPublish(k,&proof);
+}
+int MSXsegStorage_hybridRemoveCpuHead(int k,Pseg segment)
+{
+    PartitionProof proof;
+    if(!MSXsegStorage_isHybridLink(k)||!segment||segment->inHybridCore||MSX.FirstSeg[k]!=segment)
+        return ERR_PIPE_RING_CAPACITY;
+    if(MSXsegStorage_hybridPrepareTopologyChange(k,1)||
+       partitionProofBegin(k,PART_CPU_REMOVE_HEAD,segment,NULL,&proof))return ERR_PIPE_RING_CAPACITY;
+    MSX.FirstSeg[k]=segment->prev;
+    if(MSX.FirstSeg[k])MSX.FirstSeg[k]->next=NULL;else MSX.LastSeg[k]=NULL;
+    --MSX.Link[k].nsegs;segment->next=segment->prev=NULL;
+    MSXsegStorage_hybridCommitTopologyChange(k);
+    return partitionProofPublish(k,&proof);
+}
+#if defined(MSX_RESIDENT_TEST_API) || defined(MSX_RESIDENT_PARTITION_TEST_API)
+int MSXsegStorage_testPartitionCounters(int k, uint64_t lifecycle,
+                                      uint64_t revision, uint64_t sequence)
+{
+    if (PartitionReadToken || !MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    PartitionLifecycle = lifecycle; PartitionReadSequence = sequence;
+    Hybrid.pipe[k].partition.revision = revision;
+    Hybrid.pipe[k].partition.valid = FALSE;
+    return 0;
+}
+#endif
 
 enum {
     HYBRID_REBALANCE_NONE = 0,
@@ -443,6 +755,7 @@ static int hybridResidentReverse(int k)
    the Resident metadata commit rejects the orientation change. */
 static void hybridRollbackListReverse(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     Pseg seg, next, previous = NULL;
     if (k <= 0 || k > MSX.Nobjects[LINK]) return;
     seg = MSX.FirstSeg[k];
@@ -556,7 +869,9 @@ static void hybridFreePipe(HybridPipe *p)
 {
     int i;
     if (!p) return;
-    if (p->view)
+    if (p->allocationKind == HYBRID_OBJECTS_SLAB)
+    { FREE(p->coreSlab); }
+    else if (p->view)
     {
         for (i = 0; i < p->cap; i++) FREE(p->view[i]);
     }
@@ -572,8 +887,10 @@ static void hybridFreePipe(HybridPipe *p)
     FREE(p->coreSlotForResident);
     FREE(p->mapScratchResident);
     FREE(p->mapScratchCore);
-    FREE(p->observerId);
-    FREE(p->observerPayload);
+    if(p->observerAllocationKind==HYBRID_OBSERVER_PRIVATE){
+        FREE(p->observerId);
+        FREE(p->observerPayload);
+    }
     if (p->residentTx)
     {
         FREE(p->residentTx->oldCore); FREE(p->residentTx->boundary);
@@ -620,6 +937,8 @@ static void hybridClear(void)
     FREE(Hybrid.demoteItem);
     FREE(Hybrid.demoteTargets);
     FREE(Hybrid.rebalanceSnapshot);
+    FREE(Hybrid.initialScratchId);
+    FREE(Hybrid.initialScratchPayload);
     FREE(Hybrid.pipe);
     memset(&Hybrid, 0, sizeof(Hybrid));
 }
@@ -656,13 +975,24 @@ static void hybridWriteTiming(void)
     }
 }
 
-static int hybridAllocPipe(HybridPipe *p, int cap)
+static int hybridAllocPipe(HybridPipe *p, int cap, int fixedResidentMetadata)
 {
     int i;
     size_t slots, rows;
     if (!p || cap <= 0) return ERR_MEMORY;
+    p->allocationKind = fixedResidentMetadata ? HYBRID_OBJECTS_SLAB :
+                                              HYBRID_OBJECTS_INDIVIDUAL;
+    p->observerAllocationKind = Hybrid.sharedInitialObserver ?
+        HYBRID_OBSERVER_SHARED : HYBRID_OBSERVER_PRIVATE;
     slots = (size_t)cap;
+    /* Check the complete object allocation, including its real allocator
+       header, before multiplying or forming slab interior pointers. */
+    if (Hybrid.stride <= 0 || slots > SIZE_MAX / (size_t)Hybrid.stride ||
+        slots > (SIZE_MAX - MSXresidentAlloc_headerBytes()) / sizeof(struct Sseg))
+        return ERR_MEMORY;
     rows = slots * (size_t)Hybrid.stride;
+    if (rows > (SIZE_MAX - MSXresidentAlloc_headerBytes()) / sizeof(double))
+        return ERR_MEMORY;
     p->cap = cap;
     p->head = -1;
     p->tail = -1;
@@ -678,16 +1008,22 @@ static int hybridAllocPipe(HybridPipe *p, int cap)
     p->dresponse = (double *)calloc(slots, sizeof(double));
     p->residentSlot = (int *)malloc(slots * sizeof(int));
     p->coreSlotForResident = (int *)malloc(slots * sizeof(int));
-    p->mapScratchResident = (int *)malloc(slots * sizeof(int));
-    p->mapScratchCore = (int *)malloc(slots * sizeof(int));
-    p->observerId = (uint64_t *)calloc(slots, sizeof(uint64_t));
-    p->observerPayload = (MSXResidentPayload *)calloc(slots, sizeof(MSXResidentPayload));
+    /* Only the legacy observer rebuilds these inverse maps. Metadata-only
+       Resident rejects that observer before its map-sync consumer. */
+    if(!fixedResidentMetadata){
+        p->mapScratchResident = (int *)malloc(slots * sizeof(int));
+        p->mapScratchCore = (int *)malloc(slots * sizeof(int));
+    }
+    if(p->observerAllocationKind==HYBRID_OBSERVER_PRIVATE){
+        p->observerId = (uint64_t *)calloc(slots, sizeof(uint64_t));
+        p->observerPayload = (MSXResidentPayload *)calloc(slots, sizeof(MSXResidentPayload));
+    }
     p->residentTx = (HybridResidentTx *)calloc(1, sizeof(HybridResidentTx));
     if (!p->used || !p->view || (!Hybrid.metadataOnly&&(!p->c || !p->lastc)) || !p->v ||
         !p->hstep || !p->hresponse || !p->uresponse || !p->dresponse ||
         !p->residentSlot || !p->coreSlotForResident ||
-        !p->mapScratchResident || !p->mapScratchCore ||
-        !p->observerId || !p->observerPayload || !p->residentTx)
+        (!fixedResidentMetadata&&(!p->mapScratchResident || !p->mapScratchCore)) ||
+        (p->observerAllocationKind==HYBRID_OBSERVER_PRIVATE&&(!p->observerId || !p->observerPayload)) || !p->residentTx)
     {
         hybridFreePipe(p);
         return ERR_MEMORY;
@@ -704,11 +1040,17 @@ static int hybridAllocPipe(HybridPipe *p, int cap)
         hybridFreePipe(p);
         return ERR_MEMORY;
     }
+    if (p->allocationKind == HYBRID_OBJECTS_SLAB)
+    {
+        p->coreSlab = (Pseg)calloc(slots, sizeof(struct Sseg));
+        if (!p->coreSlab) { hybridFreePipe(p); return ERR_MEMORY; }
+    }
     for (i = 0; i < cap; i++)
     {
         p->residentSlot[i] = -1;
         p->coreSlotForResident[i] = -1;
-        p->view[i] = (Pseg)calloc(1, sizeof(struct Sseg));
+        p->view[i] = p->allocationKind == HYBRID_OBJECTS_SLAB ?
+            p->coreSlab + i : (Pseg)calloc(1, sizeof(struct Sseg));
         if (!p->view[i])
         {
             hybridFreePipe(p);
@@ -794,7 +1136,7 @@ static int hybridEnsureCapacity(int k, int need)
         cap = MIN(MSX.MaxSegments, cap * 2);
     }
     if (cap < need) return ERR_PIPE_RING_CAPACITY;
-    if (oldcap == 0) return hybridAllocPipe(p, cap);
+    if (oldcap == 0) return hybridAllocPipe(p, cap, FALSE);
 
     newrow = (size_t)cap * (size_t)Hybrid.stride;
     newc = (double *)calloc(newrow, sizeof(double));
@@ -921,11 +1263,16 @@ static int hybridEnsureCapacity(int k, int need)
 
 int MSXsegStorage_hybridReserve(const MSXResidentLayout *layout)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int k, err;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return 0;
     if (!layout || layout->nLinks != (uint32_t)Hybrid.nLinks || !layout->capacity ||
         !layout->guard)
         return ERR_PIPE_RING_CAPACITY;
+    /* Capture initialization ownership before the first reserve allocation.
+       Closing or later toggling DirectInitialPlanning cannot change owners. */
+    if(!Hybrid.demoteCapacity)
+        Hybrid.sharedInitialObserver=Hybrid.metadataOnly&&MSXresidentRuntime_directInitialPlanning();
     uint32_t boundaryCapacity = MSX.GpuCoreMode==2?
         MSXresidentPool_initial(layout->totalSlots):layout->totalSlots;
     {MSXResidentBudget cpu;uint64_t limit,objectBytes=sizeof(struct Sseg)+2*(uint64_t)Hybrid.stride*sizeof(double)+13;
@@ -1034,13 +1381,24 @@ int MSXsegStorage_hybridReserve(const MSXResidentLayout *layout)
         /* Resident capacity is a contract, not a growth hint.  Reserve the
            exact CSV capacity before hybridization so preflight and GPU row
            ownership use the same bound. */
-        err = p->cap == 0 ? hybridAllocPipe(p, cap) : 0;
+        err = p->cap == 0 ? hybridAllocPipe(p, cap, Hybrid.metadataOnly) : 0;
         if (err) return err;
         p->fixedCap = TRUE;
         p->admissionLimit = layout->admissionLimit ? (int)layout->admissionLimit[k] : cap;
         if (p->admissionLimit < 0 || p->admissionLimit > cap)
             return ERR_PIPE_RING_CAPACITY;
         p->guard = guard;
+    }
+    if(Hybrid.sharedInitialObserver){
+        uint32_t maximum=0;
+        for(k=1;k<=Hybrid.nLinks;++k){
+            HybridPipe *p=&Hybrid.pipe[k];
+            uint32_t total=MSXqual_pipeVolume(&MSX.Link[k])>0.0?(uint32_t)MIN(100,MSX.MaxSegments):0;
+            uint32_t count=total>2*(uint32_t)p->guard?total-2*(uint32_t)p->guard:0;
+            if(count>(uint32_t)p->admissionLimit)count=(uint32_t)p->admissionLimit;
+            if(count>maximum)maximum=count;
+        }
+        return hybridReserveInitialScratch(maximum);
     }
     return 0;
 }
@@ -1050,13 +1408,22 @@ int MSXsegStorage_hybridReserve(const MSXResidentLayout *layout)
    rows, so this prepare phase cannot grow storage. */
 int MSXsegStorage_hybridStageDirectInitialPipe(int k,uint32_t total,double volume,const double *c)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
+    if (MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return ERR_PIPE_RING_CAPACITY;
     HybridPipe *p;uint32_t ns,coreCount,guard;
+    uint64_t *initialId;MSXResidentPayload *initialPayload;
     if(!Hybrid.opened||!Hybrid.metadataOnly||k<1||k>Hybrid.nLinks||!c)return ERR_PIPE_RING_CAPACITY;
     p=&Hybrid.pipe[k];guard=(uint32_t)hybridPipeGuard(p);
     if(!p->fixedCap||p->count||p->initialPrepared||p->directInitial)return ERR_PIPE_RING_CAPACITY;
     coreCount=total>2*guard?total-2*guard:0;
     if(!MSX.GpuCoreOverflow&&coreCount>(uint32_t)p->admissionLimit)return ERR_PIPE_RING_CAPACITY;
     if(coreCount>(uint32_t)p->admissionLimit)coreCount=(uint32_t)p->admissionLimit;
+    initialId=p->observerId;initialPayload=p->observerPayload;
+    if(p->observerAllocationKind==HYBRID_OBSERVER_SHARED){
+        if(coreCount>Hybrid.initialScratchCapacity)return ERR_PIPE_RING_CAPACITY;
+        initialId=Hybrid.initialScratchId;initialPayload=Hybrid.initialScratchPayload;
+    }
+    if(coreCount&&(!initialId||!initialPayload))return ERR_MEMORY;
     p->directInitial=TRUE;p->initialPrepared=TRUE;
     p->initialCount=coreCount;p->directCount=total;p->nextId=total;
     for(ns=0;ns<total;++ns){
@@ -1068,15 +1435,15 @@ int MSXsegStorage_hybridStageDirectInitialPipe(int k,uint32_t total,double volum
             parcel.c=parcel.lastc=(double *)c;
             hybridCopyBoundaryToSlot(k,(int)slot,&parcel);
             seg=p->view[slot];
-            p->observerId[slot]=id;
-            p->observerPayload[slot].volume=volume;
-            p->observerPayload[slot].hstep=0.0;
-            p->observerPayload[slot].hresponse=0.0;
-            p->observerPayload[slot].uresponse=0.0;
-            p->observerPayload[slot].dresponse=0.0;
-            p->observerPayload[slot].parcelId=id;
-            p->observerPayload[slot].c=c;
-            p->observerPayload[slot].lastc=c;
+            initialId[slot]=id;
+            initialPayload[slot].volume=volume;
+            initialPayload[slot].hstep=0.0;
+            initialPayload[slot].hresponse=0.0;
+            initialPayload[slot].uresponse=0.0;
+            initialPayload[slot].dresponse=0.0;
+            initialPayload[slot].parcelId=id;
+            initialPayload[slot].c=c;
+            initialPayload[slot].lastc=c;
         }else{
             seg=MSXqual_getFreeSeg(volume,(double *)c);
             if(!seg)return ERR_MEMORY;
@@ -1087,7 +1454,7 @@ int MSXsegStorage_hybridStageDirectInitialPipe(int k,uint32_t total,double volum
         p->directLast=seg;
     }
     HybridResidentStatus=MSXresident_stageInitialPipe((uint32_t)k,
-        coreCount?p->observerId:NULL,coreCount?p->observerPayload:NULL,coreCount,1);
+        coreCount?initialId:NULL,coreCount?initialPayload:NULL,coreCount,1);
     if(HybridResidentStatus!=MSX_RESIDENT_OK)
         return HybridResidentStatus==MSX_RESIDENT_ERR_MEMORY?ERR_MEMORY:ERR_PIPE_RING_CAPACITY;
     return 0;
@@ -1129,8 +1496,11 @@ void MSXsegStorage_hybridDirectInitialCounts(uint64_t *pipes,uint64_t *cpu,uint6
 
 int MSXsegStorage_hybridPrepareInitialImage(void)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int k;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return 0;
+    /* Direct-only sharing does not alter the compatibility prepare snapshot. */
+    if(Hybrid.sharedInitialObserver)return ERR_PIPE_RING_CAPACITY;
     for (k = 1; k <= Hybrid.nLinks; ++k)
     {
         HybridPipe *p = &Hybrid.pipe[k]; Pseg seg; int total = 0, pos;
@@ -1143,6 +1513,7 @@ int MSXsegStorage_hybridPrepareInitialImage(void)
         if (MSX.GpuCoreOverflow && p->initialCount > (uint32_t)p->admissionLimit)
             p->initialCount = (uint32_t)p->admissionLimit;
         if (p->initialCount > (uint32_t)p->admissionLimit) goto bad;
+        if (MSXsegStorage_hybridPrepareTopologyChange(k,p->initialCount)) goto bad;
         seg = MSX.FirstSeg[k];
         for (pos = 0; pos < guard && seg; ++pos) seg = seg->prev;
         for (pos = 0; pos < (int)p->initialCount; ++pos)
@@ -1172,8 +1543,13 @@ bad:
    entirely untouched until the runtime has completed every GPU fallible step. */
 int MSXsegStorage_hybridStageInitialImage(void)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int k;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return 0;
+    if(Hybrid.sharedInitialObserver)return ERR_PIPE_RING_CAPACITY;
+    for (k = 1; k <= Hybrid.nLinks; ++k)
+        if (MSXsegStorage_hybridPrepareTopologyChange(k,Hybrid.pipe[k].initialCount))
+            return ERR_PIPE_RING_CAPACITY;
     for (k = 1; k <= Hybrid.nLinks; ++k)
     {
         HybridPipe *p = &Hybrid.pipe[k];
@@ -1192,10 +1568,13 @@ int MSXsegStorage_hybridStageInitialImage(void)
    in prepare; this is deliberately only bounded stores/list rewiring/free. */
 int MSXsegStorage_hybridCommitInitialImage(void)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int k, i;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return 0;
     if(Hybrid.pipe[1].directInitial){
         int error=MSXsegStorage_hybridValidateDirectInitial();if(error)return error;
+        for(k=1;k<=Hybrid.nLinks;++k)
+            if(MSXsegStorage_hybridPrepareTopologyChange(k,1))return ERR_PIPE_RING_CAPACITY;
         for(k=1;k<=Hybrid.nLinks;++k){
             HybridPipe *p=&Hybrid.pipe[k];
             for(i=0;i<(int)p->initialCount;++i){
@@ -1207,6 +1586,7 @@ int MSXsegStorage_hybridCommitInitialImage(void)
             MSX.Link[k].nsegs=(int)p->directCount;
             p->directFirst=p->directLast=NULL;p->directInitial=FALSE;
             p->directCount=p->initialCount=0;p->initialPrepared=FALSE;
+            MSXsegStorage_hybridCommitTopologyChange(k);
         }
         return 0;
     }
@@ -1214,6 +1594,8 @@ int MSXsegStorage_hybridCommitInitialImage(void)
     for (k = 1; k <= Hybrid.nLinks; ++k)
     {
         HybridPipe *p = &Hybrid.pipe[k]; Pseg seg = MSX.FirstSeg[k];
+        if (MSXsegStorage_hybridPrepareTopologyChange(k,p->initialCount))
+            return ERR_PIPE_RING_CAPACITY;
         if (!p->initialPrepared || p->count || p->initialCount > (uint32_t)p->cap)
             return ERR_PIPE_RING_CAPACITY;
         for (i = 0; i < hybridPipeGuard(p) && seg; ++i) seg = seg->prev;
@@ -1251,6 +1633,7 @@ int MSXsegStorage_hybridCommitInitialImage(void)
 
 void MSXsegStorage_hybridAbortInitialImage(void)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     int k;
     if (!Hybrid.opened) return;
     for (k = 1; k <= Hybrid.nLinks; ++k)
@@ -1346,6 +1729,7 @@ static int hybridCopySlotToBoundary(int k, int slot, Pseg dst)
 int MSXsegStorage_hybridMaterializeResident(uint32_t linkIndex, uint32_t slot,
                                              uint32_t generation, Pseg *segment)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     MSXResidentPayload payload;
     Pseg boundary;
     int boundaryStatus;
@@ -1414,6 +1798,7 @@ static int hybridResidentTxContains(const HybridResidentTx *t, Pseg s)
 void MSXsegStorage_hybridAbortPreparedResidentMaterialization(
     MSXHybridResidentMaterialization *token)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     HybridResidentTx *t;
     uint32_t i;
     if (!token || !(t = (HybridResidentTx *)token->opaque)) return;
@@ -1436,6 +1821,7 @@ int MSXsegStorage_hybridPrepareResidentMaterialization(
     const MSXResidentHandoffPlan *plan, const MSXResidentHandoffResult *result,
     Pseg *boundary, uint32_t count, MSXHybridResidentMaterialization *token)
 {
+    if (!plan || MSXsegStorage_hybridPrepareTopologyChange((int)plan->linkIndex, 1)) return ERR_PIPE_RING_CAPACITY;
     HybridResidentTx *t; uint32_t i; int slot;
     if (!token || token->opaque ||
         !MSXsegStorage_hybridValidateResidentMaterialization(plan, result, boundary, count)) return ERR_PIPE_RING_CAPACITY;
@@ -1444,6 +1830,8 @@ int MSXsegStorage_hybridPrepareResidentMaterialization(
     t->pipe = &Hybrid.pipe[plan->linkIndex]; t->linkIndex = plan->linkIndex;
     t->count = count; t->boundarySide = plan->boundarySide;
     t->active = TRUE;
+    t->lifecycle = PartitionLifecycle;
+    t->revision = t->pipe->partition.revision;
     t->oldHead = t->pipe->head; t->oldTail = t->pipe->tail; t->oldCount = t->pipe->count;
     slot = plan->boundarySide ? t->oldTail : t->oldHead;
     for (i = 0; i < count; ++i)
@@ -1458,8 +1846,11 @@ int MSXsegStorage_hybridPrepareResidentMaterialization(
 int MSXsegStorage_hybridValidatePreparedResidentMaterialization(
     const MSXHybridResidentMaterialization *token)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return 0;
     HybridResidentTx *t; uint32_t i;
     if (!token || !(t = (HybridResidentTx *)token->opaque) || !t->pipe ||
+        t->lifecycle != PartitionLifecycle || t->revision != t->pipe->partition.revision ||
+        t->pipe->partition.revision == UINT64_MAX ||
         t->pipe->count != t->oldCount || t->pipe->head != t->oldHead || t->pipe->tail != t->oldTail) return 0;
     for (i = 0; i < t->count; ++i)
         if (!t->boundary[i] || t->slot[i] < 0 || t->slot[i] >= t->pipe->cap ||
@@ -1472,9 +1863,13 @@ int MSXsegStorage_hybridValidatePreparedResidentMaterialization(
 void MSXsegStorage_hybridCommitPreparedResidentMaterialization(
     MSXHybridResidentMaterialization *token)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     HybridResidentTx *t = token ? (HybridResidentTx *)token->opaque : NULL;
     uint32_t i; Pseg bottom, top, down, up;
     if (!t) return; /* final validation is a required precondition. */
+    if (!MSXsegStorage_hybridValidatePreparedResidentMaterialization(token)) {
+        partitionReject(MSX_RESIDENT_ERR_GENERATION); return;
+    }
     bottom = t->boundarySide ? t->boundary[t->count - 1] : t->boundary[0];
     top = t->boundarySide ? t->boundary[0] : t->boundary[t->count - 1];
     down = t->boundarySide ? t->down[t->count - 1] : t->down[0];
@@ -1511,6 +1906,7 @@ void MSXsegStorage_hybridCommitPreparedResidentMaterialization(
     else if (!t->boundarySide) t->pipe->head = t->nextEndpoint;
     else t->pipe->tail = t->nextEndpoint;
     for (i = 0; i < t->count; ++i) t->boundary[i] = NULL;
+    MSXsegStorage_hybridCommitTopologyChange((int)t->linkIndex);
     MSXsegStorage_hybridAbortPreparedResidentMaterialization(token);
 }
 
@@ -1538,6 +1934,7 @@ static void hybridReplaceInList(int k, Pseg oldseg, Pseg newseg)
     else MSX.LastSeg[k] = newseg;
     oldseg->next = NULL;
     oldseg->prev = NULL;
+    MSXsegStorage_hybridCommitTopologyChange(k);
 }
 
 static void hybridFindCore(HybridPipe *p, int k, Pseg *firstCore,
@@ -1579,12 +1976,17 @@ static void hybridFindCore(HybridPipe *p, int k, Pseg *firstCore,
 /* Capture the authoritative CPU topology once for a Resident Rebalance
    round.  This deliberately does not call hybridFindCore: the latter remains
    the legacy/non-Resident and audit rescan seam. */
-static void hybridCaptureRebalanceSnapshot(int k, RebalanceSnapshot *s)
+int MSXsegStorage_hybridCaptureSnapshotReadOnly(int k,
+                                              MSXHybridRebalanceSnapshot *s)
 {
-    HybridPipe *p = &Hybrid.pipe[k];
-    Pseg seg;
-    int nDown = 0, nUp = 0, nCore = 0, total = 0, seenCore = FALSE;
+    const HybridPipe *p;
+    Pseg seg, previous = NULL;
+    int nDown = 0, nUp = 0, nCore = 0, total = 0, seenCore = FALSE,
+        passedCore = FALSE;
 
+    if (!s || !MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[k];
+    if (MSX.Link[k].nsegs < 0) return ERR_PIPE_RING_CAPACITY;
     memset(s, 0, sizeof(*s));
     s->linkIndex = k;
     s->head = -1;
@@ -1593,22 +1995,37 @@ static void hybridCaptureRebalanceSnapshot(int k, RebalanceSnapshot *s)
     s->guard = hybridPipeGuard(p);
     for (seg = MSX.FirstSeg[k]; seg; seg = seg->prev)
     {
+        /* Reject a cycle, broken backlink or interleaved CPU row before a
+           caller can publish corrected counters and mask the contradiction. */
+        if (total >= MSX.Link[k].nsegs || seg->next != previous)
+            return ERR_PIPE_RING_CAPACITY;
         ++total;
         if (seg->inHybridCore)
         {
+            ++s->scanCoreVisits;
+            if (passedCore || seg->ownerLink != k || !seg->hybridId ||
+                seg->hybridSlot < 0 || seg->hybridSlot >= p->cap ||
+                !p->used[seg->hybridSlot] || p->view[seg->hybridSlot] != seg ||
+                (s->lastCore && hybridNextSlot(p,s->lastCore->hybridSlot) != seg->hybridSlot))
+                return ERR_PIPE_RING_CAPACITY;
             if (!s->firstCore) s->firstCore = seg;
             s->lastCore = seg;
             ++nCore;
             seenCore = TRUE;
         }
-        else if (!seenCore) ++nDown;
-        else ++nUp;
+        else if (!seenCore) { ++nDown; ++s->scanBoundaryVisits; }
+        else { ++nUp; ++s->scanBoundaryVisits; passedCore = TRUE; }
+        previous = seg;
     }
+    if (total != MSX.Link[k].nsegs || previous != MSX.LastSeg[k] ||
+        nCore != p->count) return ERR_PIPE_RING_CAPACITY;
     s->total = total;
     s->coreCount = nCore;
     /* With no Core, all segments are the canonical downstream boundary. */
     s->downCount = nCore ? nDown : total;
     s->upCount = nCore ? nUp : 0;
+    s->captureCoreRows = (uint64_t)nCore;
+    s->captureBackend = MSX_SNAPSHOT_SERIAL_FULL;
     if (s->firstCore)
     {
         s->head = s->firstCore->hybridSlot;
@@ -1616,17 +2033,157 @@ static void hybridCaptureRebalanceSnapshot(int k, RebalanceSnapshot *s)
         s->firstCoreId = s->firstCore->hybridId;
         s->lastCoreId = s->lastCore->hybridId;
     }
+    return 0;
+}
+
+static int hybridCaptureEndpointSnapshot(int k, RebalanceSnapshot *s)
+{
+    const HybridPipe *p;
+    const MSXHybridPartitionView *v;
+    Pseg seg, previous = NULL;
+    int down = 0, up = 0;
+    if (!s || !MSXsegStorage_isHybridLink(k)) return ERR_PIPE_RING_CAPACITY;
+    p = &Hybrid.pipe[k]; v = &p->partition;
+    if (!v->valid) return MSXsegStorage_hybridCaptureSnapshotReadOnly(k, s);
+    /* Pure capture must never call the accessor's shared error publisher. */
+    if (!v->continuityProven || v->lifecycle != PartitionLifecycle ||
+        v->coreCount != p->count || v->coreCount < 0 || MSX.Link[k].nsegs < 0 ||
+        v->head != p->head || v->tail != p->tail || v->orient != p->orient)
+        return ERR_PIPE_RING_CAPACITY;
+    if (!v->coreCount) return MSXsegStorage_hybridCaptureSnapshotReadOnly(k, s);
+    if (!v->firstCore || !v->lastCore ||
+        !v->firstCore->inHybridCore || !v->lastCore->inHybridCore ||
+        v->firstCore->ownerLink != k || v->lastCore->ownerLink != k ||
+        v->firstCore->hybridId != v->firstCoreId || v->lastCore->hybridId != v->lastCoreId ||
+        v->firstCore->hybridSlot != v->head || v->lastCore->hybridSlot != v->tail ||
+        v->head < 0 || v->head >= p->cap || v->tail < 0 || v->tail >= p->cap ||
+        !p->used[v->head] || !p->used[v->tail] ||
+        p->view[v->head] != v->firstCore || p->view[v->tail] != v->lastCore)
+        return ERR_PIPE_RING_CAPACITY;
+    memset(s, 0, sizeof(*s));
+    s->linkIndex = k; s->orient = p->orient; s->guard = hybridPipeGuard(p);
+    for (seg = MSX.FirstSeg[k]; seg && seg != v->firstCore; seg = seg->prev) {
+        if (down >= MSX.Link[k].nsegs || seg->next != previous || seg->inHybridCore)
+            return ERR_PIPE_RING_CAPACITY;
+        ++down; previous = seg;
+    }
+    if (!seg || seg->next != previous) return ERR_PIPE_RING_CAPACITY;
+    previous = v->lastCore;
+    for (seg = v->lastCore->prev; seg; seg = seg->prev) {
+        if ((uint64_t)down + (uint64_t)v->coreCount + (uint64_t)up >= (uint64_t)MSX.Link[k].nsegs ||
+            seg->next != previous || seg->inHybridCore) return ERR_PIPE_RING_CAPACITY;
+        ++up; previous = seg;
+    }
+    if ((uint64_t)down + (uint64_t)v->coreCount + (uint64_t)up != (uint64_t)MSX.Link[k].nsegs ||
+        previous != MSX.LastSeg[k]) return ERR_PIPE_RING_CAPACITY;
+    s->total = MSX.Link[k].nsegs; s->coreCount = v->coreCount;
+    s->downCount = down; s->upCount = up; s->head = v->head; s->tail = v->tail;
+    s->firstCore = v->firstCore; s->lastCore = v->lastCore;
+    s->firstCoreId = v->firstCoreId; s->lastCoreId = v->lastCoreId;
+    s->scanBoundaryVisits = (uint64_t)down + (uint64_t)up;
+    s->captureCoreRows = (uint64_t)v->coreCount;
+    s->captureTrusted = TRUE;
+    s->captureBackend = MSX_SNAPSHOT_ENDPOINT_BOUNDARY;
+    return 0;
+}
+
+int MSXsegStorage_hybridCaptureSnapshotBackend(int k, int backend, RebalanceSnapshot *s)
+{
+    int err;
+    if (backend < MSX_SNAPSHOT_SERIAL_FULL || backend > MSX_SNAPSHOT_ENDPOINT_BOUNDARY)
+        return ERR_PIPE_RING_CAPACITY;
+    if (s) memset(s, 0, sizeof(*s));
+    if (backend == MSX_SNAPSHOT_ENDPOINT_BOUNDARY) return hybridCaptureEndpointSnapshot(k, s);
+    /* Only an existing proven certificate permits the pure Boundary leaf.
+       Invalid/complex mutations retain the selected full fallback. A valid
+       contradictory certificate is an error, never a reason to repair it. */
+    if (MSXsegStorage_isHybridLink(k) && Hybrid.pipe[k].partition.valid)
+        err = hybridCaptureEndpointSnapshot(k, s);
+    else err = MSXsegStorage_hybridCaptureSnapshotReadOnly(k, s);
+    if (!err) s->captureBackend = backend;
+    return err;
+}
+
+typedef struct {
+    uint64_t links, coreVisits, boundaryVisits;
+    double finishedMs;
+    int used;
+} SnapshotThreadMetric;
+
+static int hybridCaptureSnapshotBatch(int backend,
+    MSXHybridRebalanceSnapshot *drafts, size_t capacity,
+    SnapshotThreadMetric *threads, size_t threadCapacity, double regionStart)
+{
+    int k;
+    if (!drafts || Hybrid.nLinks < 0 || capacity <= (size_t)Hybrid.nLinks ||
+        backend < MSX_SNAPSHOT_SERIAL_FULL || backend > MSX_SNAPSHOT_ENDPOINT_BOUNDARY)
+        return ERR_PIPE_RING_CAPACITY;
+    if (backend == MSX_SNAPSHOT_OMP_STATIC || backend == MSX_SNAPSHOT_OMP_DYNAMIC16) {
+#ifdef _OPENMP
+        if (threads && threadCapacity < (size_t)omp_get_max_threads()) return ERR_MEMORY;
+        if (backend == MSX_SNAPSHOT_OMP_STATIC) {
+#pragma omp parallel
+          {
+            SnapshotThreadMetric metric = {0};
+#pragma omp for schedule(static) nowait
+            for (k = 1; k <= Hybrid.nLinks; ++k) {
+                int e = MSXsegStorage_hybridCaptureSnapshotBackend(k, backend, &drafts[k]);
+                drafts[k].captureStatus = e;
+                if (threads) { ++metric.links; metric.coreVisits += drafts[k].scanCoreVisits;
+                    metric.boundaryVisits += drafts[k].scanBoundaryVisits; }
+            }
+            if (threads) { metric.used = 1; metric.finishedMs = MSXgpu_wallTimeMs() - regionStart;
+                threads[omp_get_thread_num()] = metric; }
+          }
+        } else {
+#pragma omp parallel
+          {
+            SnapshotThreadMetric metric = {0};
+#pragma omp for schedule(dynamic,16) nowait
+            for (k = 1; k <= Hybrid.nLinks; ++k) {
+                int e = MSXsegStorage_hybridCaptureSnapshotBackend(k, backend, &drafts[k]);
+                drafts[k].captureStatus = e;
+                if (threads) { ++metric.links; metric.coreVisits += drafts[k].scanCoreVisits;
+                    metric.boundaryVisits += drafts[k].scanBoundaryVisits; }
+            }
+            if (threads) { metric.used = 1; metric.finishedMs = MSXgpu_wallTimeMs() - regionStart;
+                threads[omp_get_thread_num()] = metric; }
+          }
+        }
+#else
+        return ERR_PIPE_RING_CAPACITY;
+#endif
+    } else {
+        for (k = 1; k <= Hybrid.nLinks; ++k) {
+            int e = MSXsegStorage_hybridCaptureSnapshotBackend(k, backend, &drafts[k]);
+            drafts[k].captureStatus = e;
+        }
+    }
+    return 0;
+}
+
+int MSXsegStorage_hybridCaptureSnapshotsReadOnly(int backend,
+    MSXHybridRebalanceSnapshot *drafts, size_t capacity)
+{
+    return hybridCaptureSnapshotBatch(backend, drafts, capacity, NULL, 0, 0.0);
+}
+
+static void hybridPublishRebalanceSnapshot(int k, const RebalanceSnapshot *s)
+{
+    HybridPipe *p = &Hybrid.pipe[k];
     p->count = s->coreCount;
     p->downstreamBoundary = s->downCount;
     p->upstreamBoundary = s->upCount;
     p->head = s->head;
     p->tail = s->tail;
-    if (HybridRebalanceMetrics)
+    if (HybridRebalanceMetrics &&
+        MSX_REBALANCE_SNAPSHOT_BACKEND != MSX_SNAPSHOT_OMP_STATIC &&
+        MSX_REBALANCE_SNAPSHOT_BACKEND != MSX_SNAPSHOT_OMP_DYNAMIC16)
     {
         ++HybridRebalanceMetrics->scan_passes;
-        HybridRebalanceMetrics->core_visits += (uint64_t)s->coreCount;
+        HybridRebalanceMetrics->core_visits += s->scanCoreVisits;
         HybridRebalanceMetrics->boundary_visits +=
-            (uint64_t)s->downCount + (uint64_t)s->upCount;
+            s->scanBoundaryVisits;
     }
 }
 
@@ -1775,17 +2332,23 @@ int MSXsegStorage_hybridAuditSnapshot(int k,
 
 static int hybridPromote(int k, Pseg boundary, int atHead)
 {
+    if (MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return ERR_PIPE_RING_CAPACITY;
     HybridPipe *p = &Hybrid.pipe[k];
+    PartitionProof proof;
+    int oldCapacity=p->cap;
     int slot, err;
     double timer = 0.0;
     int timing = MSXsegStorage_hybridTimingEnabled();
     int detail = MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DEMOTE);
     if (timing || detail) timer = MSXgpu_wallTimeMs();
     if (!boundary || boundary->inHybridCore) return 0;
+    if(partitionProofBegin(k,atHead?PART_PROMOTE_DOWN:PART_PROMOTE_UP,boundary,NULL,&proof))
+        return ERR_PIPE_RING_CAPACITY;
     /* Fixed resident capacity is checked before the first mutation. */
     if (p->fixedCap && p->count + 1 > p->admissionLimit) return ERR_PIPE_RING_CAPACITY;
     err = hybridEnsureCapacity(k, p->count + 1);
     if (err) return err;
+    if(p->cap!=oldCapacity)proof.trusted=FALSE; /* legitimate legacy growth */
     if (p->count == 0)
         slot = 0;
     else if (atHead)
@@ -1803,6 +2366,7 @@ static int hybridPromote(int k, Pseg boundary, int atHead)
     /* Publish the fallible Resident row first.  The remaining CPU writes are
        bounded stores/list rewiring and cannot leave a half-promoted slot. */
     if (hybridResidentInsert(k, slot, atHead, boundary)) return ERR_PIPE_RING_CAPACITY;
+    proof.newSegment=p->view[slot];
     hybridCopyBoundaryToSlot(k, slot, boundary);
     p->used[slot] = TRUE;
     p->count++;
@@ -1811,6 +2375,7 @@ static int hybridPromote(int k, Pseg boundary, int atHead)
     else p->tail = slot;
     hybridReplaceInList(k, boundary, p->view[slot]);
     MSXqual_removeSeg(boundary);
+    if(partitionProofPublish(k,&proof))return ERR_PIPE_RING_CAPACITY;
     if (HybridRebalanceMetrics)
     {
         if (HybridRebalanceStage == HYBRID_REBALANCE_EMPTY_INIT)
@@ -1825,7 +2390,9 @@ static int hybridPromote(int k, Pseg boundary, int atHead)
 
 static int hybridDemote(int k, int atHead)
 {
+    if (MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return ERR_PIPE_RING_CAPACITY;
     HybridPipe *p = &Hybrid.pipe[k];
+    PartitionProof proof;
     Pseg core, boundary;
     int slot, boundaryStatus;
     double timer = 0.0;
@@ -1835,6 +2402,8 @@ static int hybridDemote(int k, int atHead)
     if (p->count <= 0) return 0;
     slot = atHead ? p->head : p->tail;
     core = p->view[slot];
+    if(partitionProofBegin(k,atHead?PART_DEMOTE_DOWN:PART_DEMOTE_UP,core,NULL,&proof))
+        return ERR_PIPE_RING_CAPACITY;
     /* Resident Core concentration is not a CPU source of truth.  The seed is
        overwritten by selected GPU fetch (or by the legacy copy path below). */
     boundaryStatus = MSXsegStorage_hybridAcquireBoundary(&boundary);
@@ -1894,6 +2463,7 @@ static int hybridDemote(int k, int atHead)
         if (atHead) p->head = hybridNextSlot(p, slot);
         else p->tail = hybridPrevSlot(p, slot);
     }
+    if(partitionProofPublish(k,&proof))return ERR_PIPE_RING_CAPACITY;
     if (timing) MSXsegStorage_hybridTimingAddHandoff(MSXgpu_wallTimeMs() - timer);
     if (detail) MSXgpu_profileRecordDemote(1, MSXgpu_wallTimeMs() - timer);
     return 0;
@@ -2069,6 +2639,7 @@ static int hybridValidateDemoteRequest(const HybridDemoteRequest *r)
 
 static int hybridCommitDemoteRequest(HybridDemoteRequest *r)
 {
+    if (MSXsegStorage_hybridPrepareTopologyChange(r ? r->linkIndex : 0, 1)) return ERR_PIPE_RING_CAPACITY;
     HybridPipe *p;
     int residentSlot;
     /* Resident removals are committed by one prevalidated batch per link
@@ -2130,6 +2701,7 @@ static void hybridFreeDemoteBatch(HybridDemoteRequest *request,
    the small pre-transport endpoint materializer. */
 static int hybridDemoteResidentBatch(void)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     HybridDemoteRequest *request = Hybrid.demoteRequest;
     MSXResidentHandoffResult *result = Hybrid.demoteResult;
     MSXResidentHandoffItem *item = Hybrid.demoteItem;
@@ -2284,6 +2856,10 @@ static int hybridDemoteResidentBatch(void)
         link = request[begin].linkIndex;
         end = begin + 1;
         while (end < count && request[end].linkIndex == link) ++end;
+        if (MSXsegStorage_hybridPrepareTopologyChange(link,end-begin)) {
+            hybridFreeDemoteBatch(request, count, result, item);
+            return ERR_PIPE_RING_CAPACITY;
+        }
         if (HybridRebalanceMetrics)
             HybridRebalanceMetrics->validation_capacity_visits +=
                 (uint64_t)(end - begin);
@@ -2378,6 +2954,7 @@ static int hybridPromoteResidentExcess(int k, RebalanceSnapshot *s)
 
 int MSXsegStorage_hybridizeAll(void)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int k, err;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return 0;
     /* Resident startup owns a separate prepare/commit transaction. */
@@ -2410,6 +2987,7 @@ int MSXsegStorage_hybridizeAll(void)
 
 int MSXsegStorage_hybridObserveAll(void)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int k;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return 0;
     for (k = 1; k <= Hybrid.nLinks; k++)
@@ -2422,7 +3000,9 @@ int MSXsegStorage_hybridObserveAll(void)
 
 int MSXsegStorage_hybridRemoveHead(int k, Pseg seg)
 {
+    if (MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return ERR_PIPE_RING_CAPACITY;
     HybridPipe *p;
+    PartitionProof proof;
     int slot;
     Pseg next;
     double timer = 0.0;
@@ -2442,6 +3022,7 @@ int MSXsegStorage_hybridRemoveHead(int k, Pseg seg)
         return ERR_PIPE_RING_CAPACITY;
     }
     next = seg->prev;
+    if(partitionProofBegin(k,PART_CORE_REMOVE,seg,NULL,&proof))return ERR_PIPE_RING_CAPACITY;
     if (hybridResidentRemove(k, slot)) return ERR_PIPE_RING_CAPACITY;
     if (next) next->next = NULL;
     else MSX.LastSeg[k] = NULL;
@@ -2463,6 +3044,8 @@ int MSXsegStorage_hybridRemoveHead(int k, Pseg seg)
         p->count--;
         p->head = hybridNextSlot(p, slot);
     }
+    MSXsegStorage_hybridCommitTopologyChange(k);
+    if(partitionProofPublish(k,&proof))return ERR_PIPE_RING_CAPACITY;
     if (timing) MSXsegStorage_hybridTimingAddHandoff(MSXgpu_wallTimeMs() - timer);
     return 0;
 }
@@ -2473,6 +3056,7 @@ void MSXsegStorage_hybridRebalanceAll(void)
     MSXRebalanceMetrics metrics;
     double parentStart = 0.0, phaseStart;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return;
+    if (MSXsegStorage_hybridWriteAllowed()) return;
 #if defined(EPANETMSX_CUDA_ENABLED)
     if (MSXresidentRuntime_isResident())
     {
@@ -2487,13 +3071,72 @@ void MSXsegStorage_hybridRebalanceAll(void)
         /* Initialization contains only fallible promote commits.  Complete
            those first, then collect every post-transport demote before any
            CPU topology mutation or selected GPU fetch. */
+#if MSX_REBALANCE_SNAPSHOT_BACKEND == 1 || MSX_REBALANCE_SNAPSHOT_BACKEND == 2
+        {
+            uint64_t coreVisits = 0, boundaryVisits = 0, captures = 0;
+            SnapshotThreadMetric *threadMetrics = NULL;
+            size_t threadCapacity = 0;
+            double regionMs;
+            if (audit) {
+                threadCapacity = (size_t)omp_get_max_threads();
+                threadMetrics = (SnapshotThreadMetric *)calloc(threadCapacity, sizeof(*threadMetrics));
+                if (!threadMetrics) { MSX.ErrCode = ERR_MEMORY; goto resident_done; }
+            }
+            phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
+            /* Only private per-link drafts are written here. Every publish
+               and fallible initialization stays in the original k loop. */
+            err = hybridCaptureSnapshotBatch(MSX_REBALANCE_SNAPSHOT_BACKEND,
+                Hybrid.rebalanceSnapshot, (size_t)Hybrid.nLinks + 1,
+                threadMetrics, threadCapacity, phaseStart);
+            regionMs = audit ? MSXgpu_wallTimeMs() - phaseStart : 0.0;
+            if (audit && !err) {
+                FILE *f = fopen("resident_rebalance_threads.csv", "at");
+                size_t thread;
+                if (!f) err = ERR_IO_OUT_FILE;
+                else {
+                    fseek(f,0,SEEK_END);
+                    if (ftell(f)==0) fprintf(f,"step,sim_time_sec,backend,thread,links,core_visits,boundary_visits,thread_finished_ms,region_wall_ms\n");
+                    for(thread=0;thread<threadCapacity;++thread) {
+                        const SnapshotThreadMetric *t=&threadMetrics[thread];
+                        if(t->used) fprintf(f,"%lld,%.6f,%d,%llu,%llu,%llu,%llu,%.6f,%.6f\n",
+                            MSX.GpuTimingRecord.step_index,MSX.GpuTimingRecord.sim_time_sec,
+                            MSX_REBALANCE_SNAPSHOT_BACKEND,(unsigned long long)thread,
+                            (unsigned long long)t->links,(unsigned long long)t->coreVisits,
+                            (unsigned long long)t->boundaryVisits,t->finishedMs,regionMs);
+                    }
+                    if(ferror(f)) err=ERR_IO_OUT_FILE;
+                    if(fclose(f)) err=ERR_IO_OUT_FILE;
+                }
+            }
+            free(threadMetrics);
+            if (err) { MSX.ErrCode = err; goto resident_done; }
+            if (audit) metrics.rb_scan_ms += regionMs;
+            for (k = 1; k <= Hybrid.nLinks; ++k) {
+                RebalanceSnapshot *draft = &Hybrid.rebalanceSnapshot[k];
+                coreVisits += draft->scanCoreVisits;
+                boundaryVisits += draft->scanBoundaryVisits;
+                ++captures;
+            }
+            if (audit) {
+                metrics.scan_passes += captures;
+                metrics.core_visits += coreVisits;
+                metrics.boundary_visits += boundaryVisits;
+            }
+        }
+#endif
         for (k = 1; k <= Hybrid.nLinks; k++)
         {
             RebalanceSnapshot *s = &Hybrid.rebalanceSnapshot[k];
             phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
             if (audit) HybridRebalanceStage = HYBRID_REBALANCE_SCAN;
-            hybridCaptureRebalanceSnapshot(k, s);
+#if MSX_REBALANCE_SNAPSHOT_BACKEND == 1 || MSX_REBALANCE_SNAPSHOT_BACKEND == 2
+            err = s->captureStatus;
+#else
+            err = MSXsegStorage_hybridCaptureSnapshotBackend(k, MSX_REBALANCE_SNAPSHOT_BACKEND, s);
             if (audit) metrics.rb_scan_ms += MSXgpu_wallTimeMs() - phaseStart;
+#endif
+            if (err) { MSX.ErrCode = err; goto resident_done; }
+            hybridPublishRebalanceSnapshot(k, s);
             if (s->coreCount == 0 && s->total > 2 * s->guard)
             {
                 phaseStart = audit ? MSXgpu_wallTimeMs() : 0.0;
@@ -2563,6 +3206,7 @@ int MSXsegStorage_hybridEnsureEndpointBoundary(int k, int boundarySide)
 
 int MSXsegStorage_hybridAfterListReorder(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     HybridPipe *p;
     Pseg firstCore, lastCore;
     int down, up, count;
@@ -2587,7 +3231,9 @@ int MSXsegStorage_hybridAfterListReorder(int k)
 
 void MSXsegStorage_hybridClear(int k)
 {
+    if (MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return;
     HybridPipe *p;
+    PartitionProof proof;
     Pseg seg, next;
     MSXResidentStatus z;
     if (!MSXsegStorage_isHybridLink(k)) return;
@@ -2614,6 +3260,7 @@ void MSXsegStorage_hybridClear(int k)
                 return;
             }
         }
+    if(partitionProofBegin(k,PART_CLEAR,NULL,NULL,&proof))return;
     z = MSXresident_stageClear((uint32_t)k);
     if (z != MSX_RESIDENT_OK)
     {
@@ -2648,6 +3295,8 @@ void MSXsegStorage_hybridClear(int k)
     memset(p->used, 0, (size_t)p->cap * sizeof(unsigned char));
     memset(p->residentSlot, 0xFF, (size_t)p->cap * sizeof(int));
     memset(p->coreSlotForResident, 0xFF, (size_t)p->cap * sizeof(int));
+    MSXsegStorage_hybridCommitTopologyChange(k);
+    (void)partitionProofPublish(k,&proof);
 }
 
 int MSXsegStorage_hybridCoreCount(int k)
@@ -2767,6 +3416,7 @@ int MSXsegStorage_hybridCoreSpan(int k, int spanIndex, Pseg **segs,
 
 void MSXsegStorage_hybridPrepareCore(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     HybridPipe *p;
     int pos, slot;
     if (!MSXsegStorage_isHybridLink(k)) return;
@@ -2788,6 +3438,7 @@ void MSXsegStorage_hybridPrepareCore(int k)
 
 void MSXsegStorage_hybridCommitCore(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     HybridPipe *p;
     int pos, slot;
     if (!MSXsegStorage_isHybridLink(k)) return;
@@ -2850,6 +3501,7 @@ void MSXsegStorage_hybridTimingStepEnd(void)
 
 void MSXsegStorage_hybridSyncSegmentScalars(Pseg seg)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     HybridPipe *p;
     int slot;
     if (!seg || !seg->inHybridCore || !MSXsegStorage_isHybridLink(seg->ownerLink)) return;
@@ -2865,6 +3517,7 @@ void MSXsegStorage_hybridSyncSegmentScalars(Pseg seg)
 
 void MSXsegStorage_hybridSyncAllScalars(void)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     int k, pos, slot;
     HybridPipe *p;
     if (!MSXsegStorage_isHybridEnabled() || !Hybrid.opened) return;
@@ -3060,6 +3713,7 @@ bad:
 
 int MSXsegStorage_hybridEnsureBoundaryPoolFree(uint32_t required)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     uint32_t old=Hybrid.demoteBoundaryCapacity,need,minimum,suggested;
     int oldMemoryError=MSX.OutOfMemory;
     if(required<=Hybrid.demoteBoundaryFreeCount)return 0;
@@ -3151,6 +3805,7 @@ uint64_t MSXsegStorage_hybridCpuPoolGrowthCount(void)
 
 int MSXsegStorage_hybridAcquireBoundary(Pseg *segment)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     uint32_t i;
     Pseg seg;
     if (!segment) return ERR_MEMORY;
@@ -3191,6 +3846,7 @@ int MSXsegStorage_hybridAcquireBoundary(Pseg *segment)
 
 int MSXsegStorage_hybridReleaseBoundary(Pseg segment)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return 1;
     int i;
     if (!segment || !Hybrid.demoteBoundary) return 0;
     i = segment->hybridBoundaryPoolIndex;
@@ -3389,6 +4045,7 @@ int MSXsegStorage_hybridApplyResidentPayload(int k, int residentSlot,
                                               uint64_t hybridId,
                                               const MSXResidentPayload *payload)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return 0;
     HybridPipe *p;
     Pseg seg;
     int coreSlot, m;
@@ -3417,6 +4074,7 @@ int MSXsegStorage_hybridApplyResidentPayload(int k, int residentSlot,
 
 void MSXsegStorage_hybridAssignIdentity(int k, Pseg seg)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     HybridPipe *p;
     if (!MSXsegStorage_isHybridLink(k) || !seg || seg->hybridId != 0) return;
     p = &Hybrid.pipe[k];
@@ -3453,6 +4111,7 @@ int MSXsegStorage_open(void)
     size_t slots;
     size_t rows;
 
+    if (partitionNextLifecycle()) return ERR_PIPE_RING_CAPACITY;
     clearRing();
     hybridClear();
     if (MSXsegStorage_isHybridEnabled()) return hybridOpen();
@@ -3497,6 +4156,7 @@ int MSXsegStorage_open(void)
 
 void MSXsegStorage_close(void)
 {
+    if (partitionNextLifecycle()) return;
     if (MSXsegStorage_isHybridEnabled()) hybridWriteTiming();
     clearRing();
     hybridClear();
@@ -3507,11 +4167,13 @@ int MSXsegStorage_hybridResetUncommitted(void)
     int k, error;
     Pseg seg;
     if (!MSXsegStorage_isHybridEnabled()) return ERR_PIPE_RING_CAPACITY;
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
     /* Startup retry owns staging only. Published CPU lists and identities
        must survive, and no committed Core pointer may reference freed rows. */
     for (k=1; k<=MSX.Nobjects[LINK]; ++k)
         for (seg=MSX.FirstSeg[k]; seg; seg=seg->prev)
             if (seg->inHybridCore) return ERR_PIPE_RING_CAPACITY;
+    if (partitionNextLifecycle()) return ERR_PIPE_RING_CAPACITY;
     hybridClear();
     error=hybridOpen();
     if (error) return error;
@@ -3527,6 +4189,8 @@ int MSXsegStorage_hybridResetUncommitted(void)
 void MSXsegStorage_reset(void)
 {
     int k;
+
+    if (partitionNextLifecycle()) return;
 
     if (MSXsegStorage_isHybridEnabled())
     {
@@ -3558,6 +4222,7 @@ void MSXsegStorage_reset(void)
 
 int MSXsegStorage_preparePrivate(Pseg seg)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     if (!seg) return ERR_MEMORY;
 
     if (!seg->privateC)
@@ -3589,6 +4254,7 @@ int MSXsegStorage_preparePrivate(Pseg seg)
 
 void MSXsegStorage_initPrivateValues(Pseg seg, const double c[])
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     int m;
     if (!seg || !seg->privateC || !seg->privateLastC) return;
 
@@ -3603,12 +4269,14 @@ void MSXsegStorage_initPrivateValues(Pseg seg, const double c[])
 
 int MSXsegStorage_bindPipeSegment(int k, Pseg seg)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     if (MSXsegStorage_isHybridLink(k)) return 0;
     return MSXsegStorage_pipeAppendTail(k, seg);
 }
 
 void MSXsegStorage_unbindSegment(Pseg seg)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     int k, slot, index;
 
     if (!seg || seg->inHybridCore) return;
@@ -3634,6 +4302,7 @@ void MSXsegStorage_unbindSegment(Pseg seg)
 
 int MSXsegStorage_pipeAppendTail(int k, Pseg seg)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int slot, index;
 
     if (!seg) return ERR_MEMORY;
@@ -3692,6 +4361,7 @@ Pseg MSXsegStorage_pipePeekTail(int k)
 
 int MSXsegStorage_pipePopHead(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int oldHead;
 
     if (!MSXsegStorage_isPipeRingLink(k) || Ring.count[k] <= 0) return 0;
@@ -3714,6 +4384,7 @@ int MSXsegStorage_pipePopHead(int k)
 
 int MSXsegStorage_pipeConsumeHead(int k, double volume)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int index;
     if (!MSXsegStorage_isPipeRingLink(k) || Ring.count[k] <= 0) return 0;
     index = flatSlotIndex(k, Ring.head[k]);
@@ -3725,6 +4396,7 @@ int MSXsegStorage_pipeConsumeHead(int k, double volume)
 
 int MSXsegStorage_pipeMergeTail(int k, const double upnodeQual[], double volume)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int m, index;
     double oldv, newv;
     Pseg seg;
@@ -3749,6 +4421,7 @@ int MSXsegStorage_pipeMergeTail(int k, const double upnodeQual[], double volume)
 
 int MSXsegStorage_pipeReverse(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int h;
     if (!MSXsegStorage_isPipeRingLink(k) || Ring.count[k] <= 1) return 0;
     h = Ring.head[k];
@@ -3760,6 +4433,7 @@ int MSXsegStorage_pipeReverse(int k)
 
 void MSXsegStorage_pipeClear(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     int pos, slot;
     if (!MSXsegStorage_isPipeRingLink(k)) return;
 
@@ -3870,6 +4544,7 @@ double *MSXsegStorage_pipeDresponsePtr(int k, int slot)
 
 void MSXsegStorage_syncPsegMirror(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     int pos;
     Pseg seg, prev;
 
@@ -3902,6 +4577,7 @@ void MSXsegStorage_syncAllPsegMirrors(void)
 
 void MSXsegStorage_syncScalarsFromPseg(int k)
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     int pos, slot, index;
     Pseg seg;
     if (MSXsegStorage_isHybridLink(k))
@@ -4014,3 +4690,72 @@ double *MSXsegStorage_ringHstepData(void)
 {
     return Ring.opened ? Ring.hstep : NULL;
 }
+
+#include "c08_production_probe_hook.h"
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Storage(MSXInventory *s)
+{
+ uint32_t k,j;HybridPipe *p;HybridResidentTx *t;Pseg seg;
+ INV_HEAP(s,Hybrid.pipe);
+ INV_HEAP(s,Hybrid.initialScratchId);
+ INV_HEAP(s,Hybrid.initialScratchPayload);
+ INV_HEAP(s,Hybrid.demoteRequest);
+ INV_HEAP(s,Hybrid.demoteResult);
+ INV_HEAP(s,Hybrid.demoteItem);
+ INV_HEAP(s,Hybrid.demoteTargets);
+ INV_HEAP(s,Hybrid.demoteBoundary);
+ INV_HEAP(s,Hybrid.demoteBoundaryState);
+ INV_HEAP(s,Hybrid.demoteBoundaryNext);
+ INV_HEAP(s,Hybrid.rebalanceSnapshot);
+ MSXinv_tag(s,"Hybrid.metadataOnly",Hybrid.metadataOnly);MSXinv_tag(s,"Hybrid.sharedInitialObserver",Hybrid.sharedInitialObserver);MSXinv_tag(s,"Hybrid.initialScratchCapacity",Hybrid.initialScratchCapacity);
+ if(Hybrid.pipe)for(k=1;k<=(uint32_t)Hybrid.nLinks;k++){p=&Hybrid.pipe[k];
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->coreSlab);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->used);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->view);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->c);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->lastc);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->v);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->hstep);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->hresponse);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->uresponse);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->dresponse);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->residentSlot);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->coreSlotForResident);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->mapScratchResident);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->mapScratchCore);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->observerId);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->observerPayload);
+ INV_INDEX(s,"Hybrid.pipe",k,0,p->residentTx);
+ MSXinv_tag(s,"Hybrid.allocationKind",p->allocationKind);MSXinv_tag(s,"Hybrid.observerAllocationKind",p->observerAllocationKind);
+ if(p->allocationKind==HYBRID_OBJECTS_INDIVIDUAL&&p->view)for(j=0;j<(uint32_t)p->cap;j++){INV_INDEX(s,"Hybrid.individual",k,j,p->view[j]);}
+ if(p->view)for(j=0;j<(uint32_t)p->cap;j++)if(p->view[j]){if(p->view[j]->privateC)INV_POOL_INDEX(s,"Hybrid.viewPrivate",k,j,p->view[j]->privateC,MSX.QualPool);if(p->view[j]->privateLastC)INV_POOL_INDEX(s,"Hybrid.viewPrivate",k,j,p->view[j]->privateLastC,MSX.QualPool);}
+ if(p->residentTx){t=p->residentTx;
+ INV_INDEX(s,"Hybrid.tx",k,0,t->oldCore);
+ INV_INDEX(s,"Hybrid.tx",k,0,t->boundary);
+ INV_INDEX(s,"Hybrid.tx",k,0,t->down);
+ INV_INDEX(s,"Hybrid.tx",k,0,t->up);
+ INV_INDEX(s,"Hybrid.tx",k,0,t->slot);
+}
+ j=0;for(seg=p->directFirst;seg;seg=seg->prev){if(seg->hybridBoundaryPoolIndex<0&&!seg->inHybridCore){if(seg->privateC)INV_POOL_INDEX(s,"Hybrid.directPrivate",k,j,seg->privateC,MSX.QualPool);if(seg->privateLastC)INV_POOL_INDEX(s,"Hybrid.directPrivate",k,j,seg->privateLastC,MSX.QualPool);}++j;}
+}
+ if(Hybrid.demoteBoundary)for(j=0;j<Hybrid.demoteBoundaryCapacity;j++)if(Hybrid.demoteBoundary[j]){if(Hybrid.demoteBoundary[j]->privateC)INV_POOL_INDEX(s,"Hybrid.boundaryPrivate",0,j,Hybrid.demoteBoundary[j]->privateC,MSX.QualPool);if(Hybrid.demoteBoundary[j]->privateLastC)INV_POOL_INDEX(s,"Hybrid.boundaryPrivate",0,j,Hybrid.demoteBoundary[j]->privateLastC,MSX.QualPool);}
+ INV_HEAP(s,Ring.c);
+ INV_HEAP(s,Ring.lastc);
+ INV_HEAP(s,Ring.v);
+ INV_HEAP(s,Ring.hstep);
+ INV_HEAP(s,Ring.hresponse);
+ INV_HEAP(s,Ring.uresponse);
+ INV_HEAP(s,Ring.dresponse);
+ INV_HEAP(s,Ring.used);
+ INV_HEAP(s,Ring.seg);
+ INV_HEAP(s,Ring.head);
+ INV_HEAP(s,Ring.tail);
+ INV_HEAP(s,Ring.count);
+ INV_HEAP(s,Ring.orient);
+ INV_HEAP(s,Ring.observerId);
+ INV_HEAP(s,Ring.observerPayload);
+ if(Ring.seg)for(j=0;j<(uint32_t)Ring.nLinks*(uint32_t)Ring.cap;j++)if(Ring.seg[j]){if(Ring.seg[j]->privateC)INV_POOL_INDEX(s,"Ring.private",0,j,Ring.seg[j]->privateC,MSX.QualPool);if(Ring.seg[j]->privateLastC)INV_POOL_INDEX(s,"Ring.private",0,j,Ring.seg[j]->privateLastC,MSX.QualPool);}
+}
+#endif

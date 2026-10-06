@@ -98,6 +98,22 @@ static int ProfileAnnounced = 0;
 static int ProfileExplicit = 0;
 static int GpuTimingOutputEnabled = 0;
 static int Ros2RawErrorReason = 0;
+typedef struct {
+    uint64_t links, cpuRows, coreWalked;
+    double finishedMs;
+    int used;
+} ResidentThreadDiagnostic;
+typedef struct {
+    double start[MSX_HOST_INTERVAL_COUNT], end[MSX_HOST_INTERVAL_COUNT];
+    double enumerateMs, identityWriteMs, sealMs, prepareMs;
+    uint64_t rowsRead, rowsWritten;
+    int failureStage;
+    int threadCapacity;
+    long long stepOwned;
+    ResidentThreadDiagnostic *threads;
+} ResidentDiagnostic;
+static ResidentDiagnostic *ResidentDiag = NULL;
+static FILE *ResidentDiagnosticFile = NULL;
 
 typedef struct
 {
@@ -305,6 +321,113 @@ int MSXgpu_validateStrict(void)
     err = validateModelForGpu();
     if (err) setGpuError(err, GPU_STAGE_NONE, -1, -1, -1, -1, -1, 0.0);
     return err;
+}
+
+int MSXgpu_profileResidentDiagnosticEnabled(void)
+{
+    return MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_CHEM) ||
+           MSXgpu_profileDetailGroupEnabled(MSX_PROFILE_DETAIL_DIAGNOSTIC);
+}
+
+int MSXgpu_profileResidentDiagnosticBegin(void)
+{
+    int n = 1;
+    if (!MSXgpu_profileResidentDiagnosticEnabled()) return 0;
+#ifdef _OPENMP
+    n = omp_get_max_threads();
+#endif
+    if (!ResidentDiag) {
+        ResidentDiag = (ResidentDiagnostic *)calloc(1, sizeof(*ResidentDiag));
+        if (!ResidentDiag) return ERR_MEMORY;
+        ResidentDiag->threads = (ResidentThreadDiagnostic *)calloc((size_t)n, sizeof(*ResidentDiag->threads));
+        if (!ResidentDiag->threads) { free(ResidentDiag); ResidentDiag = NULL; return ERR_MEMORY; }
+        ResidentDiag->threadCapacity = n;
+    }
+    /* Thread configuration must stay within its budgeted initialization bound. */
+    if (n > ResidentDiag->threadCapacity) return ERR_MEMORY;
+    if (!ResidentDiagnosticFile) {
+        ResidentDiagnosticFile = fopen("resident_cpu_diagnostics.csv", "wt");
+        if (!ResidentDiagnosticFile) return ERR_IO_OUT_FILE;
+        fprintf(ResidentDiagnosticFile, "record,step,sim_time_sec,thread,links,cpu_reacted_rows,core_rows_walked_for_boundary,thread_finished_ms,submit_start_ms,submit_end_ms,boundary_start_ms,boundary_end_ms,tank_start_ms,tank_end_ms,wait_start_ms,wait_end_ms,enumerate_ms,identity_write_ms,seal_ms,host_prepare_ms,rows_read,rows_written,failure_stage,error_code\n");
+    }
+    memset(ResidentDiag->start, 0, sizeof(ResidentDiag->start));
+    memset(ResidentDiag->end, 0, sizeof(ResidentDiag->end));
+    memset(ResidentDiag->threads, 0, (size_t)ResidentDiag->threadCapacity * sizeof(*ResidentDiag->threads));
+    ResidentDiag->enumerateMs = ResidentDiag->identityWriteMs = 0;
+    ResidentDiag->sealMs = ResidentDiag->prepareMs = 0;
+    ResidentDiag->rowsRead = ResidentDiag->rowsWritten = 0;
+    ResidentDiag->failureStage = 0;
+    ResidentDiag->stepOwned = MSX.GpuTimingRecord.step_index;
+    return 0;
+}
+
+void MSXgpu_profileResidentHostInterval(int phase, double startMs, double endMs)
+{
+    if (!ResidentDiag || !MSXgpu_profileResidentDiagnosticEnabled() ||
+        phase < 0 || phase >= MSX_HOST_INTERVAL_COUNT) return;
+    ResidentDiag->start[phase] = startMs - StepStartMs;
+    ResidentDiag->end[phase] = endMs - StepStartMs;
+}
+
+int MSXgpu_profileResidentThread(int thread, uint64_t links, uint64_t cpuRows,
+                                 uint64_t coreWalked, double finishedMs)
+{
+    ResidentThreadDiagnostic *t;
+    if (!ResidentDiag || !MSXgpu_profileResidentDiagnosticEnabled()) return 0;
+    /* The OpenMP region uses the same maximum established by Begin. */
+    if (thread < 0 || thread >= ResidentDiag->threadCapacity) return ERR_MEMORY;
+    t = &ResidentDiag->threads[thread];
+    t->links = links; t->cpuRows = cpuRows; t->coreWalked = coreWalked;
+    t->finishedMs = finishedMs - StepStartMs; t->used = 1;
+    return 0;
+}
+
+void MSXgpu_profileRecordActiveStages(double enumerateMs, double identityWriteMs,
+                                    double sealMs, uint64_t rowsRead,
+                                    uint64_t rowsWritten, int failureStage)
+{
+    if (!ResidentDiag || !MSXgpu_profileResidentDiagnosticEnabled()) return;
+    ResidentDiag->enumerateMs += enumerateMs;
+    ResidentDiag->identityWriteMs += identityWriteMs;
+    ResidentDiag->sealMs += sealMs;
+    ResidentDiag->rowsRead += rowsRead; ResidentDiag->rowsWritten += rowsWritten;
+    if (!ResidentDiag->failureStage) ResidentDiag->failureStage = failureStage;
+}
+
+void MSXgpu_profileRecordActivePrepare(double ms, int failed)
+{
+    if (!ResidentDiag || !MSXgpu_profileResidentDiagnosticEnabled()) return;
+    ResidentDiag->prepareMs += ms;
+    if (failed && !ResidentDiag->failureStage) ResidentDiag->failureStage = 4;
+}
+
+static void writeResidentDiagnostic(int errorCode)
+{
+    int i;
+    ResidentDiagnostic *d = ResidentDiag;
+    if (!d || !ResidentDiagnosticFile || !MSXgpu_profileResidentDiagnosticEnabled() ||
+        d->stepOwned != MSX.GpuTimingRecord.step_index) return;
+    ResidentThreadDiagnostic total = {0};
+    for (i = 0; i < d->threadCapacity; ++i) {
+        total.links += d->threads[i].links;
+        total.cpuRows += d->threads[i].cpuRows;
+        total.coreWalked += d->threads[i].coreWalked;
+    }
+    for (i = -1; i < d->threadCapacity; ++i) {
+        ResidentThreadDiagnostic *t = i < 0 ? &total : &d->threads[i];
+        if (i >= 0 && !t->used) continue;
+        fprintf(ResidentDiagnosticFile,
+            "%s,%lld,%.6f,%d,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%d,%d\n",
+            i < 0 ? "STEP" : "THREAD", MSX.GpuTimingRecord.step_index, MSX.GpuTimingRecord.sim_time_sec, i,
+            (unsigned long long)t->links, (unsigned long long)t->cpuRows,
+            (unsigned long long)t->coreWalked, t->finishedMs,
+            d->start[0], d->end[0], d->start[1], d->end[1],
+            d->start[2], d->end[2], d->start[3], d->end[3],
+            d->enumerateMs, d->identityWriteMs, d->sealMs,
+            d->enumerateMs + d->identityWriteMs + d->sealMs + d->prepareMs,
+            (unsigned long long)d->rowsRead, (unsigned long long)d->rowsWritten,
+            d->failureStage, errorCode);
+    }
 }
 
 int MSXgpu_openTiming(void)
@@ -1232,6 +1355,10 @@ static void writeProfileSummary(void)
 
 void MSXgpu_closeTiming(void)
 {
+    if (ResidentDiagnosticFile) fclose(ResidentDiagnosticFile);
+    ResidentDiagnosticFile = NULL;
+    if (ResidentDiag) { free(ResidentDiag->threads); free(ResidentDiag); }
+    ResidentDiag = NULL;
     if (TimingFile)
     {
         fprintf(TimingFile,
@@ -1302,6 +1429,7 @@ void MSXgpu_beginStep(double simTimeSec)
 void MSXgpu_endStep(int errorCode)
 {
     MSXGpuTiming *t = &MSX.GpuTimingRecord;
+    writeResidentDiagnostic(errorCode);
     if (!MSXgpu_profileStageEnabled())
     {
         t->error_code = errorCode;
@@ -3011,6 +3139,9 @@ static int submitResidentCoreHydInternal(MSXResidentGpu *resident,
     residentStatus = writer ? MSXresidentGpu_prepareSealedActiveHyd(resident, writer, hyd, &view, NULL) :
                               (hyd ? MSXresidentGpu_prepareActiveHyd(resident, batch, hyd, &view, NULL) :
                                      MSXresidentGpu_prepareActive(resident, batch, &view, NULL));
+    if (MSXgpu_profileResidentDiagnosticEnabled())
+        MSXgpu_profileRecordActivePrepare(MSXgpu_wallTimeMs() - prepareStart,
+                                          residentStatus != MSX_RESIDENT_OK);
     if (stage) MSXgpu_profileRunPhase(MSX_PROFILE_RUN_REACT_PREPARE,
                                       MSXgpu_wallTimeMs() - prepareStart);
     if (residentStatus != MSX_RESIDENT_OK)
@@ -3766,5 +3897,28 @@ cleanup:
     free(termProg);
     if (err) setGpuError(err, GPU_STAGE_NONE, -1, -1, -1, -1, -1, 0.0);
     return err;
+}
+#endif
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_GPUPrograms(MSXInventory *s)
+{
+ INV_HEAP(s,ResidentDiag);
+ if(ResidentDiag){INV_HEAP(s,ResidentDiag->threads);}
+#ifdef EPANETMSX_CUDA_ENABLED
+ INV_HEAP(s,ResidentProgram.params);
+ INV_HEAP(s,ResidentProgram.consts);
+ INV_HEAP(s,ResidentProgram.linkDiam);
+ INV_HEAP(s,ResidentProgram.rateSpecies);
+ INV_HEAP(s,ResidentProgram.rateAtol);
+ INV_HEAP(s,ResidentProgram.rateRtol);
+ INV_HEAP(s,ResidentProgram.eqSpecies);
+ INV_HEAP(s,ResidentProgram.formulaSpecies);
+ INV_HEAP(s,ResidentProgram.speciesType);
+ INV_HEAP(s,ResidentProgram.instr);
+ INV_HEAP(s,ResidentProgram.speciesProg);
+ INV_HEAP(s,ResidentProgram.termProg);
+#endif
 }
 #endif

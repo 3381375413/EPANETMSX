@@ -23,6 +23,7 @@
 #include "epanet2.h"
 #include "dispersion.h"
 #include "msxresident_alloc_redirect.h"
+#include "msxsegment_storage.h"
 //  Exported variables
 //--------------------
 MSXproject  MSX;                            // MSX project data
@@ -124,6 +125,7 @@ int  MSXproj_open(char *fname)
 **    an error code (0 if no error)
 */
 {
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
 // --- initialize data to default values
 
     int errcode = 0;
@@ -210,6 +212,7 @@ void MSXproj_close()
 **    none
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     // --- close all files
 
     if ( MSX.RptFile.file ) fclose(MSX.RptFile.file);                          //(LR-11/20/07, to fix bug 08)
@@ -901,3 +904,55 @@ void  freeadjlists()            //from epanet for node sorting in WQ routing
     MSX.Adjlist = NULL;
 }
 
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Project(MSXInventory *s)
+{
+ uint32_t k,j;Psource src;SnumList *num;Padjlist a;
+ INV_HEAP(s,MSX.Species);
+ INV_HEAP(s,MSX.Param);
+ INV_HEAP(s,MSX.Const);
+ INV_HEAP(s,MSX.Term);
+ INV_HEAP(s,MSX.Node);
+ INV_HEAP(s,MSX.Link);
+ INV_HEAP(s,MSX.Tank);
+ INV_HEAP(s,MSX.Pattern);
+ INV_HEAP(s,MSX.Adjlist);
+ INV_HEAP(s,MSX.C0);
+ INV_HEAP(s,MSX.D);
+ INV_HEAP(s,MSX.H);
+ INV_HEAP(s,MSX.K);
+ INV_HEAP(s,MSX.Q);
+ INV_HEAP(s,MSX.S); if(MSX.Node)for(k=1;k<=(uint32_t)MSX.Nobjects[NODE];k++){INV_INDEX(s,"Node",k,0,MSX.Node[k].c);INV_INDEX(s,"Node",k,0,MSX.Node[k].c0);j=0;for(src=MSX.Node[k].sources;src;src=src->next){INV_INDEX(s,"Node.source",k,j++,src);}}
+ if(MSX.Link)for(k=1;k<=(uint32_t)MSX.Nobjects[LINK];k++){ INV_INDEX(s,"Link",k,0,MSX.Link[k].c0);
+ INV_INDEX(s,"Link",k,0,MSX.Link[k].param);
+ INV_INDEX(s,"Link",k,0,MSX.Link[k].reacted);}
+ if(MSX.Tank)for(k=1;k<=(uint32_t)MSX.Nobjects[TANK];k++){ INV_INDEX(s,"Tank",k,0,MSX.Tank[k].c);
+ INV_INDEX(s,"Tank",k,0,MSX.Tank[k].param);
+ INV_INDEX(s,"Tank",k,0,MSX.Tank[k].reacted);}
+ if(MSX.Pattern)for(k=1;k<=(uint32_t)MSX.Nobjects[PATTERN];k++){j=0;for(num=MSX.Pattern[k].first;num;num=num->next){INV_INDEX(s,"Pattern.num",k,j++,num);}}
+ if(MSX.Species)for(k=1;k<=(uint32_t)MSX.Nobjects[SPECIES];k++){MSXinv_Expr(s,MSX.Species[k].pipeExpr,"Species.pipeExpr",k);MSXinv_TankExpr(s,MSX.Species[k].tankExpr,MSX.Species[k].pipeExpr,"Species.tankExpr",k);}
+ if(MSX.Term)for(k=1;k<=(uint32_t)MSX.Nobjects[TERM];k++)MSXinv_Expr(s,MSX.Term[k].expr,"Term.expr",k);
+ if(MSX.Adjlist)for(k=0;k<=(uint32_t)MSX.Nobjects[NODE];k++){j=0;for(a=MSX.Adjlist[k];a;a=a->next){INV_INDEX(s,"Adjlist",k,j++,a);}}
+ for(k=0;k<MAX_OBJECTS;k++)MSXinv_Hash(s,Htable[k],k);MSXinv_Pool(s,HashPool,"HashPool");
+ INV_HEAP(s,MSX.Dispersion.ld);
+ INV_HEAP(s,MSX.Dispersion.md);
+ INV_HEAP(s,MSX.Dispersion.Adjlist);
+ INV_HEAP(s,MSX.Dispersion.Aij);
+ INV_HEAP(s,MSX.Dispersion.Aii);
+ INV_HEAP(s,MSX.Dispersion.F);
+ INV_HEAP(s,MSX.Dispersion.temp);
+ INV_HEAP(s,MSX.Dispersion.link);
+ INV_HEAP(s,MSX.Dispersion.first);
+ INV_HEAP(s,MSX.Dispersion.pipeDispersionCoeff);
+ INV_HEAP(s,MSX.Dispersion.Order);
+ INV_HEAP(s,MSX.Dispersion.Row);
+ INV_HEAP(s,MSX.Dispersion.Ndx);
+ INV_HEAP(s,MSX.Dispersion.Degree);
+ INV_HEAP(s,MSX.Dispersion.XLNZ);
+ INV_HEAP(s,MSX.Dispersion.NZSUB);
+ INV_HEAP(s,MSX.Dispersion.LNZ);
+ if(MSX.Dispersion.Adjlist)for(k=0;k<=(uint32_t)MSX.Nobjects[NODE];k++){j=0;for(a=MSX.Dispersion.Adjlist[k];a;a=a->next){INV_INDEX(s,"Dispersion.Adjlist",k,j++,a);}}
+}
+#endif

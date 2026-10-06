@@ -203,7 +203,7 @@ static int evaluateCost(const uint32_t *admission,const uint32_t *guards,const u
                         MSXResidentMemoryEstimate *memory,CapacityCost *cost)
 {
  uint64_t host,extra,available=0,pattern[3],initialPool,slots=0,objects;
- uint32_t k;int direct=MSXresidentRuntime_directInitialPlanning();Pseg cursor;AllocForecast forecast;
+ uint32_t k,maxInitialCore=0;int direct=MSXresidentRuntime_directInitialPlanning();Pseg cursor;AllocForecast forecast;
  memset(cost,0,sizeof(*cost));
  if(!admission||!guards)return 0;
  for(k=1;k<=Plan.links;++k){uint32_t physical=capacity?capacity[k]:(admission[k]?admission[k]:1);
@@ -213,6 +213,7 @@ static int evaluateCost(const uint32_t *admission,const uint32_t *guards,const u
   if(!physical||admission[k]>physical||(guards[k]!=2&&guards[k]!=4))return 0;
   slots+=physical;if(slots>UINT32_MAX)return 0;
   if(direct)cost->initialCpu+=initial-MIN(core,admission[k]);
+  if(direct&&MIN(core,admission[k])>maxInitialCore)maxInitialCore=MIN(core,admission[k]);
  }
  if(direct){
   for(k=1;k<=(uint32_t)MSX.Nobjects[TANK];++k)if(MSX.Tank[k].a!=0.0)
@@ -253,7 +254,7 @@ static int evaluateCost(const uint32_t *admission,const uint32_t *guards,const u
  cost->temporaryHeadroom=MSXcapacity_headroom(Plan.temporaryReserve,Plan.baselineTemporary);
  cost->uploadHeadroom=MSXcapacity_headroom(Plan.uploadReserve,Plan.baselineUpload);
  cost->coreHost=MSXresident_fixedHostBytes(Plan.links,(uint32_t)slots,Plan.stride);
- cost->hybridFull=MSXsegStorage_hybridFixedHostBytes(Plan.links,(uint32_t)slots,Plan.stride)-
+ cost->hybridFull=MSXsegStorage_hybridFixedHostBytesWithInitial(Plan.links,(uint32_t)slots,Plan.stride,direct,maxInitialCore)-
         slots*(sizeof(struct Sseg)+(uint64_t)2*Plan.stride*sizeof(double));
  cost->hybridExisting=Plan.baselineHybrid;
  if(cost->hybridExisting>cost->hybridFull)return 0;
@@ -652,3 +653,19 @@ void MSXresidentCapacity_writeUsage(void)
  fclose(f);
  if(MSXResidentCapacityAuditEnabled){f=fopen("resident_ownership_audit.json","wb");if(f){fprintf(f,"{\"steps\":%llu,\"hyd_grid_expected_steps\":%llu,\"parcel_row_steps\":%llu,\"status\":\"%s\"}\n",(unsigned long long)Plan.auditSteps,(unsigned long long)Plan.expectedSteps,(unsigned long long)Plan.auditParcels,MSX.ErrCode||(Plan.pipe&&Plan.auditSteps!=Plan.expectedSteps)?"FAIL":"PASS");fclose(f);}}
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Capacity(MSXInventory *s)
+{
+ uint32_t k;
+ INV_HEAP(s,Plan.pipe);
+ INV_HEAP(s,Plan.limit);
+ INV_HEAP(s,Plan.guard);
+ INV_HEAP(s,Plan.trial);
+ INV_HEAP(s,Plan.usage);
+ INV_HEAP(s,Plan.audit);
+ if(Plan.audit)for(k=1;k<=Plan.links;k++){ INV_INDEX(s,"Capacity.audit",k,0,Plan.audit[k].parcel);
+}
+}
+#endif

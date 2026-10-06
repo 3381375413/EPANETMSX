@@ -414,3 +414,11 @@ void  AllocFreePool()
     }
     root = NULL;
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Pool(MSXInventory *s,void *handle,const char *name)
+{ alloc_root_t *p=(alloc_root_t *)handle;alloc_hdr_t *b;char key[128];uint32_t i=0;if(!p)return;snprintf(key,sizeof(key),"%s.root",name);MSXinv_ticket(s,key,p,p->backing.bytes,&p->backing);for(b=p->first;b;b=b->next){snprintf(key,sizeof(key),"%s.block[%u]",name,i++);MSXinv_ticket(s,key,b->block,(uint64_t)(b->end-b->block),&b->backing);} }
+void MSXinv_poolIndexed(MSXInventory *s,const char *module,uint32_t k,uint32_t j,const char *field,const void *ptr,void *handle)
+{ alloc_root_t *p=(alloc_root_t *)handle;alloc_hdr_t *b;const void *owner=NULL;char key[256];uintptr_t address=(uintptr_t)ptr;if(s->closed){s->error=1;return;}if(ptr&&p)for(b=p->first;b;b=b->next)if(address>=(uintptr_t)b->block&&address<(uintptr_t)b->free){owner=b->block;break;}if(ptr&&!owner)s->error=1;snprintf(key,sizeof(key),"%s[%u,%u].%s",module,k,j,field);MSXinv_alias(s,key,ptr,owner); }
+#endif

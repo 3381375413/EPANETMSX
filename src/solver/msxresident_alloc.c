@@ -138,3 +138,11 @@ void MSXresidentExternal_release(uintptr_t ptr,MSXMemoryClass kind)
     if(MSXresidentBudget_releaseAllocation(MSXresidentBudget_global(),&r->allocation)!=MSX_BUDGET_OK)abort();
     MSXresidentAlloc_free(r);
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+int MSXinv_describeHeap(const void *p,MSXBudgetAllocation *allocation,uint64_t *payload)
+{ const AllocationHeader *h;if(!p||!allocation||!payload)return 0;h=(const AllocationHeader *)p-1;if(h->magic!=ALLOCATION_MAGIC)return 0;*allocation=h->allocation;*payload=h->payloadBytes;return 1; }
+void MSXinv_external(MSXInventory *s)
+{ MSXExternalAllocation *p;uint32_t i=0;char key[128];externalEnter();for(p=externalHead;p;p=p->next){snprintf(key,sizeof(key),"external[%u].metadata",i);MSXinv_heap(s,key,p,sizeof(*p));snprintf(key,sizeof(key),"external[%u].backing",i++);MSXinv_ticket(s,key,(const void *)p->ptr,p->allocation.bytes,&p->allocation);}externalLeave(); }
+#endif

@@ -14,7 +14,8 @@ int MSXgpu_prepareResidentContext(void){return 0;}
 int MSXgpu_openResidentPrograms(void){return 0;}
 int MSXgpu_getResidentProgramMemory(MSXResidentMemoryEstimate *m){memset(m,0,sizeof(*m));return 0;}
 int MSXresidentRuntime_isResident(void){return 0;}
-int MSXresidentRuntime_directInitialPlanning(void){return 0;}
+static int testDirectInitialPlanning;
+int MSXresidentRuntime_directInitialPlanning(void){return testDirectInitialPlanning;}
 uint64_t MSXresidentRuntime_initialScratchBytes(uint32_t n,uint32_t t,uint32_t s){(void)n;(void)t;(void)s;return 0;}
 uint64_t MSXresidentRuntime_fixedHostBytes(uint32_t n,uint32_t s,uint32_t t){(void)n;(void)s;(void)t;return 0;}
 MSXproject MSX; static int pass,fail; static int segmentAllocFail; static uint64_t segmentAllocCalls;
@@ -326,4 +327,24 @@ static void t_retry_identities(void)
 }
 #include "resident_lease_tests.h"
 #include "resident_compact_core_tests.h"
-int main(void){t1();t2();t3();t4();t5();t6();t6a();t6b();t6c();t6d();t6e();t7();t19();t20();t21();t22();t23();t24();t8();t9();t10();t10b();t11();t12();t13();t14();t15();t16();t17();t18();t25();t26();t_cpu_spill();t_cpu_pool_growth();t_predictor();t_hyd_scan();t_host_size_ledger();t_retry_identities();t_handoff_leases();t_compact_core();cleanup();remove("resident_phase2a.csv");printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);return fail?1:0;}
+#include "resident_slab_tests.h"
+#include "resident_map_scratch_tests.h"
+#include "resident_shared_observer_tests.h"
+#include "resident_active_span_tests.h"
+#include "resident_rebalance_snapshot_tests.h"
+#include "resident_partition_tests.h"
+#include "resident_incremental_partition_tests.h"
+int main(void)
+{
+ t1(); t2(); t3(); t4(); t5(); t6(); t6a(); t6b(); t6c(); t6d(); t6e();
+ t7(); t19(); t20(); t21(); t22(); t23(); t24(); t8(); t9(); t10(); t10b();
+ t11(); t12(); t13(); t14(); t15(); t16(); t17(); t18(); t25(); t26();
+ t_cpu_spill(); t_cpu_pool_growth(); t_predictor(); t_hyd_scan();
+ t_host_size_ledger(); t_retry_identities(); t_handoff_leases(); t_compact_core();
+ t_core_slab(); t_map_scratch_modes();t_shared_initial_observer(); t_active_spans();
+ t_rebalance_snapshot_readonly();
+ t_incremental_partition_development(); t_incremental_capacity_reject(); t_rebalance_snapshot_parallel_batch(); t_partition_view_contract();
+ cleanup(); remove("resident_phase2a.csv");
+ printf("assertions_passed=%d\nassertions_failed=%d\n",pass,fail);
+ return fail?1:0;
+}

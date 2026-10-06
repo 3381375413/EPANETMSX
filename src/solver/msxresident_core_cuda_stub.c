@@ -24,6 +24,7 @@ MSXResidentStatus MSXresidentGpu_getFixedMemory(const MSXResidentGpu *g,MSXResid
 {(void)g;(void)m;return MSX_RESIDENT_ERR_GPU;}
 /* Fail closed: a non-CUDA build must never claim a resident GPU mirror. */
 int MSXresidentGpu_isEnabled(void){return 0;}
+MSXResidentStatus MSXresidentGpu_auditFixedLayout(MSXResidentGpu*g){(void)g;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_open(const MSXResidentGpuOpen*a,MSXResidentGpu**b){(void)a;if(b)*b=0;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_initialUpload(MSXResidentGpu*a,const MSXResidentPatchBatch*b){(void)a;(void)b;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_applyPatches(MSXResidentGpu*a,const MSXResidentPatchBatch*b){(void)a;(void)b;return MSX_RESIDENT_DISABLED;}
@@ -36,6 +37,8 @@ MSXResidentStatus MSXresidentGpu_prepareActive(MSXResidentGpu*a,const MSXResiden
 MSXResidentStatus MSXresidentGpu_prepareActiveHyd(MSXResidentGpu*a,const MSXResidentActiveBatch*b,const MSXResidentHydView*h,MSXResidentGpuDeviceView*c,MSXResidentGpuReactResult*d){(void)a;(void)b;(void)h;if(c)memset(c,0,sizeof(*c));if(d)memset(d,0,sizeof(*d));return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_beginActive(MSXResidentGpu*a,uint32_t n,uint64_t t,MSXResidentGpuActiveWriter*w){(void)a;(void)n;(void)t;if(w)memset(w,0,sizeof(*w));return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_appendActive(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w,const MSXResidentActiveRow*x){(void)a;(void)w;(void)x;return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_appendActivePipe(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w,const MSXResidentActiveRow*x,uint32_t n,MSXResidentActiveRowCheck before,MSXResidentActiveRowCheck after,void*context){(void)a;(void)w;(void)x;(void)n;(void)before;(void)after;(void)context;return MSX_RESIDENT_DISABLED;}
+MSXResidentStatus MSXresidentGpu_appendActivePipeView(MSXResidentGpu*g,MSXResidentGpuActiveWriter*w,const MSXResidentActivePipeView*p,MSXResidentActiveRowCheck before,MSXResidentActiveRowCheck after,void*context){(void)g;(void)w;(void)p;(void)before;(void)after;(void)context;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_sealActive(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w,uint64_t t){(void)a;(void)w;(void)t;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_abortActiveBuild(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w){(void)a;(void)w;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_prepareSealedActiveHyd(MSXResidentGpu*a,MSXResidentGpuActiveWriter*w,const MSXResidentHydView*h,MSXResidentGpuDeviceView*c,MSXResidentGpuReactResult*d){(void)a;(void)w;(void)h;if(c)memset(c,0,sizeof(*c));if(d)memset(d,0,sizeof(*d));return MSX_RESIDENT_DISABLED;}
@@ -48,3 +51,8 @@ MSXResidentStatus MSXresidentGpu_abortActive(MSXResidentGpu*a){(void)a;return MS
 MSXResidentStatus MSXresidentGpu_invalidateHyd(MSXResidentGpu*a){(void)a;return MSX_RESIDENT_DISABLED;}
 MSXResidentStatus MSXresidentGpu_poison(MSXResidentGpu*a){(void)a;return MSX_RESIDENT_DISABLED;}
 void MSXresidentGpu_close(MSXResidentGpu*a){(void)a;}
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_CUDA(MSXInventory *s,void *g){(void)s;(void)g;}
+#endif

@@ -54,3 +54,14 @@ void MSXupload_close(void)
             (unsigned long long)U.cancelled,(unsigned long long)U.completed,(unsigned long long)U.flushes,U.poisoned);fclose(f);}}
     MSXresidentAlloc_free(U.lease);MSXresidentAlloc_free(U.c);MSXresidentAlloc_free(U.lastc);memset(&U,0,sizeof(U));
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Upload(MSXInventory *s)
+{
+ INV_HEAP(s,U.lease);
+ INV_HEAP(s,U.c);
+ INV_HEAP(s,U.lastc);
+ MSXinv_tag(s,"upload.capacity",U.capacity);MSXinv_tag(s,"upload.pending",U.count);MSXinv_tag(s,"upload.completed",U.completed);
+}
+#endif

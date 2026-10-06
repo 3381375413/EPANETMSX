@@ -157,3 +157,14 @@ int newton_solve(double x[], int n, int maxit, int numsig,
 
 	return -2;
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Newton(MSXInventory *s)
+{
+ INV_INDEX(s,"Newton.worker",(uint32_t)omp_get_thread_num(),0,MSXNewtonSolver.Indx);
+ INV_INDEX(s,"Newton.worker",(uint32_t)omp_get_thread_num(),0,MSXNewtonSolver.F);
+ INV_INDEX(s,"Newton.worker",(uint32_t)omp_get_thread_num(),0,MSXNewtonSolver.W);
+{char key[128];snprintf(key,sizeof(key),"Newton.worker[%u].matrix",(unsigned)omp_get_thread_num());MSXinv_matrix(s,key,MSXNewtonSolver.J);}
+}
+#endif

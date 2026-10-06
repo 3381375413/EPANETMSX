@@ -1,3 +1,6 @@
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+#endif
 /******************************************************************************
 **  MODULE:        MSXQUAL.C
 **  PROJECT:       EPANET-MSX
@@ -208,6 +211,7 @@ int  MSXqual_open()
 **     an error code (0 if no errors).
 */
 {
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
     int errcode = 0;
     int n;
 
@@ -317,6 +321,7 @@ int  MSXqual_init()
 **    an error code (or 0 if no errors).
 */
 {
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
     int i, n, m;
     int errcode = 0;
 
@@ -462,6 +467,7 @@ int MSXqual_step(double *t, double *tleft)
 **      513 = can't integrate reaction rates
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return ERR_PIPE_RING_CAPACITY;
     int  k, errcode = 0, flowchanged;
     int m;
     double smassin, smassout, sreacted;
@@ -1014,6 +1020,7 @@ int MSXqual_close()
 **     error code (0 if no error).
 */
 {
+    if (MSXsegStorage_hybridLifecycleAllowed()) return ERR_PIPE_RING_CAPACITY;
     int errcode = 0;
     freeLinkQualitySnapshot();
     if (!MSX.ProjectOpened) return 0;
@@ -1416,6 +1423,9 @@ static int initDirectResidentSegs(void)
             if(n!=draft[j].count||previous!=draft[j].last||
                n!=(MSX.Tank[j].mixModel==MIX2?2U:1U))error=ERR_MEMORY;
         }
+#ifdef MSX_RESIDENT_TEST_API
+        MSXinv_checkpoint(cache,draft);
+#endif
         auditDirectInitialAttempt(error,draft,(int)tanks,equilCalls);
         if(!error)error=MSXresidentRuntime_finishDirectInitial();
         if(!error)error=MSXresidentRuntime_afterHybridInit();
@@ -2222,6 +2232,7 @@ void  removeAllSegs(int k)
 **     k = link index.
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     Pseg seg;
     if (MSXsegStorage_isHybridLink(k))
     {
@@ -2497,6 +2508,7 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
     **--------------------------------------------------------------
     */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
 
     double q, v, vseg;
     int sindex;
@@ -2516,6 +2528,7 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
             vseg = seg->v;
             vseg = MIN(vseg, v);
 
+            if (vseg >= seg->v && MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return;
             *volin += vseg;
             for (sindex = 1; sindex <= MSX.Nobjects[SPECIES]; sindex++)
                 massin[sindex] += vseg * seg->c[sindex] * LperFT3;
@@ -2534,10 +2547,17 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
                 MSXsegStorage_pipePopHead(k);
             else
             {
+                if (MSXsegStorage_isHybridLink(k)) {
+                    MSX.ErrCode=MSXsegStorage_hybridRemoveCpuHead(k,seg);
+                    if(MSX.ErrCode)return;
+                    MSXqual_removeSeg(seg);
+                    continue;
+                }
                 MSX.FirstSeg[k] = seg->prev;
                 MSX.Link[k].nsegs--;
                 if (MSX.FirstSeg[k] == NULL) MSX.LastSeg[k] = NULL;
                 else MSX.FirstSeg[k]->next = NULL;
+                MSXsegStorage_hybridCommitTopologyChange(k);
                 MSXqual_removeSeg(seg);
             }
             }
@@ -2575,6 +2595,7 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
         vseg = seg->v;
         vseg = MIN(vseg, v);
 
+        if (vseg >= seg->v && MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return;
         // ... update total volume & mass entering downstream node
         *volin += vseg;
         for (sindex = 1; sindex <= MSX.Nobjects[SPECIES]; sindex++)
@@ -2595,10 +2616,17 @@ void  evalnodeinflow(int k, double tstep, double* volin, double* massin)
             else
             {
                 // ... replace this leading segment with the one behind it
+                if (MSXsegStorage_isHybridLink(k)) {
+                    MSX.ErrCode=MSXsegStorage_hybridRemoveCpuHead(k,seg);
+                    if(MSX.ErrCode)return;
+                    MSXqual_removeSeg(seg);
+                    continue;
+                }
                 MSX.FirstSeg[k] = seg->prev;
                 MSX.Link[k].nsegs--;
                 if (MSX.FirstSeg[k] == NULL) MSX.LastSeg[k] = NULL;
                 else MSX.FirstSeg[k]->next = NULL; //03/19/2024 added to break the linked segments
+                MSXsegStorage_hybridCommitTopologyChange(k);
 
                 // ... recycle the used up segment
                 MSXqual_removeSeg(seg);
@@ -3090,6 +3118,7 @@ void MSXqual_reversesegs(int k)
 **--------------------------------------------------------------
 */
 {
+    if (MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return;
     Pseg  seg, cseg, pseg;
 
     if (MSXsegStorage_isPipeRingLink(k))
@@ -3112,6 +3141,7 @@ void MSXqual_reversesegs(int k)
         pseg = seg;
         seg = cseg;
     }
+    MSXsegStorage_hybridCommitTopologyChange(k);
 }
 
 
@@ -3127,6 +3157,7 @@ void MSXqual_removeSeg(Pseg seg)
 **     seg = pointer to a WQ segment.
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return;
     if ( seg == NULL ) return;
     /* Resident Hybrid demote boundaries are owned by the fixed boundary
        arena.  Returning one to that arena is distinct from exposing it to
@@ -3158,6 +3189,7 @@ Pseg MSXqual_getFreeSeg(double v, double c[])
 **     a pointer to an unused water quality segment.
 */
 {
+    if (MSXsegStorage_hybridWriteAllowed()) return NULL;
     Pseg seg;
 
 // --- try using the last discarded segment if one is available
@@ -3201,6 +3233,9 @@ Pseg MSXqual_getFreeSeg(double v, double c[])
     seg->v = v;
     MSXsegStorage_initPrivateValues(seg, c);
     seg->hstep = 0.0;
+    /* A recycled free-list node is detached before the owned C08 endpoint
+       insertion validates it; no published list links are changed here. */
+    seg->prev = seg->next = NULL;
     return seg;
 }
 
@@ -3217,6 +3252,7 @@ void  MSXqual_addSeg(int k, Pseg seg)
 */
 
 {
+    if (MSXsegStorage_hybridPrepareTopologyChange(k, 1)) return;
     int errcode;
     if (seg == NULL) return;
     if (MSX.ErrCode) return;
@@ -3238,6 +3274,10 @@ void  MSXqual_addSeg(int k, Pseg seg)
         MSX.ErrCode = errcode;
         return;
     }
+    if (MSXsegStorage_isHybridLink(k)) {
+        MSX.ErrCode=MSXsegStorage_hybridAppendCpuBoundary(k,seg);
+        return;
+    }
     seg->prev = NULL;
     seg->next = NULL;
     if (MSX.FirstSeg[k] == NULL) MSX.FirstSeg[k] = seg;
@@ -3249,6 +3289,7 @@ void  MSXqual_addSeg(int k, Pseg seg)
     MSX.LastSeg[k] = seg;
     if (k <= MSX.Nobjects[LINK])
         MSX.Link[k].nsegs++;
+    MSXsegStorage_hybridCommitTopologyChange(k);
 }
 
 void evalHydVariables(int k)
@@ -3310,3 +3351,29 @@ void evalHydVariables(int k)
 
     MSX.Link[k].HydVar[ROUGHNESS] = MSX.Link[k].roughness;
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+
+void MSXinv_Quality(MSXInventory *s)
+{
+ uint32_t k,j;Pseg p;
+ INV_HEAP(s,MSX.C1);
+ INV_HEAP(s,MSX.FirstSeg);
+ INV_HEAP(s,MSX.LastSeg);
+ INV_HEAP(s,MSX.NewSeg);
+ INV_HEAP(s,MSX.FlowDir);
+ INV_HEAP(s,MSX.MassIn);
+ INV_HEAP(s,MSX.SourceIn);
+ INV_HEAP(s,MSX.SortedNodes);
+ INV_HEAP(s,MSX.MassBalance.initial);
+ INV_HEAP(s,MSX.MassBalance.inflow);
+ INV_HEAP(s,MSX.MassBalance.indisperse);
+ INV_HEAP(s,MSX.MassBalance.outflow);
+ INV_HEAP(s,MSX.MassBalance.reacted);
+ INV_HEAP(s,MSX.MassBalance.final);
+ INV_HEAP(s,MSX.MassBalance.ratio);
+ INV_HEAP(s,LinkQualitySnapshot.values);
+ MSXinv_Pool(s,MSX.QualPool,"QualPool");if(MSX.FirstSeg)for(k=1;k<=(uint32_t)(MSX.Nobjects[LINK]+MSX.Nobjects[TANK]);k++){j=0;for(p=MSX.FirstSeg[k];p;p=p->prev){if(!p->inPipeRing&&!p->inHybridCore&&p->hybridBoundaryPoolIndex<0){if(p->privateC)INV_POOL_INDEX(s,"Quality.private",k,j,p->privateC,MSX.QualPool);if(p->privateLastC)INV_POOL_INDEX(s,"Quality.private",k,j,p->privateLastC,MSX.QualPool);}++j;}}
+ j=0;for(p=MSX.FreeSeg;p;p=p->prev){if(!p->inPipeRing&&!p->inHybridCore&&p->hybridBoundaryPoolIndex<0){if(p->privateC)INV_POOL_INDEX(s,"Quality.freePrivate",0,j,p->privateC,MSX.QualPool);if(p->privateLastC)INV_POOL_INDEX(s,"Quality.freePrivate",0,j,p->privateLastC,MSX.QualPool);}++j;}
+}
+#endif

@@ -106,3 +106,9 @@ void    HTfree(HTtable *ht)
         }
         free(ht);
 }
+
+#ifdef MSX_RESIDENT_TEST_API
+#include "msxresident_inventory.h"
+void MSXinv_Hash(MSXInventory *s,void *handle,uint32_t k)
+{ HTtable *ht=(HTtable *)handle;struct HTentry *e;uint32_t i,j;if(!ht)return;INV_INDEX(s,"Hash.table",k,0,ht);for(i=0;i<HTMAXSIZE;i++){j=0;for(e=ht[i];e;e=e->next){INV_INDEX(s,"Hash.entry",k,i*100000U+j++,e);}} }
+#endif
